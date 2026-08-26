@@ -1,5 +1,11 @@
 # Nightly sweep of in_review / in_progress beads.
 #
+# NOTE FOR ADOPTERS: Actions is switched OFF on the beads-template repo
+# itself (a template has no tracker to sweep). A repo created from the
+# template gets Actions enabled by default, so this schedule starts firing
+# as soon as you have a tracker — set BEADS_SWEEP_TOKEN and edit
+# BD_SWEEP_REPOS below before it does, or the first runs are loud no-ops.
+#
 # Closes beads whose citing PRs have all merged (scripts/bd-sweep-merged) and
 # publishes a job summary of what closed and what is still parked in review,
 # oldest first. Runs GitHub-side PR discovery (--search-citing), so a merged

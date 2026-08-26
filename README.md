@@ -73,6 +73,11 @@ scripts/test-bd-review-gate           # offline
 
 All six suites run in a few seconds with no network, no GitHub token and no bd database.
 
+The nightly sweep ships **enabled in your copy** (Actions is off on the template
+repo itself, which has no tracker to sweep). Before its first run, set the
+`BEADS_SWEEP_TOKEN` repo secret and edit `BD_SWEEP_REPOS` in the workflow —
+without them it degrades to a loud no-op.
+
 ---
 
 ## Two rules worth knowing before you touch anything
