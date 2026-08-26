@@ -1,0 +1,573 @@
+#!/usr/bin/env bash
+# bd-setup-sync — is this machine running the current beads setup, and does
+# anyone else know?
+#
+# The "setup" is the handful of files this repo ships in templates/ and that
+# only do anything once they are copied OUTSIDE every git repo: the session
+# sync hook, the workspace-root CLAUDE.md that tells every agent how we work,
+# and the workspace .claude/settings.json that wires the hooks up. That is the
+# whole point of them — hooks and workspace-root rules cannot live inside a
+# repo — and it is also why nothing versions the installed copies. No diff, no
+# `git status`, no CI can show that a machine is running last month's rules,
+# while that machine keeps syncing and every other check stays green.
+#
+# The cost is measured, not hypothetical. The automatic fork repair shipped in
+# templates/beads-sync.sh on 2026-08-19; one laptop was still running its
+# 2026-08-17 copy, so it never called bd-reconcile-fork, re-forked the tracker
+# on every sync, and was healed by hand three days running while nothing could
+# see why. bd-health grew a `cmp` against the hook template after
+# that — but only that one file, only on the machine you happen to be sitting
+# at, and only when a session happens to start. "Which machines have picked up
+# the change?" had no answer at all.
+#
+# This script answers three questions:
+#
+#   what is current?    A SETUP VERSION derived from the CONTENT of templates/
+#                       (see setup_version). Change a template and the version
+#                       changes — there is no field anyone can forget to bump,
+#                       which is the failure mode a hand-maintained version
+#                       number would just move rather than fix.
+#   what do I have?     Each artifact is compared against its template, and the
+#                       verdict plus the version is written to local state.
+#   who else has it?    A heartbeat published into the repo, ONE FILE PER
+#                       MACHINE so two machines can never conflict, which
+#                       bd-setup-report turns into a fleet view.
+#
+# And it installs the cron that runs all of that on a cadence, because a check
+# that only runs at session start cannot see the machine that has not started
+# a session — which is exactly the machine most likely to be behind.
+#
+# Usage: bd-setup-sync [<beads-repo>] [options]
+#   (default)         check, report, record state, publish heartbeat
+#   --apply           install any artifact that is out of date (backs it up)
+#   --quiet           print only findings and actions (hooks, cron)
+#   --json            machine-readable status on stdout, nothing else
+#   --no-publish      skip the heartbeat commit/push (offline, or a dry run)
+#   --install-cron    install the periodic checker, then exit
+#   --uninstall-cron  remove the periodic checker, then exit
+#   --cron-hours N    cadence for --install-cron (default 12; must be <= 24)
+#
+# Exit: 0 setup is current, 1 usage/environment error, 3 this machine is
+# behind or an artifact could not be verified. 3 is deliberately NOT reserved
+# for "something crashed": being behind is the finding this exists to report,
+# and a caller that treats it as a crash learns nothing.
+#
+# Sourcing it with BD_SETUP_SYNC_LIB=1 defines the functions and returns
+# without touching git, the filesystem, or the network, so the offline tests
+# can pin them (scripts/test-bd-setup-sync).
+
+set -uo pipefail
+
+# --- portability ------------------------------------------------------------
+# sha256 is spelled differently on the laptops (BSD, `shasum -a 256`) and in CI
+# (GNU, `sha256sum`). Everything downstream is content-addressed, so picking
+# the wrong one silently would make every machine's version disagree with
+# every other machine's — the exact confusion this file exists to remove.
+if command -v sha256sum >/dev/null 2>&1; then
+    _sha256() { sha256sum "$@" | cut -d' ' -f1; }
+elif command -v shasum >/dev/null 2>&1; then
+    _sha256() { shasum -a 256 "$@" | cut -d' ' -f1; }
+else
+    _sha256() { echo "no-sha256-available"; }
+fi
+
+_sha256_stdin() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum | cut -d' ' -f1
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 | cut -d' ' -f1
+    else
+        echo "no-sha256-available"
+    fi
+}
+
+now_utc() { date -u '+%Y-%m-%dT%H:%M:%SZ'; }
+
+# --- the manifest -----------------------------------------------------------
+# Every artifact this repo distributes by copying it out, as
+#   name <TAB> template-path <TAB> target-path <TAB> mode <TAB> perms
+# relative to the beads repo ($1) and its workspace ($2).
+#
+# mode is `exact` for a byte-for-byte copy and `templated` for one the install
+# step rewrites (settings.json has the absolute workspace path substituted in,
+# and SETUP.md tells anyone with an existing file to merge the blocks by hand).
+# The distinction is load-bearing: a templated artifact that does not match its
+# template has NOT necessarily drifted, and reporting it as drift would train
+# people to ignore this check — see verify_artifact.
+#
+# ADDING TO THIS LIST IS HOW A NEW ARTIFACT GETS DISTRIBUTED. Anything this
+# repo ships by copying out and does not list here is invisible again, which
+# is the whole bug.
+setup_manifest() {
+    repo=$1
+    ws=$2
+    printf 'hook\t%s\t%s\texact\t755\n' \
+        "$repo/templates/beads-sync.sh" "$HOME/.claude/hooks/beads-sync.sh"
+    printf 'agent-rules\t%s\t%s\texact\t644\n' \
+        "$repo/templates/workspace-CLAUDE.md" "$ws/CLAUDE.md"
+    printf 'settings\t%s\t%s\ttemplated\t644\n' \
+        "$repo/templates/workspace-settings.json" "$ws/.claude/settings.json"
+}
+
+# The canonical version of the setup: a short hash over every template's
+# CONTENT, keyed by name and sorted so it does not depend on manifest order.
+#
+# Derived rather than declared on purpose. A hand-maintained version field is
+# one more thing to forget in the same PR that changes the rules, and a version
+# that silently fails to bump is worse than none — every machine would report
+# "current" while running different files. Deriving it means the only way to
+# change the rules is to change the version.
+setup_version() {
+    repo=$1
+    ws=$2
+    setup_manifest "$repo" "$ws" | while IFS=$'\t' read -r name tmpl _ _ _; do
+        if [ -f "$tmpl" ]; then
+            printf '%s %s\n' "$name" "$(_sha256 "$tmpl")"
+        else
+            printf '%s MISSING-TEMPLATE\n' "$name"
+        fi
+    done | sort | _sha256_stdin | cut -c1-12
+}
+
+# Compare one installed artifact against its template.
+# Echoes: current | missing | stale | local-edits | differs | unverifiable
+#
+# `exact` is decided by content — but content only says the two files DIFFER,
+# never which one is newer, and both directions really happen. The very first
+# run of this script found the workspace CLAUDE.md ahead of its template: the
+# lint-slot rule had been fixed in the installed copy and never upstreamed, so
+# the template still shipped the `pgrep -f` wait-loop that deadlocks two
+# agents against each other, and every teammate re-copying
+# "the current rules" would have been handed the broken one. A check that
+# reported that as "you are BEHIND, re-copy" would have actively destroyed the
+# fix. So direction is inferred from this machine's own install record:
+#
+#   recorded == template-now  the template has not moved since this machine
+#                             last matched it, so the difference is a LOCAL
+#                             EDIT — upstream it, do not overwrite it.
+#   recorded != template-now  the template moved after we last matched — we
+#                             are STALE, re-copy.
+#   no record                 genuinely cannot tell. Say so instead of
+#                             guessing; `--apply` will not touch it either.
+#
+# The record is PER ARTIFACT and is the sha of the template as it stood the
+# last time this machine was seen to match it (or applied it) — not the global
+# setup version, and not "the version at the last check". Recording the check
+# would make every differing artifact report LOCAL EDITS from the second run
+# onward, since the check itself would have just stamped the current version
+# over the evidence. Only a match (or an --apply) may write the record.
+#
+# `templated` is decided differently again: the installed file legitimately
+# differs (the workspace path is substituted in) and may legitimately differ
+# further (an existing settings.json is merged by hand, per SETUP.md). It is
+# checked by reverse-substituting the workspace path; if that does not match,
+# the file is NOT called drift — we fall back to the install record, and if
+# that cannot answer either we say "unverifiable" and name the reason.
+# Reporting a hand-merged file as drift on every run is how a check becomes
+# something people scroll past (on the duplicate checker).
+verify_artifact() {
+    tmpl=$1; target=$2; mode=$3; ws=$4; recorded_sha=$5; tmpl_sha=$6
+    [ -f "$tmpl" ] || { echo "unverifiable"; return; }
+    [ -f "$target" ] || { echo "missing"; return; }
+    case "$mode" in
+        exact)
+            if cmp -s "$target" "$tmpl"; then
+                echo "current"
+            elif [ -z "$recorded_sha" ]; then
+                echo "differs"
+            elif [ "$recorded_sha" = "$tmpl_sha" ]; then
+                echo "local-edits"
+            else
+                echo "stale"
+            fi
+            ;;
+        templated)
+            if sed "s#$ws#/ABSOLUTE/PATH/TO/WORKSPACE#g" "$target" 2>/dev/null |
+                    cmp -s - "$tmpl"; then
+                echo "current"
+            elif [ -n "$recorded_sha" ] && [ "$recorded_sha" = "$tmpl_sha" ]; then
+                # Differs from the template, but this machine was last seen
+                # matching THIS template — a hand-merged file that is current.
+                echo "current"
+            else
+                echo "unverifiable"
+            fi
+            ;;
+        *) echo "unverifiable" ;;
+    esac
+}
+
+# Per-artifact provenance: "name<TAB>template-sha" lines. Deliberately a flat
+# file rather than a key in the JSON state — this is read and written from a
+# cron whose PATH is not the interactive one, and requiring jq there is how a
+# checker silently stops checking.
+record_path() { printf '%s/.claude/beads-setup-installed-%s.tsv\n' "$HOME" "$1"; }
+
+recorded_sha_for() {
+    [ -f "$1" ] || { printf ''; return; }
+    awk -F'\t' -v n="$2" '$1 == n { print $2; exit }' "$1"
+}
+
+record_sha_for() {
+    file=$1; name=$2; sha=$3
+    mkdir -p "$(dirname "$file")"
+    tmp="$file.tmp.$$"
+    { [ -f "$file" ] && awk -F'\t' -v n="$name" '$1 != n' "$file"; printf '%s\t%s\n' "$name" "$sha"; } > "$tmp" 2>/dev/null
+    mv "$tmp" "$file" 2>/dev/null || rm -f "$tmp"
+}
+
+# Where this machine's per-workspace state lives. Keyed by workspace name the
+# same way the sync hook keys its lock and stale marker, because one machine
+# genuinely runs more than one tracker (a second workspace has its own) and
+# a shared state file would have them overwrite each other's answers.
+state_path() { printf '%s/.claude/beads-setup-state-%s.json\n' "$HOME" "$1"; }
+
+# A stable, filesystem-safe identity for this machine+user, used as the
+# heartbeat filename. One file per machine is what keeps machines from ever
+# conflicting with each other in git: two laptops publishing at the same
+# moment touch different paths, so the only failure left is a push race, which
+# publish_heartbeat retries.
+machine_id() {
+    host=$(hostname -s 2>/dev/null || echo unknown-host)
+    who=$(id -un 2>/dev/null || echo unknown-user)
+    printf '%s' "$host-$who" | tr -c 'A-Za-z0-9._-' '-'
+}
+
+heartbeat_dir() { printf '%s/.beads-setup/heartbeats\n' "$1"; }
+
+read_json_field() {
+    # read_json_field <file> <key> — "" when the file or key is absent. Uses
+    # jq when present and falls back to sed, because this runs from a cron
+    # whose PATH is not the interactive one.
+    #
+    # Deliberately `has($k)` + tostring rather than the obvious `.[$k] // ""`:
+    # jq's `//` treats FALSE as empty, so a boolean field that is false reads
+    # back as "" and is indistinguishable from a missing one. That made every
+    # machine report its cron as "unknown" instead of "not installed" — the
+    # answer the report exists to give.
+    [ -f "$1" ] || { printf ''; return; }
+    if command -v jq >/dev/null 2>&1; then
+        jq -r --arg k "$2" 'if has($k) then (.[$k] | tostring) else "" end' "$1" 2>/dev/null
+    else
+        sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\"\{0,1\}\([^\",}]*\)\"\{0,1\}.*/\1/p" "$1" |
+            head -1 | tr -d ' '
+    fi
+}
+
+# Cron identity, derived from the workspace name so one machine running two
+# trackers (a second workspace has its own) gets two independent jobs.
+#
+# These live ABOVE the library early-return on purpose. They started out below
+# it, next to the install code, and bd-health — which sources this file for its
+# verdicts — then called cron_installed() against unset variables and reported
+# "no periodic check installed" on a machine where one was loaded and running.
+# A checker that cannot see its own scheduler is worse than no checker: it
+# sends you to fix something that is not broken.
+cron_label() { printf 'dev.beads.setup-sync.%s\n' "$1"; }
+cron_plist() { printf '%s/Library/LaunchAgents/%s.plist\n' "$HOME" "$(cron_label "$1")"; }
+
+# cron_installed <workspace-name>
+cron_installed() {
+    if [ "$(uname -s)" = "Darwin" ]; then
+        [ -f "$(cron_plist "$1")" ]
+    else
+        crontab -l 2>/dev/null | grep -q "$(cron_label "$1")"
+    fi
+}
+
+[ "${BD_SETUP_SYNC_LIB:-0}" = 1 ] && return 0
+
+# --- arguments --------------------------------------------------------------
+APPLY=0 QUIET=0 JSON=0 PUBLISH=1 CRON_ACTION="" CRON_HOURS=12
+BEADS_REPO=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --apply) APPLY=1 ;;
+        --quiet) QUIET=1 ;;
+        --json) JSON=1 ;;
+        --no-publish) PUBLISH=0 ;;
+        --install-cron) CRON_ACTION=install ;;
+        --uninstall-cron) CRON_ACTION=uninstall ;;
+        --cron-hours) shift; CRON_HOURS=${1:-12} ;;
+        -h|--help) sed -n '2,60p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -*) echo "bd-setup-sync: unknown option $1" >&2; exit 1 ;;
+        *) BEADS_REPO=$1 ;;
+    esac
+    shift
+done
+
+if [ -z "$BEADS_REPO" ]; then
+    BEADS_REPO="${BEADS_SETUP_REPO:-}"
+fi
+if [ -z "$BEADS_REPO" ] && [ -n "${BEADS_DIR:-}" ]; then
+    BEADS_REPO=$(dirname "$BEADS_DIR")
+fi
+if [ -z "$BEADS_REPO" ]; then
+    # No hardcoded fallback: on a machine running two trackers a default path
+    # silently answers about the wrong one, and "which tracker did you mean?"
+    # is the one question this tool must never guess at.
+    echo "$(basename "$0"): pass the path to your beads repo (or set BEADS_SETUP_REPO / BEADS_DIR)" >&2
+    exit 1
+fi
+
+if [ ! -d "$BEADS_REPO/templates" ]; then
+    echo "bd-setup-sync: no templates/ under $BEADS_REPO — pass the beads repo path" >&2
+    exit 1
+fi
+BEADS_REPO=$(cd "$BEADS_REPO" && pwd)
+
+# The workspace is the parent of the MAIN checkout, not of whatever copy of
+# the repo this script was invoked from. Run from a worktree under
+# .mr-worktrees/ — which is exactly how a change to these templates gets
+# tested — the naive dirname answers ".mr-worktrees", and every artifact then
+# looks "NOT INSTALLED" because we went looking in a directory nobody
+# installs into. Templates still come from the invoked copy, so testing a
+# template change against the real installed files works.
+main_checkout=$(git -C "$BEADS_REPO" worktree list 2>/dev/null | head -1 | awk '{print $1}')
+if [ -n "$main_checkout" ] && [ -d "$main_checkout" ]; then
+    WS=$(dirname "$main_checkout")
+else
+    WS=$(dirname "$BEADS_REPO")
+fi
+# BEADS_DIR is the operator's own statement of which tracker this is, so it
+# wins when it disagrees (a repo cloned somewhere unusual, or a test rig).
+if [ -n "${BEADS_DIR:-}" ] && [ -d "${BEADS_DIR:-}" ]; then
+    WS=$(dirname "$(dirname "$BEADS_DIR")")
+fi
+WS_NAME=$(basename "$WS")
+
+say() { [ "$JSON" = 1 ] && return 0; echo "$@"; }
+note() { [ "$QUIET" = 1 ] && return 0; say "$@"; }
+
+# --- cron -------------------------------------------------------------------
+# A session-start check cannot see the machine that has not started a session,
+# and that is precisely the machine running month-old rules. So the cadence
+# has to come from outside any session. launchd on macOS (cron is deprecated
+# there and a LaunchAgent survives reboots and logins), crontab elsewhere.
+CRON_LABEL=$(cron_label "$WS_NAME")
+PLIST=$(cron_plist "$WS_NAME")
+
+install_cron() {
+    case "$CRON_HOURS" in
+        ''|*[!0-9]*) echo "bd-setup-sync: --cron-hours needs a number" >&2; exit 1 ;;
+    esac
+    if [ "$CRON_HOURS" -lt 1 ] || [ "$CRON_HOURS" -gt 24 ]; then
+        echo "bd-setup-sync: --cron-hours must be between 1 and 24" >&2
+        exit 1
+    fi
+    interval=$((CRON_HOURS * 3600))
+    logdir="$HOME/.claude/logs"
+    mkdir -p "$logdir"
+    if [ "$(uname -s)" = "Darwin" ]; then
+        mkdir -p "$HOME/Library/LaunchAgents"
+        cat > "$PLIST" <<PLIST_EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$CRON_LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>-c</string>
+    <string>exec '$BEADS_REPO/scripts/bd-setup-sync' '$BEADS_REPO' --quiet</string>
+  </array>
+  <key>StartInterval</key><integer>$interval</integer>
+  <!-- Without this a laptop that was asleep at the fire time simply skips the
+       run, which is the one machine we most need to hear from. -->
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>$logdir/beads-setup-sync.log</string>
+  <key>StandardErrorPath</key><string>$logdir/beads-setup-sync.log</string>
+</dict>
+</plist>
+PLIST_EOF
+        launchctl unload "$PLIST" >/dev/null 2>&1
+        if launchctl load "$PLIST" >/dev/null 2>&1; then
+            say "Installed the beads setup checker: every ${CRON_HOURS}h via launchd ($CRON_LABEL)."
+        else
+            say "Wrote $PLIST but launchctl load failed — load it by hand: launchctl load '$PLIST'"
+            return 1
+        fi
+    else
+        line="0 */$CRON_HOURS * * * '$BEADS_REPO/scripts/bd-setup-sync' '$BEADS_REPO' --quiet >> $logdir/beads-setup-sync.log 2>&1 # $CRON_LABEL"
+        existing=$(crontab -l 2>/dev/null | grep -v "$CRON_LABEL")
+        printf '%s\n%s\n' "$existing" "$line" | grep -v '^$' | crontab - || {
+            say "Could not write crontab; add this line by hand:"; say "$line"; return 1; }
+        say "Installed the beads setup checker: every ${CRON_HOURS}h via crontab ($CRON_LABEL)."
+    fi
+    say "It runs $BEADS_REPO/scripts/bd-setup-sync --quiet and logs to $logdir/beads-setup-sync.log."
+}
+
+uninstall_cron() {
+    if [ "$(uname -s)" = "Darwin" ]; then
+        launchctl unload "$PLIST" >/dev/null 2>&1
+        rm -f "$PLIST" && say "Removed the beads setup checker ($CRON_LABEL)."
+    else
+        crontab -l 2>/dev/null | grep -v "$CRON_LABEL" | crontab - 2>/dev/null &&
+            say "Removed the beads setup checker ($CRON_LABEL)."
+    fi
+}
+
+case "$CRON_ACTION" in
+    install) install_cron; exit $? ;;
+    uninstall) uninstall_cron; exit $? ;;
+esac
+
+# --- check ------------------------------------------------------------------
+STATE=$(state_path "$WS_NAME")
+RECORD=$(record_path "$WS_NAME")
+VERSION=$(setup_version "$BEADS_REPO" "$WS")
+
+behind=0
+statuses=""
+actions=""
+
+while IFS=$'\t' read -r name tmpl target mode perms; do
+    tmpl_sha=""
+    [ -f "$tmpl" ] && tmpl_sha=$(_sha256 "$tmpl")
+    recorded_sha=$(recorded_sha_for "$RECORD" "$name")
+    verdict=$(verify_artifact "$tmpl" "$target" "$mode" "$WS" "$recorded_sha" "$tmpl_sha")
+    # --apply installs the template over the target. That is only ever the
+    # right move when we KNOW the target is the older side. `local-edits` and
+    # `differs` mean the installed copy may carry the newer rules — the first
+    # run of this script found exactly that — and overwriting them would
+    # delete a fix nobody had upstreamed yet. Those two are reported and left
+    # alone; there is no flag to force them, because the correct repair is to
+    # commit the edit to the template, not to discard it.
+    if [ "$APPLY" = 1 ] && [ "$mode" = exact ] && [ -f "$tmpl" ] &&
+       { [ "$verdict" = stale ] || [ "$verdict" = missing ]; }; then
+        mkdir -p "$(dirname "$target")"
+        # Back up before overwriting: the installed copy is the only one on
+        # this machine, and a local edit someone meant to upstream must not
+        # vanish silently. Same reason bd-reconcile-fork never rewrites a
+        # record it already has.
+        if [ -f "$target" ]; then
+            cp "$target" "$target.pre-setup-sync.$(date -u '+%Y%m%dT%H%M%SZ')" 2>/dev/null
+        fi
+        if cp "$tmpl" "$target" 2>/dev/null; then
+            chmod "$perms" "$target" 2>/dev/null
+            actions="$actions installed:$name"
+            verdict=current
+        else
+            actions="$actions FAILED:$name"
+        fi
+    fi
+    # Only a match (or the --apply above, which produces one) may write the
+    # record — see verify_artifact. Stamping it on every check would erase the
+    # evidence that tells a stale copy from a locally-improved one.
+    if [ "$verdict" = current ] && [ -n "$tmpl_sha" ]; then
+        record_sha_for "$RECORD" "$name" "$tmpl_sha"
+    fi
+    [ "$verdict" = current ] || behind=1
+    statuses="$statuses$name=$verdict "
+    case "$verdict" in
+        missing)
+            note "  $name: NOT INSTALLED — $target is absent. Run with --apply to install it."
+            ;;
+        stale)
+            note "  $name: STALE — the template moved after this machine installed it (recorded template ${recorded_sha:0:12}, now ${tmpl_sha:0:12}). Run with --apply to update $target."
+            ;;
+        local-edits)
+            note "  $name: LOCAL EDITS — $target differs from $tmpl, but this machine already has the current version ($VERSION), so the edits are yours and NEWER. Upstream them: commit the change to $tmpl so the team gets it. --apply will not overwrite this."
+            ;;
+        differs)
+            note "  $name: DIFFERS, direction unknown — $target and $tmpl are not the same and this machine has no install record to say which is newer. Diff them before doing anything: if the installed copy carries the newer rules, upstream it to the template; if not, --apply after recording. --apply will not overwrite this."
+            ;;
+        unverifiable)
+            note "  $name: CANNOT VERIFY — $target is not a plain copy of $tmpl (it is templated or hand-merged) and this machine has no install record at the current version. Re-apply the block from the template after checking your local edits."
+            ;;
+    esac
+done <<EOF
+$(setup_manifest "$BEADS_REPO" "$WS")
+EOF
+
+# The hook is the one artifact whose staleness has already cost us days, so it
+# gets named rather than folded into a count.
+if [ "$behind" = 1 ]; then
+    note "This machine is NOT running the current beads setup (version $VERSION)."
+    note "Fix: $BEADS_REPO/scripts/bd-setup-sync '$BEADS_REPO' --apply"
+    note "Re-apply the sync hook only while no sync is in flight — sh reads a running script by byte offset."
+else
+    note "Beads setup is current (version $VERSION)."
+fi
+[ -n "$actions" ] && say "Applied:$actions"
+
+# --- record -----------------------------------------------------------------
+# Written on EVERY run, current or not. "When did this machine last check?" is
+# a different question from "is it current?", and only the first one can tell a
+# silent machine from a healthy one — the same reason the sync hook logs an OK
+# heartbeat rather than only failures.
+mkdir -p "$(dirname "$STATE")"
+CHECKED=$(now_utc)
+# `setup_version` is the version of templates/ this machine READ, which
+# answers "has it even pulled the change?". It is NOT evidence the machine is
+# running it — the first version of this file published the template version
+# alone, so a machine that had pulled the new templates and installed none of
+# them still reported as "current" in the fleet report, which is precisely the
+# machine the report exists to find. `up_to_date` is the load-bearing field
+# and the report keys on it; the version is what makes a laggard's row
+# readable ("stuck on X" vs "has X but has not applied it").
+cat > "$STATE" <<STATE_EOF
+{
+  "setup_version": "$VERSION",
+  "workspace": "$WS_NAME",
+  "machine": "$(machine_id)",
+  "last_checked": "$CHECKED",
+  "up_to_date": $([ "$behind" = 0 ] && echo true || echo false),
+  "artifacts": "$(echo "$statuses" | sed 's/ *$//')",
+  "cron_installed": $(cron_installed "$WS_NAME" && echo true || echo false)
+}
+STATE_EOF
+
+# --- publish ----------------------------------------------------------------
+# The heartbeat is what makes "who has gotten the update?" answerable at all.
+# It goes in the repo, one file per machine, so it distributes over the sync
+# everyone already runs and two machines can never conflict.
+publish_heartbeat() {
+    hbdir=$(heartbeat_dir "$BEADS_REPO")
+    hb="$hbdir/$(machine_id).json"
+    mkdir -p "$hbdir"
+    cp "$STATE" "$hb" || return 1
+
+    # Only commit when something a reader would care about changed, or when
+    # the published copy has gone stale. last_checked moves every run, so
+    # committing on any difference would put a commit on main every cron
+    # firing, on every machine, forever.
+    prev_version=$(cd "$BEADS_REPO" && git show "HEAD:.beads-setup/heartbeats/$(machine_id).json" 2>/dev/null |
+        (command -v jq >/dev/null 2>&1 && jq -r '.setup_version // ""' 2>/dev/null || cat) 2>/dev/null | head -1)
+    prev_checked=$(cd "$BEADS_REPO" && git log -1 --format=%ct -- ".beads-setup/heartbeats/$(machine_id).json" 2>/dev/null)
+    nowsec=$(date -u '+%s')
+    stale=1
+    if [ -n "$prev_checked" ] && [ $((nowsec - prev_checked)) -lt 43200 ]; then
+        stale=0
+    fi
+    if [ "$prev_version" = "$VERSION" ] && [ "$stale" = 0 ]; then
+        return 0
+    fi
+
+    (
+        cd "$BEADS_REPO" || exit 1
+        [ "$(git rev-parse --abbrev-ref HEAD 2>/dev/null)" = main ] || exit 0
+        git add ".beads-setup/heartbeats/$(machine_id).json" 2>/dev/null || exit 1
+        git diff --cached --quiet && exit 0
+        git commit -q -m "chore: setup heartbeat" >/dev/null 2>&1 || exit 1
+        git push -q origin main >/dev/null 2>&1 && exit 0
+        # Racing another machine's heartbeat or an export commit is the normal
+        # case here, not an error: rebase onto whatever landed and try once
+        # more. One file per machine means the rebase cannot conflict.
+        git fetch -q origin main >/dev/null 2>&1
+        git pull --rebase -q origin main >/dev/null 2>&1 || { git rebase --abort >/dev/null 2>&1; exit 1; }
+        git push -q origin main >/dev/null 2>&1
+    )
+}
+
+if [ "$PUBLISH" = 1 ]; then
+    publish_heartbeat || note "Heartbeat not published (offline, or the push raced and lost) — the local state file is still current."
+fi
+
+if [ "$JSON" = 1 ]; then
+    cat "$STATE"
+fi
+
+[ "$behind" = 0 ] || exit 3
+exit 0

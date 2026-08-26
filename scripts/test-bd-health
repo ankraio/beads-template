@@ -1,0 +1,187 @@
+#!/usr/bin/env bash
+# Tests for bd-health's export-fork verdict — the rule that decides whether a
+# fork is work for a human or one the sync hook is already healing by itself.
+#
+# Both ways of being wrong are expensive, and the tracker has now been bitten by
+# each of them:
+#
+#   - too loud, and a self-healing fork reads as manual work. Every session
+#     start after a fork arrives prints "run bd dolt pull and re-export", so
+#     somebody files it. On 2026-08-20 that became acme-os4p2 and was
+#     dispatched to an agent for a fork scripts/bd-reconcile-fork had already
+#     merged at 12:06:02 that same day, straight out of the sync hook.
+#   - too quiet, and a fork nothing is repairing looks routine. That is the
+#     failure this whole check exists for: on 2026-08-17 the tracker ran forked
+#     for days with 40 JSONL-only and 664 Dolt-only issues and the only signal
+#     was bd's per-write "auto-export skipped" warning.
+#
+# So the tests below pin the boundary between them, and every one runs offline:
+# the script is sourced with BD_HEALTH_LIB=1, which defines the helpers and
+# stops before any bd, gh or filesystem check of the live tracker.
+#
+# Run: scripts/test-bd-health
+
+set -uo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+# shellcheck source=/dev/null
+BD_HEALTH_LIB=1 . "$SCRIPT_DIR/bd-health"
+
+FAILED=0
+pass() { printf '  ok   %s\n' "$1"; }
+fail() { printf '  FAIL %s\n     %s\n' "$1" "$2"; FAILED=$((FAILED + 1)); }
+
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+
+# The jsonl this machine last wrote, and "now" five minutes later. Fixed times
+# rather than the clock: the whole rule is about ordering two timestamps.
+JSONL="$TMP/issues.jsonl"
+: >"$JSONL"
+touch -t 202608201200.00 "$JSONL"
+JSONL_AT=$(mtime_epoch "$JSONL")
+NOW=$((JSONL_AT + 300))
+
+synclog() {
+    # synclog <line>... — write a sync log and echo its path
+    printf '%s\n' "$@" >"$TMP/sync.log"
+    printf '%s\n' "$TMP/sync.log"
+}
+
+check() {
+    # check <expected> <n_jsonl> <n_dolt> <hook_current> <synclog> <now> <name> [repo]
+    local want=$1 name=$7 got
+    got=$(fork_verdict "$2" "$3" "$4" "$5" "$JSONL" "$6" "${8:-}")
+    if [ "$got" = "$want" ]; then
+        pass "$name"
+    else
+        fail "$name" "fork_verdict answered '$got', expected '$want'"
+    fi
+}
+
+NONE="$TMP/no-such-sync.log"
+
+echo "bd-health fork verdict tests"
+
+# --- 1. the regression: a fork the hook has not reached yet ----------------
+# acme-os4p2's own shape. The reconciler last ran at 11:55, this machine's
+# jsonl was rewritten at 12:00 by the sync hook's git convergence, and the
+# session starts at 12:05 — so the fork post-dates the last reconcile and the
+# next sync merges it. Nobody should be told to do anything.
+log=$(synclog \
+    "[2026-08-20 11:55:01] reconcile-fork (rc=0) in /ws/beads:" \
+    "Reconciled tracker fork: 47 issue(s) imported into the local Dolt store, 1 status(es) restored. Auto-export is unblocked." \
+    "[2026-08-20 11:56:02] sync OK in /ws/beads")
+check self-healing 47 1 1 "$log" "$NOW" \
+    "a fork that arrived after the last clean reconcile is self-healing"
+
+# Both sides of the same fork: the Dolt-only side is the export the JSONL-only
+# side is blocking, so healing the one clears the other. Same verdict.
+check self-healing 47 0 1 "$log" "$NOW" \
+    "the JSONL-only side alone is still self-healing"
+
+# --- 2. a fork nothing is going to repair ---------------------------------
+# The hook is not the copy templates/ ships (2026-08-19, acme-6od1g: the
+# laptop that needed the repair most had a hook from two days before it
+# shipped). Nothing calls the reconciler, so this one waits for a human.
+check no-hook 47 1 0 "$log" "$NOW" \
+    "a drifted sync hook means no reconcile, so the fork is real work"
+
+# --- 3. the reconciler ran and did not fix it -----------------------------
+# Cleanly, after the jsonl was last written, and the two sides still disagree:
+# the union merge is not covering this fork and the next sync will not either.
+log=$(synclog \
+    "[2026-08-20 12:03:00] reconcile-fork (rc=0) in /ws/beads:" \
+    "Reconciled tracker fork: 3 issue(s) imported into the local Dolt store, 0 status(es) restored. Auto-export is unblocked.")
+check "survived:2026-08-20 12:03:00" 47 1 1 "$log" "$NOW" \
+    "a fork that outlived a clean reconcile is reported with the time it ran"
+
+# Nonzero: the import did not finish, so the export stays frozen.
+log=$(synclog \
+    "[2026-08-20 12:03:00] reconcile-fork (rc=3) in /ws/beads:" \
+    "WARNING: beads fork reconcile did not finish - the export is still blocked")
+check "failed:2026-08-20 12:03:00" 47 1 1 "$log" "$NOW" \
+    "a reconcile that exited nonzero is reported as a failure, not as pending"
+
+# A failure BEFORE the jsonl arrived is still a failure: the ordering rule only
+# ever downgrades a fork to self-healing on a run that succeeded.
+log=$(synclog "[2026-08-20 11:00:00] reconcile-fork (rc=3) in /ws/beads:")
+check "failed:2026-08-20 11:00:00" 47 1 1 "$log" "$NOW" \
+    "an earlier failed reconcile is not excused by a newer jsonl"
+
+# --- 4. the log is read last-line-first -----------------------------------
+# The sync log is append-only and holds every run this machine ever made, so
+# reading anything but the newest reconcile answers about the wrong day.
+log=$(synclog \
+    "[2026-08-20 09:00:00] reconcile-fork (rc=3) in /ws/beads:" \
+    "[2026-08-20 11:55:01] reconcile-fork (rc=0) in /ws/beads:" \
+    "[2026-08-20 11:56:02] sync OK in /ws/beads")
+check self-healing 47 1 1 "$log" "$NOW" \
+    "an old failure does not outvote the newest successful reconcile"
+
+log=$(synclog \
+    "[2026-08-20 09:00:00] reconcile-fork (rc=0) in /ws/beads:" \
+    "[2026-08-20 12:03:00] reconcile-fork (rc=3) in /ws/beads:")
+check "failed:2026-08-20 12:03:00" 47 1 1 "$log" "$NOW" \
+    "an old success does not hide the newest failed reconcile"
+
+# --- 5. a reconciler that has never run here ------------------------------
+# Wired but with nothing in the log yet — a fresh machine, or a log that was
+# rotated. Nothing there says the reconcile will fail, and check 5 of bd-health
+# already reports a hook that is not producing heartbeats.
+log=$(synclog "[2026-08-20 11:56:02] sync OK in /ws/beads")
+check self-healing 47 1 1 "$log" "$NOW" \
+    "a wired reconciler with no run in the log yet is trusted once"
+check self-healing 47 1 1 "$NONE" "$NOW" \
+    "a missing sync log is not evidence the reconcile failed"
+
+# --- 6. the Dolt-only side on its own -------------------------------------
+# No JSONL-only records means nothing is blocking the auto-export, so this is
+# not the reconciler's fork at all: it is bd's export trailing the newest
+# writes, and the next mutating command clears it.
+log=$(synclog "[2026-08-20 12:03:00] reconcile-fork (rc=3) in /ws/beads:")
+check export-lag 0 1 1 "$log" "$NOW" \
+    "a Dolt-only fork with a freshly written jsonl is export lag"
+check export-lag 0 1 0 "$NONE" "$NOW" \
+    "a Dolt-only fork does not depend on the reconciler or the hook"
+
+# ...but an export that has not run in an hour while the database has issues it
+# lacks is frozen, and the committed jsonl — the GitHub issue view — is stale.
+check export-frozen 0 1 1 "$log" "$((JSONL_AT + 7200))" \
+    "a Dolt-only fork with a stale jsonl is a frozen export"
+# Exactly at the grace boundary counts as stale: the window is generous
+# already, and a wrong answer here should be the loud one.
+check export-frozen 0 1 1 "$log" "$((JSONL_AT + FORK_EXPORT_GRACE))" \
+    "the grace window is exclusive at its edge"
+
+# An unreadable jsonl gives no mtime, and "I could not tell" must not read as
+# "recently written" — the same rule the fork check itself follows when either
+# side of the comparison comes back empty.
+JSONL="$TMP/gone.jsonl"
+check export-frozen 0 1 1 "$NONE" "$NOW" \
+    "an unreadable jsonl is reported, not assumed fresh"
+JSONL="$TMP/issues.jsonl"
+
+# --- 7. two trackers share one machine, and one sync log -------------------
+# ~/.claude/logs/beads-sync.log is per MACHINE, not per tracker: on a laptop
+# running two workspaces, the other tracker's lines interleave with ours, and
+# reading the newest reconcile line regardless of path answers about the
+# wrong tracker (2026-08-24: the other workspace's first bd-health run reported the first workspace's
+# failures). The optional repo argument scopes the read to one tracker.
+log=$(synclog \
+    "[2026-08-20 11:55:01] reconcile-fork (rc=0) in /ws/beads:" \
+    "[2026-08-20 12:03:00] reconcile-fork (rc=3) in /other/beads:")
+check self-healing 47 1 1 "$log" "$NOW" \
+    "another tracker's failed reconcile is not read as ours" /ws/beads
+check "failed:2026-08-20 12:03:00" 47 1 1 "$log" "$NOW" \
+    "scoping to the other tracker still sees its failure" /other/beads
+check "failed:2026-08-20 12:03:00" 47 1 1 "$log" "$NOW" \
+    "unscoped keeps the old newest-line behavior"
+
+echo
+if [ "$FAILED" -eq 0 ]; then
+    echo "all fork verdict tests passed"
+    exit 0
+fi
+echo "$FAILED test(s) failed"
+exit 1

@@ -1,0 +1,215 @@
+# Nightly sweep of in_review / in_progress beads.
+#
+# Closes beads whose citing PRs have all merged (scripts/bd-sweep-merged) and
+# publishes a job summary of what closed and what is still parked in review,
+# oldest first. Runs GitHub-side PR discovery (--search-citing), so a merged
+# PR that cites a bead id closes the bead even when nobody pasted the PR
+# number back into the bead.
+#
+# Secrets:
+#   BEADS_SWEEP_TOKEN — fine-grained PAT (your org, all repos,
+#     permissions: Pull requests: read + Metadata: read). Needed to see PRs
+#     in your other repos; without it the sweep falls back to the job
+#     token, sees nothing outside this repo, and closes nothing (safe, loud).
+#
+# The Dolt data ref (refs/dolt/data) is pulled and pushed with the job token
+# over https; laptops keep using SSH. bd version is pinned — keep it in
+# lockstep with the laptops' Homebrew bd to avoid schema drift in the shared
+# database (bump both together). The BD_SHA256 below pins the binary itself.
+#
+# This job cannot report its own death. On 2026-08-10 it stopped running
+# entirely (Actions billing: "the job was not started"), and since no step
+# ever executed, no in-workflow notification could fire; eight nights failed
+# unnoticed while in_review grew past 360 beads. Liveness is therefore
+# watched from OUTSIDE Actions by scripts/bd-health, which runs from the
+# laptop session hooks and warns when the last successful run of this
+# workflow is older than 48h. Keep that check working — it is the only thing
+# standing between a dead scheduler and a silently rotting tracker.
+
+name: nightly-review-sweep
+
+on:
+  schedule:
+    - cron: "43 2 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: beads-dolt-sync
+  cancel-in-progress: false
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      BD_VERSION: "1.1.0"
+      BD_NON_INTERACTIVE: "1"
+      BEADS_ACTOR: nightly-sweep-bot
+    steps:
+      # Pinned to a commit SHA, not a floating tag: a tag can be repointed at
+      # new code, and this job holds contents:write on the tracker.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.2.2
+
+      - name: Install bd
+        env:
+          # sha256 of beads_<ver>_linux_amd64.tar.gz from the release's
+          # checksums.txt. Bump together with BD_VERSION; a release asset can
+          # be re-uploaded, so verify rather than trust the URL.
+          BD_SHA256: "b0f3dd607c3fb989ee08d0a6854fba80d0402971eb108f9af6170bc14d491a34"
+        run: |
+          curl -fsSL -o /tmp/bd.tar.gz "https://github.com/gastownhall/beads/releases/download/v${BD_VERSION}/beads_${BD_VERSION}_linux_amd64.tar.gz"
+          echo "${BD_SHA256}  /tmp/bd.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/bd.tar.gz -C /tmp bd
+          sudo install -m 0755 /tmp/bd /usr/local/bin/bd
+          bd version
+
+      - name: Bootstrap tracker from Dolt remote
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          # The committed sync.remote is SSH (for laptops); CI authenticates
+          # over https with the job token. Runner-local edit only — the jsonl
+          # commit below adds specific paths, so this never lands on main.
+          #
+          # This writes a credential into a file on the runner, which is
+          # unavoidable: dolt reads its remote from config.yaml. Bound the
+          # exposure instead — 0600 so nothing else on the runner reads it,
+          # and the "Scrub credential" step below restores the file even when
+          # the job fails, so no later step, artifact, or cache can carry it.
+          sed -i "s#^sync.remote:.*#sync.remote: \"git+https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git\"#" .beads/config.yaml
+          chmod 600 .beads/config.yaml
+          bd bootstrap --yes
+
+      - name: Sweep beads whose citing PRs merged
+        env:
+          GH_TOKEN: ${{ secrets.BEADS_SWEEP_TOKEN || github.token }}
+          HAS_SWEEP_TOKEN: ${{ secrets.BEADS_SWEEP_TOKEN != '' }}
+          # EDIT ME: every repo in your org whose PRs may deliver a bead, plus
+          # this one. In CI there are no sibling checkouts, so this list IS the
+          # vocabulary for `repo#123` references and the open-PR cross-check.
+          BD_SWEEP_REPOS: api web worker infra beads
+        run: |
+          if [ "$HAS_SWEEP_TOKEN" != "true" ]; then
+            echo "::warning::BEADS_SWEEP_TOKEN is not set — the job token cannot see PRs in your other repos, so this run will close nothing."
+          fi
+          set +e
+          ./scripts/bd-sweep-merged --apply --search-citing | tee /tmp/sweep.out
+          status=${PIPESTATUS[0]}
+          set -e
+          echo "SWEEP_STATUS=$status" >> "$GITHUB_ENV"
+          # Both 3 and 5 mean "the sweep RAN and closed real beads, and also
+          # has something to tell you". Aborting here would skip the push-back
+          # below and throw those closes away — they live only in this job's
+          # ephemeral database until it pushes. So neither one exits here.
+          #
+          # 3 = GitHub would not resolve every PR it asked about, so some beads
+          #     were left open on an unknown state rather than a known one.
+          #     That is a bad night: the run is failed in the last step, after
+          #     the push-back.
+          # 5 = an in_review bead names only PRs that deliver some other bead.
+          #     That is a finding about tracker DATA, not about this run's
+          #     health — the sweep did its whole job. It is a warning, and the
+          #     run stays green, because the ONLY thing watching this workflow
+          #     from outside is scripts/bd-health's "last successful run"
+          #     liveness check, and exit 5 is a standing condition: it holds
+          #     until a human records the right PR on the bead. Failing on it
+          #     paints the sweep red indefinitely and buries the one signal
+          #     that says the scheduler itself died (the 2026-08-10 billing
+          #     outage, eight nights unnoticed). The finding is surfaced in
+          #     the job summary instead, where it is actionable.
+          #
+          # Regression this encodes: run 32686984270 closed four
+          # beads, exited 5, skipped push-back, and discarded all four.
+          if [ "$status" = 3 ]; then
+            echo "::error::sweep ran degraded — GitHub lookups did not resolve; some beads were left open on an unknown state (see job summary)"
+          elif [ "$status" = 5 ]; then
+            echo "::warning::sweep found in_review bead(s) whose recorded PR delivers a different bead — they can never auto-close until the real PR is recorded (see job summary)"
+          elif [ "$status" != 0 ]; then
+            exit "$status"
+          fi
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "## Nightly review sweep"
+            echo
+            if grep -q ': DEGRADED' /tmp/sweep.out 2>/dev/null; then
+              echo "### :warning: Degraded — GitHub lookups did not resolve"
+              echo
+              echo "These beads were left open on an **unknown** state, not a known one. Re-run the workflow once GitHub is healthy."
+              echo
+              grep ': DEGRADED' /tmp/sweep.out | sed 's/^/- /'
+              echo
+            fi
+            # Exit 5's finding. Given its own section because it is the one
+            # thing here that nothing else ever revisits: the bead looks
+            # referenced, so a reader skims past it, and --search-citing asks
+            # GitHub which PRs cite the bead and is told none.
+            if grep -q ': MISRECORDED' /tmp/sweep.out 2>/dev/null; then
+              echo "### :warning: Misrecorded — these beads can never auto-close"
+              echo
+              echo "Each names only PRs that deliver some **other** bead, so no sweep can close it and \`--search-citing\` will not find it either. Record the real PR on the bead to unpark it."
+              echo
+              grep ': MISRECORDED' /tmp/sweep.out | sed 's/^/- /'
+              echo
+            fi
+            echo "### Closed this run"
+            grep ': CLOSED' /tmp/sweep.out 2>/dev/null | sed 's/^/- /' || echo "_nothing closed_"
+            echo
+            echo "### Still parked in review (oldest first)"
+            bd list --status=in_review,in_progress --limit 0 --json 2>/dev/null |
+              jq -r 'sort_by(.updated_at)[] | "- **\(.id)** (\(.status), updated \(.updated_at[0:10])) \(.title)"' \
+              || echo "_listing unavailable_"
+            echo
+            echo "<details><summary>Per-bead sweep notes</summary>"
+            echo
+            grep -v ': CLOSED' /tmp/sweep.out 2>/dev/null | sed 's/^/    /' || true
+            echo
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Push tracker state back
+        run: |
+          bd dolt commit || true
+          bd dolt pull
+          bd dolt push
+          bd export -o .beads/issues.jsonl
+          if ! git diff --quiet -- .beads/issues.jsonl; then
+            git config user.name "beads-nightly-sweep"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add .beads/issues.jsonl
+            git commit -m "chore: sync issue export (nightly sweep)"
+            git pull --rebase origin main && git push origin main ||
+              echo "::warning::jsonl export commit not pushed (concurrent update); the Dolt push above already carried the real data"
+          fi
+
+      # Runs even when an earlier step fails, so a crashed job never leaves
+      # the token sitting in the workspace.
+      - name: Scrub credential from config
+        if: always()
+        run: |
+          git checkout -- .beads/config.yaml 2>/dev/null || true
+          if grep -q 'x-access-token' .beads/config.yaml 2>/dev/null; then
+            echo "::error::sync.remote still holds a credential after scrub"
+            exit 1
+          fi
+
+      # A degraded sweep must not report as a green night: it closed less
+      # than it should have, and only the run's status is watched from
+      # outside (scripts/bd-health). Failing here rather than at the sweep
+      # step keeps the push-back above intact.
+      #
+      # Deliberately 3 only, not 5. Degraded is transient — re-running once
+      # GitHub is healthy fixes it — so red means "this night is incomplete,
+      # look at it". Exit 5 is a standing data condition that no re-run can
+      # clear, so failing on it would make red the permanent resting state
+      # and cost us the liveness signal entirely. See the sweep step above.
+      - name: Fail the run when the sweep was degraded
+        if: always() && env.SWEEP_STATUS == '3'
+        run: |
+          echo "GitHub did not resolve every PR this sweep asked about; beads were left open on an unknown state."
+          exit 1

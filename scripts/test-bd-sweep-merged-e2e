@@ -1,0 +1,702 @@
+#!/usr/bin/env bash
+# End-to-end tests for bd-sweep-merged's close path: the main-loop glue that
+# decides which bead CLOSES, which is BLOCKED, and which is DEGRADED.
+#
+# scripts/test-bd-sweep-merged pins the helpers (cites_bead,
+# merged_before_start, filter_citing_prs) by sourcing the script with
+# BD_SWEEP_MERGED_LIB=1. The helpers have never been the whole risk. Every bug
+# this script has shipped lived in the glue *around* them — which list a verdict
+# lands in, which of those lists blocks a close, and whether a failed lookup is
+# reported as "not merged" or as "could not tell":
+#
+#   - acme-hylim: a GraphQL outage made every `gh pr view` fail, the errors
+#     were discarded, and beads whose PRs HAD merged were reported as "citing
+#     PRs not all merged (UNKNOWN)". A whole sweep did nothing and read clean.
+#   - acme-vz559: the pre-close search answered empty because the issue-search
+#     index lagged, which is indistinguishable from "nothing cites this bead",
+#     so an open delivering PR failed to block a close.
+#   - acme-k2zxt: a merged PR that named the bead as a sibling lane it had
+#     already shipped closed the bead while its real PR was still a draft.
+#   - acme-it9d: follow-up beads named in a merged PR's body prose were closed
+#     while their own PRs were open.
+#   - acme-aeqb8: four PRs citing dotted child ids closed nothing.
+#
+# Every one of those was SILENT: the run exited 0 and printed plausible lines.
+# Nothing but a test that drives the whole loop can see them, so this file puts
+# a fake `bd` and a fake `gh` on PATH and runs the real script against crafted
+# fixtures — the harness acme-vz559 used to reproduce its defect and verify its
+# fix in two offline runs, committed rather than thrown away.
+#
+# THE MAINTENANCE CALL this pins gh's CLI invocation shape: the fakes match on
+# `gh pr view`, `gh search prs` and `gh api repos/.../pulls...`, and they apply
+# the script's own `--jq` filters with real jq (so those filters are under test
+# too, not stubbed past). If you change HOW bd-sweep-merged calls gh, this file
+# must change with it — and it tells you so: an unmodelled call is recorded and
+# fails the scenario rather than degrading quietly into a wrong verdict. That
+# coupling is the price. It is worth paying here because the alternative is the
+# five bugs above, each of which cost more to find in production than the whole
+# harness costs to keep.
+#
+# Everything runs offline: no network, no GitHub token, no bd database. The
+# workspace is a throwaway git repo whose origin URL supplies the owner.
+#
+# Run: scripts/test-bd-sweep-merged-e2e
+
+set -uo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+SWEEP="$SCRIPT_DIR/bd-sweep-merged"
+OWNER=acme
+
+for tool in jq git; do
+    command -v "$tool" >/dev/null || { echo "test-bd-sweep-merged-e2e: needs $tool" >&2; exit 1; }
+done
+
+FAILED=0
+SC_N=0
+SC_NAME=""
+SC_FAILED_BEFORE=0
+OUT=""
+RC=0
+
+pass() { printf '  ok   %s\n' "$1"; }
+fail() { printf '  FAIL %s\n     %s\n' "$SC_NAME" "$1"; FAILED=$((FAILED + 1)); }
+
+# --- the fake world -----------------------------------------------------
+# One throwaway workspace for the whole run (it never varies); one fixture
+# directory per scenario, addressed by the fakes through $E2E_DIR.
+
+ROOT=$(mktemp -d "${TMPDIR:-/tmp}/bd-sweep-e2e.XXXXXX") || exit 1
+trap 'rm -rf "$ROOT"' EXIT
+
+SHIM="$ROOT/bin"
+mkdir -p "$SHIM" "$ROOT/workspace/beads/.beads"
+E2E_WORKSPACE="$ROOT/workspace/beads/.beads"
+export E2E_WORKSPACE
+git -c init.defaultBranch=main init -q "$ROOT/workspace/beads" >/dev/null 2>&1
+git -C "$ROOT/workspace/beads" remote add origin "https://github.com/$OWNER/beads.git"
+
+cat > "$SHIM/bd" <<'FAKE_BD'
+#!/usr/bin/env bash
+# fake bd — every subcommand bd-sweep-merged uses, and a loud failure for any
+# it does not: an unmodelled call must fail the test, not silently answer "".
+set -uo pipefail
+case "${1:-}" in
+    where) printf '%s\n' "$E2E_WORKSPACE" ;;
+    # Real bd hides closed issues from `bd list` unless --all is passed. The
+    # fake has to model that, because a caller needing closed rows (children_of
+    # wants a parent's ALREADY-DELIVERED children) gets a silently short answer
+    # without the flag, not an error. A fake that ignored flags passed the
+    # parked-parent tests while the live sweep still reported MISRECORDED.
+    list)
+        if printf '%s\n' "$@" | grep -qx -- --all; then
+            cat "$E2E_DIR/bd-list.json"
+        else
+            jq -c '[ .[] | select((.status // "") != "closed") ]' "$E2E_DIR/bd-list.json"
+        fi ;;
+    show)
+        f="$E2E_DIR/bead-$2.json"
+        [ -f "$f" ] || { echo "fake bd: no fixture for bead $2" >&2; exit 1; }
+        cat "$f" ;;
+    close)
+        id=$2; shift 2
+        printf '%s %s\n' "$id" "$*" >> "$E2E_DIR/closed.log"
+        echo "closed $id" ;;
+    *) printf 'bd %s\n' "$*" >> "$E2E_DIR/unexpected.log"; exit 90 ;;
+esac
+FAKE_BD
+
+cat > "$SHIM/gh" <<'FAKE_GH'
+#!/usr/bin/env bash
+# fake gh — answers the three surfaces bd-sweep-merged uses, applying the
+# script's own --jq filters with real jq so those filters are under test.
+#
+# Fixtures in $E2E_DIR:
+#   pr-<owner>-<repo>-<n>.json  one PR, in `gh pr view --json` shape. Serves the
+#                               REST surface too, mapped here to REST's shape,
+#                               so a scenario declares each PR once.
+#   open-<owner>-<repo>.json    that repo's open PRs, REST shape. A MISSING file
+#                               is a 404 — "no such repo under this owner".
+#   search-<bead-id>.json       search hits; missing means no hits.
+# Failure switches: E2E_FAIL_SEARCH, E2E_FAIL_PRVIEW, E2E_FAIL_REST,
+# E2E_FAIL_OPENPRS. Error text carries "HTTP 404"/"HTTP 502" because the script
+# distinguishes a definitive 404 from a surface that broke.
+set -uo pipefail
+
+unexpected() { printf 'gh %s\n' "$*" >> "$E2E_DIR/unexpected.log"; exit 90; }
+
+sub=${1:-}
+shift || true
+case "$sub" in
+    search)
+        [ "${1:-}" = prs ] || unexpected search "$@"
+        shift
+        query=""; filter="."
+        while [ $# -gt 0 ]; do
+            case $1 in
+                --owner|--json) shift ;;
+                --jq) filter=$2; shift ;;
+                -*) ;;
+                *) query=$1 ;;
+            esac
+            shift
+        done
+        if [ "${E2E_FAIL_SEARCH:-0}" = 1 ]; then
+            echo "gh: GraphQL: Something went wrong" >&2
+            exit 1
+        fi
+        f="$E2E_DIR/search-$query.json"
+        [ -f "$f" ] && jq -r "$filter" "$f"
+        exit 0 ;;
+    pr)
+        [ "${1:-}" = view ] || unexpected pr "$@"
+        shift
+        num=$1; shift
+        repo=""
+        while [ $# -gt 0 ]; do
+            case $1 in
+                --repo) repo=$2; shift ;;
+                --json) shift ;;
+            esac
+            shift
+        done
+        if [ "${E2E_FAIL_PRVIEW:-0}" = 1 ] ||
+           [ -f "$E2E_DIR/unresolvable-${repo//\//-}-$num" ]; then
+            echo "gh: GraphQL: Something went wrong" >&2
+            exit 1
+        fi
+        f="$E2E_DIR/pr-${repo//\//-}-$num.json"
+        [ -f "$f" ] || { echo "gh: could not resolve to a PullRequest" >&2; exit 1; }
+        cat "$f" ;;
+    api)
+        path=""; filter=""
+        while [ $# -gt 0 ]; do
+            case $1 in
+                --jq) filter=$2; shift ;;
+                -*) ;;
+                *) path=$1 ;;
+            esac
+            shift
+        done
+        case "$path" in
+            repos/*/pulls\?state=open*)
+                or=${path#repos/}; or=${or%%/pulls*}
+                if [ "${E2E_FAIL_OPENPRS:-0}" = 1 ]; then
+                    echo "gh: HTTP 502: Bad Gateway" >&2
+                    exit 1
+                fi
+                f="$E2E_DIR/open-${or//\//-}.json"
+                [ -f "$f" ] || { echo "gh: HTTP 404: Not Found ($path)" >&2; exit 1; }
+                jq -r "$filter" "$f" ;;
+            repos/*/pulls/[0-9]*)
+                rest=${path#repos/}; or=${rest%/pulls/*}; num=${rest##*/}
+                if [ "${E2E_FAIL_REST:-0}" = 1 ] ||
+                   [ -f "$E2E_DIR/unresolvable-${or//\//-}-$num" ]; then
+                    echo "gh: HTTP 502: Bad Gateway" >&2
+                    exit 1
+                fi
+                f="$E2E_DIR/pr-${or//\//-}-$num.json"
+                [ -f "$f" ] || { echo "gh: HTTP 404: Not Found ($path)" >&2; exit 1; }
+                # view shape -> REST shape: REST reports merged separately from
+                # state, and folding the two back is the script's job.
+                jq -c '{merged: (.state == "MERGED"),
+                        state: (if .state == "MERGED" then "closed"
+                                else (.state | ascii_downcase) end),
+                        title, body, head: {ref: .headRefName},
+                        merged_at: .mergedAt}' "$f" ;;
+            *) unexpected api "$path" ;;
+        esac ;;
+    *) unexpected "$sub" "$@" ;;
+esac
+FAKE_GH
+
+# The sweep sleeps ~2.2s between search calls for GitHub's rate limit and 2s
+# between pr_lookup retries. There is no rate limit here, and a suite that
+# really slept would be too slow to run before every ship — which is the same
+# as not having one.
+cat > "$SHIM/sleep" <<'FAKE_SLEEP'
+#!/usr/bin/env bash
+exit 0
+FAKE_SLEEP
+
+chmod +x "$SHIM/bd" "$SHIM/gh" "$SHIM/sleep"
+
+# --- fixture builders ---------------------------------------------------
+
+scenario() {
+    SC_NAME=$1
+    SC_N=$((SC_N + 1))
+    E2E_DIR="$ROOT/sc-$SC_N"
+    export E2E_DIR
+    mkdir -p "$E2E_DIR"
+    : > "$E2E_DIR/closed.log"
+    : > "$E2E_DIR/unexpected.log"
+    printf '[]' > "$E2E_DIR/bd-list.json"
+    BEAD_IDS=()
+    BEAD_ROWS=()
+    export BD_SWEEP_REPOS="api web"
+    export E2E_FAIL_SEARCH=0 E2E_FAIL_PRVIEW=0 E2E_FAIL_REST=0 E2E_FAIL_OPENPRS=0
+    # Both candidate repos exist and have no open PRs unless a scenario says so.
+    repo_open api
+    repo_open web
+    SC_FAILED_BEFORE=$FAILED
+}
+
+bead() {
+    # bead <id> <started_at|""> <description> [status] [parent]
+    # Status defaults to in_progress, which is what a bead whose work has not
+    # been delivered yet actually is. Only the MISRECORDED report reads it -
+    # that claim is about a bead asserting "delivered, awaiting merge" - so
+    # scenarios about anything else are unaffected by the default.
+    # Parent defaults to none. It appears only in the `bd list` view, which is
+    # where the script reads parentage from (never from the child's own
+    # record, and never from the id shape - see children_of).
+    jq -nc --arg t "$1" --arg d "$3" --arg s "$2" --arg st "${4:-in_progress}" \
+        '[{title: ("bead " + $t), description: $d, comments: [], status: $st,
+           started_at: (if $s == "" then null else $s end)}]' \
+        > "$E2E_DIR/bead-$1.json"
+    BEAD_IDS+=("$1")
+    BEAD_ROWS+=("$(jq -nc --arg id "$1" --arg st "${4:-in_progress}" --arg p "${5:-}" \
+        '{id: $id, status: $st, parent: (if $p == "" then null else $p end)}')")
+    printf '%s\n' "${BEAD_ROWS[@]}" | jq -sc . > "$E2E_DIR/bd-list.json"
+}
+
+# A bead that exists only as a row in `bd list` - a child the sweep never
+# sweeps itself (it is closed, or not in_review/in_progress) but whose
+# parentage the parked-parent check has to be able to see.
+child_row() {
+    # child_row <id> <parent> [status]
+    BEAD_ROWS+=("$(jq -nc --arg id "$1" --arg p "$2" --arg st "${3:-closed}" \
+        '{id: $id, status: $st, parent: $p}')")
+    printf '%s\n' "${BEAD_ROWS[@]}" | jq -sc . > "$E2E_DIR/bd-list.json"
+}
+
+pr() {
+    # pr <owner/repo> <number> <MERGED|OPEN|CLOSED> <title> <branch> <body> [mergedAt]
+    jq -nc --arg s "$3" --arg t "$4" --arg h "$5" --arg b "$6" --arg m "${7:-}" \
+        '{state: $s, title: $t, body: $b, headRefName: $h,
+          mergedAt: (if $m == "" then null else $m end)}' \
+        > "$E2E_DIR/pr-${1//\//-}-$2.json"
+}
+
+repo_open() {
+    # repo_open <repo> — the repo exists and has no open PRs
+    printf '[]' > "$E2E_DIR/open-$OWNER-$1.json"
+}
+
+pr_unresolvable() {
+    # pr_unresolvable <owner/repo> <number> — GitHub answers neither surface for
+    # this one PR (the rest of the run is unaffected)
+    : > "$E2E_DIR/unresolvable-${1//\//-}-$2"
+}
+
+repo_absent() {
+    # repo_absent <repo> — a sibling checkout GitHub answers 404 for
+    rm -f "$E2E_DIR/open-$OWNER-$1.json"
+}
+
+open_pr() {
+    # open_pr <repo> <number> <title> <branch> <body>
+    f="$E2E_DIR/open-$OWNER-$1.json"
+    jq -c --argjson n "$2" --arg t "$3" --arg h "$4" --arg b "$5" \
+        '. + [{number: $n, title: $t, body: $b, head: {ref: $h}}]' "$f" > "$f.tmp" &&
+        mv -f "$f.tmp" "$f"
+}
+
+search_hit() {
+    # search_hit <bead-id> <owner/repo> <number>
+    f="$E2E_DIR/search-$1.json"
+    [ -f "$f" ] || printf '[]' > "$f"
+    jq -c --arg r "$2" --argjson n "$3" \
+        '. + [{number: $n, repository: {nameWithOwner: $r}}]' "$f" > "$f.tmp" &&
+        mv -f "$f.tmp" "$f"
+}
+
+run_sweep() {
+    OUT=$(PATH="$SHIM:$PATH" "$SWEEP" "$@" 2>&1)
+    RC=$?
+}
+
+# --- assertions ---------------------------------------------------------
+
+expect_rc() {
+    [ "$RC" = "$1" ] || fail "exited $RC, expected $1"
+}
+
+expect_says() {
+    case "$OUT" in *"$1"*) ;; *) fail "output does not contain '$1'" ;; esac
+}
+
+expect_silent_about() {
+    case "$OUT" in *"$1"*) fail "output contains '$1' and must not" ;; esac
+}
+
+expect_closed() {
+    grep -q "^$1 " "$E2E_DIR/closed.log" || fail "$1 was not closed"
+}
+
+expect_not_closed() {
+    ! grep -q "^$1 " "$E2E_DIR/closed.log" || fail "$1 was CLOSED and must not be"
+}
+
+finish() {
+    if [ -s "$E2E_DIR/unexpected.log" ]; then
+        fail "the fakes saw a call they do not model: $(tr '\n' ';' < "$E2E_DIR/unexpected.log")"
+    fi
+    if [ "$FAILED" = "$SC_FAILED_BEFORE" ]; then
+        pass "$SC_NAME"
+    else
+        printf '     --- sweep output (rc=%s) ---\n' "$RC"
+        printf '%s\n' "$OUT" | sed 's/^/     | /'
+    fi
+    return 0
+}
+
+echo "bd-sweep-merged close-path tests (fake bd + fake gh)"
+
+# --- 1. the close, end to end -------------------------------------------
+scenario "a bead whose only citing PR merged is closed"
+bead acme-aaa 2026-08-01T00:00:00Z "delivered in api#100"
+pr $OWNER/api 100 MERGED "acme-aaa: do the thing" acme-aaa-do-the-thing \
+    "why" 2026-08-05T09:00:00Z
+run_sweep --apply
+expect_rc 0
+expect_says "acme-aaa: CLOSED — $OWNER/api#100"
+expect_closed acme-aaa
+finish
+
+scenario "a dry run reports the close and closes nothing"
+bead acme-aaa 2026-08-01T00:00:00Z "delivered in api#100"
+pr $OWNER/api 100 MERGED "acme-aaa: do the thing" acme-aaa-do-the-thing \
+    "why" 2026-08-05T09:00:00Z
+run_sweep
+expect_rc 0
+expect_says "would close"
+expect_says "dry run; pass --apply"
+expect_not_closed acme-aaa
+finish
+
+# --- 2. the open-PR cross-check, which is why it exists ------------------
+# acme-vz559's exact shape: a merged PR the bead references, a search that
+# answers empty because the index lags, and the real delivering PR still open.
+scenario "an open PR the search missed blocks the close"
+bead acme-kdod 2026-08-17T08:00:00Z "started in api#100"
+pr $OWNER/api 100 MERGED "acme-kdod: first half" acme-kdod-first-half \
+    "why" 2026-08-17T12:00:00Z
+open_pr api 1244 "acme-kdod: fix the sweep" acme-kdod-fix-the-sweep "why"
+run_sweep --apply
+expect_rc 0
+expect_says "citing PRs not all merged (open-PR cross-check) — $OWNER/api#1244(OPEN)"
+expect_says "treating its empty answer as incomplete"
+expect_not_closed acme-kdod
+finish
+
+scenario "an open PR that only names the bead in prose does not block"
+bead acme-aaa 2026-08-01T00:00:00Z "delivered in api#100"
+pr $OWNER/api 100 MERGED "acme-aaa: do the thing" acme-aaa-do-the-thing \
+    "why" 2026-08-05T09:00:00Z
+open_pr api 1244 "something else" other-branch \
+    "Follow-up beads: acme-aaa covers the rest."
+run_sweep --apply
+expect_rc 0
+expect_closed acme-aaa
+finish
+
+# The index is a snapshot taken at the run's first close candidate. A PR that
+# merged after it was taken already got a fresh per-PR lookup, and that is the
+# newer answer — otherwise a bead would block on its own delivering PR.
+scenario "a PR already found merged does not block itself from the stale index"
+bead acme-aaa 2026-08-01T00:00:00Z "delivered in api#100"
+pr $OWNER/api 100 MERGED "acme-aaa: do the thing" acme-aaa-do-the-thing \
+    "why" 2026-08-05T09:00:00Z
+open_pr api 100 "acme-aaa: do the thing" acme-aaa-do-the-thing "why"
+run_sweep --apply
+expect_rc 0
+expect_closed acme-aaa
+finish
+
+scenario "an open-PR list GitHub will not answer is DEGRADED, never a close"
+bead acme-aaa 2026-08-01T00:00:00Z "delivered in api#100"
+pr $OWNER/api 100 MERGED "acme-aaa: do the thing" acme-aaa-do-the-thing \
+    "why" 2026-08-05T09:00:00Z
+export E2E_FAIL_OPENPRS=1
+run_sweep --apply
+expect_rc 3
+expect_says "DEGRADED — would close, but the open-PR cross-check could not be completed"
+expect_not_closed acme-aaa
+finish
+
+# A repo GitHub 404s is a sibling checkout from somewhere else, not a broken
+# index: it hosts none of our PRs, so the rest of the cross-check still stands.
+scenario "a 404 repo in the candidate list does not degrade the cross-check"
+bead acme-aaa 2026-08-01T00:00:00Z "delivered in api#100"
+pr $OWNER/api 100 MERGED "acme-aaa: do the thing" acme-aaa-do-the-thing \
+    "why" 2026-08-05T09:00:00Z
+repo_absent web
+run_sweep --apply
+expect_rc 0
+expect_silent_about DEGRADED
+expect_closed acme-aaa
+finish
+
+# --- 3. the pre-close search --------------------------------------------
+scenario "a failed pre-close search leaves the bead open and degrades the run"
+bead acme-aaa 2026-08-01T00:00:00Z "delivered in api#100"
+pr $OWNER/api 100 MERGED "acme-aaa: do the thing" acme-aaa-do-the-thing \
+    "why" 2026-08-05T09:00:00Z
+export E2E_FAIL_SEARCH=1
+run_sweep --apply
+expect_rc 3
+expect_says "DEGRADED — would close, but the GitHub citing-PR search failed"
+expect_not_closed acme-aaa
+finish
+
+scenario "a PR only the search knows about still delivers the bead"
+bead acme-aaa 2026-08-01T00:00:00Z "nobody pasted the PR back into this bead"
+pr $OWNER/api 200 MERGED "acme-aaa: do the thing" acme-aaa-do-the-thing \
+    "why" 2026-08-05T09:00:00Z
+search_hit acme-aaa $OWNER/api 200
+run_sweep --apply --search-citing
+expect_rc 0
+expect_closed acme-aaa
+finish
+
+scenario "an unmerged PR only the search knows about blocks the close"
+bead acme-aaa 2026-08-01T00:00:00Z "delivered in api#100"
+pr $OWNER/api 100 MERGED "acme-aaa: first half" acme-aaa-first-half \
+    "why" 2026-08-05T09:00:00Z
+pr $OWNER/api 201 OPEN "acme-aaa: the rest" acme-aaa-the-rest "why"
+search_hit acme-aaa $OWNER/api 201
+run_sweep --apply
+expect_rc 0
+expect_says "citing PRs not all merged (GitHub-side) — $OWNER/api#201(OPEN)"
+expect_not_closed acme-aaa
+finish
+
+# Discovery going quiet is exactly the invisible failure this script keeps
+# having, so a --search-citing pass that could not search must not exit 0.
+scenario "a failed discovery search degrades the run even with nothing to close"
+bead acme-aaa 2026-08-01T00:00:00Z "no PR references at all"
+export E2E_FAIL_SEARCH=1
+run_sweep --apply --search-citing
+expect_rc 3
+expect_says "DEGRADED — GitHub citing-PR search failed"
+expect_says "no PR references found"
+expect_not_closed acme-aaa
+finish
+
+# --- 4. state that cannot be determined is not state that says "open" ----
+# acme-hylim: with both surfaces failing, the run used to report "not all
+# merged (UNKNOWN)", which reads exactly like a healthy run over open PRs.
+scenario "a PR neither surface will resolve is DEGRADED, not 'not merged'"
+bead acme-aaa 2026-08-01T00:00:00Z "delivered in api#100"
+pr $OWNER/api 100 MERGED "acme-aaa: do the thing" acme-aaa-do-the-thing \
+    "why" 2026-08-05T09:00:00Z
+export E2E_FAIL_PRVIEW=1 E2E_FAIL_REST=1
+run_sweep --apply
+expect_rc 3
+expect_says "DEGRADED — GitHub would not resolve: $OWNER/api#100"
+expect_silent_about "citing PRs not all merged"
+expect_not_closed acme-aaa
+finish
+
+scenario "REST answers what GraphQL will not, and the run stays clean"
+bead acme-aaa 2026-08-01T00:00:00Z "delivered in api#100"
+pr $OWNER/api 100 MERGED "acme-aaa: do the thing" acme-aaa-do-the-thing \
+    "why" 2026-08-05T09:00:00Z
+export E2E_FAIL_PRVIEW=1
+run_sweep --apply
+expect_rc 0
+expect_silent_about DEGRADED
+expect_closed acme-aaa
+finish
+
+# A definitive 404 is an answer: the ref is reported MISSING, the bead stays
+# open, and the run does not paint itself red.
+scenario "a bead citing a deleted PR is MISSING, not DEGRADED"
+bead acme-aaa 2026-08-01T00:00:00Z "delivered in api#404"
+run_sweep --apply
+expect_rc 0
+expect_says "citing PRs not all merged — $OWNER/api#404(MISSING)"
+expect_silent_about DEGRADED
+expect_not_closed acme-aaa
+finish
+
+# --- 5. which list blocks, which is only reported ------------------------
+scenario "an open citing PR blocks before any GitHub cross-check runs"
+bead acme-aaa 2026-08-01T00:00:00Z "delivered in api#100"
+pr $OWNER/api 100 OPEN "acme-aaa: do the thing" acme-aaa-do-the-thing "why"
+export E2E_FAIL_SEARCH=1 E2E_FAIL_OPENPRS=1
+run_sweep --apply
+expect_rc 0
+expect_says "citing PRs not all merged — $OWNER/api#100(OPEN)"
+expect_silent_about DEGRADED
+expect_not_closed acme-aaa
+finish
+
+# acme-imao9: a PR closed without merging is superseded, not unmerged. While
+# closed PRs blocked, every bead with a replaced PR was unclosable forever.
+scenario "a closed unmerged PR does not block a close and is reported"
+bead acme-aaa 2026-08-01T00:00:00Z "api#100 replaced web#99"
+pr $OWNER/api 100 MERGED "acme-aaa: do the thing" acme-aaa-do-the-thing \
+    "why" 2026-08-05T09:00:00Z
+pr $OWNER/web 99 CLOSED "acme-aaa: first attempt" acme-aaa-first-attempt "why"
+run_sweep --apply
+expect_rc 0
+expect_says "superseded, closed unmerged: $OWNER/web#99"
+expect_closed acme-aaa
+finish
+
+scenario "only closed unmerged PRs cite the bead — nothing delivered"
+bead acme-aaa 2026-08-01T00:00:00Z "attempted in api#100"
+pr $OWNER/api 100 CLOSED "acme-aaa: abandoned" acme-aaa-abandoned "why"
+run_sweep --apply
+expect_rc 0
+expect_says "nothing delivered, manual check"
+expect_not_closed acme-aaa
+finish
+
+# acme-k2zxt: api#1007 named the bead in its title as the sibling lane it
+# had already shipped, days before this bead's work started.
+scenario "a merged PR that predates the bead's start does not close it"
+bead acme-kdod 2026-08-17T13:05:00Z "api#1007 touched this lane"
+pr $OWNER/api 1007 MERGED "acme-kdod: sibling lane" some-branch "why" \
+    2026-08-11T22:34:20Z
+run_sweep --apply
+expect_rc 0
+expect_says "the only citing merged PRs predate this bead's start"
+expect_not_closed acme-kdod
+finish
+
+# acme-it9d: a parent feature's merged PR listed its follow-up beads in prose
+# and the sweep closed them while their real PRs were open.
+scenario "a merged PR naming the bead only in prose delivers nothing"
+bead acme-aaa 2026-08-01T00:00:00Z "see api#100"
+pr $OWNER/api 100 MERGED "some other feature" other-branch \
+    "Follow-up beads: acme-aaa covers the rest." 2026-08-05T09:00:00Z
+run_sweep --apply
+expect_rc 0
+expect_says "no PR cites this bead (context only: $OWNER/api#100)"
+expect_not_closed acme-aaa
+finish
+
+# acme-k2zxt: the reference that LOOKS recorded. acme-xjprg carried
+# "PR: .../pull/1484", a real merged PR that delivers acme-5xr5, and sat in
+# in_review for four days because the guard failed safe and said so quietly -
+# under --quiet, which is how the hook runs it, it said nothing at all.
+scenario "an in_review bead whose recorded PR delivers another bead is MISRECORDED"
+bead acme-xjprg 2026-08-19T08:00:00Z "PR: https://github.com/$OWNER/api/pull/1484" in_review
+pr $OWNER/api 1484 MERGED "acme-5xr5: bearer-token parity" acme-5xr5-parity \
+    "why" 2026-08-19T12:00:00Z
+run_sweep --apply
+expect_rc 5
+expect_says "acme-xjprg: MISRECORDED"
+expect_says "delivery-cites some OTHER bead"
+expect_not_closed acme-xjprg
+finish
+
+# The report has to survive --quiet or it does not exist where it runs: the
+# session hook invokes the sweep with --apply --quiet and sends all of its
+# output to a log file.
+scenario "the MISRECORDED report is not silenced by --quiet"
+bead acme-xjprg 2026-08-19T08:00:00Z "PR: https://github.com/$OWNER/api/pull/1484" in_review
+pr $OWNER/api 1484 MERGED "acme-5xr5: bearer-token parity" acme-5xr5-parity \
+    "why" 2026-08-19T12:00:00Z
+run_sweep --apply --quiet
+expect_rc 5
+expect_says "acme-xjprg: MISRECORDED"
+finish
+
+# The same shape on an in_progress bead is ordinary: work that has not been
+# delivered yet legitimately has no delivering PR, and someone pasting a
+# related PR for context is not a fault. Reporting it would make the loud
+# lane fire constantly and stop being read.
+scenario "the same shape on an in_progress bead is not reported"
+bead acme-aaa 2026-08-19T08:00:00Z "context: https://github.com/$OWNER/api/pull/1484" in_progress
+pr $OWNER/api 1484 MERGED "acme-5xr5: bearer-token parity" acme-5xr5-parity \
+    "why" 2026-08-19T12:00:00Z
+run_sweep --apply
+expect_rc 0
+expect_silent_about "MISRECORDED"
+expect_says "no PR cites this bead"
+finish
+
+# acme-fluna: the MISRECORDED lane's false positive, and an expensive one.
+# A parent split into children names the children's PRs, each of which
+# delivery-cites a CHILD - which read as "delivers some OTHER bead" and made
+# the sweep exit 5. That is a permanent, healthy state, so it fired every
+# night; and exit 5 used to abort the nightly job before its push-back step,
+# so each night's real closes were computed and thrown away (run 32686984270
+# discarded four). The live bead was acme-9myv, whose own notes read
+# "Parent stays open until .1 and .3 land. Do not close it on PR #13".
+scenario "a parent whose PR delivers its own child is not MISRECORDED"
+bead acme-par 2026-08-18T08:00:00Z "PR: https://github.com/$OWNER/api/pull/13" in_review
+child_row acme-par.2 acme-par closed
+pr $OWNER/api 13 MERGED "feat: telemetry (acme-par.2)" acme-par.2-telemetry \
+    "Bead: acme-par.2" 2026-08-18T18:51:22Z
+run_sweep --apply
+expect_rc 0
+expect_silent_about "MISRECORDED"
+expect_says "acme-par: parent parked on its children"
+expect_not_closed acme-par
+finish
+
+# The guard is scoped to THIS bead's children, not to dotted ids in general:
+# an unrelated bead that merely spells its id with a dot is still a misrecord.
+# Without that scoping the fix would silence the lane it was built for.
+scenario "a PR delivering someone else's child is still MISRECORDED"
+bead acme-par 2026-08-18T08:00:00Z "PR: https://github.com/$OWNER/api/pull/13" in_review
+child_row acme-par.2 acme-par closed
+pr $OWNER/api 13 MERGED "feat: telemetry (acme-other.2)" acme-other.2-telemetry \
+    "Bead: acme-other.2" 2026-08-18T18:51:22Z
+run_sweep --apply
+expect_rc 5
+expect_says "acme-par: MISRECORDED"
+expect_not_closed acme-par
+finish
+
+# A bead whose real PR IS recorded closes as before - the new lane must not
+# fire just because some other, non-citing PR is also mentioned.
+scenario "a citing merged PR still closes even alongside a non-citing one"
+bead acme-aaa 2026-08-19T08:00:00Z "context $OWNER/api#1484, delivered in $OWNER/api#100" in_review
+pr $OWNER/api 1484 MERGED "acme-5xr5: something else" acme-5xr5-parity \
+    "why" 2026-08-19T12:00:00Z
+pr $OWNER/api 100 MERGED "acme-aaa: do the thing" acme-aaa-do-the-thing \
+    "why" 2026-08-20T09:00:00Z
+run_sweep --apply
+expect_rc 0
+expect_silent_about "MISRECORDED"
+expect_closed acme-aaa
+finish
+
+# --- 6. one bead's verdict is its own ------------------------------------
+# Every branch above ends in `continue`, not `exit`. A degraded bead that
+# stopped the sweep would silently park everything behind it.
+scenario "a degraded bead does not stop the sweep closing a later one"
+bead acme-aaa 2026-08-01T00:00:00Z "delivered in api#100"
+bead acme-bbb 2026-08-01T00:00:00Z "delivered in web#200"
+pr $OWNER/api 100 MERGED "acme-aaa: do the thing" acme-aaa-do-the-thing \
+    "why" 2026-08-05T09:00:00Z
+pr $OWNER/web 200 MERGED "acme-bbb: do the other thing" acme-bbb-other \
+    "why" 2026-08-05T09:00:00Z
+pr_unresolvable $OWNER/api 100   # neither surface answers for #100 alone
+run_sweep --apply
+expect_rc 3
+expect_says "acme-bbb: CLOSED"
+expect_closed acme-bbb
+expect_not_closed acme-aaa
+finish
+
+scenario "an empty in_review backlog is a clean no-op"
+run_sweep --apply
+expect_rc 0
+expect_says "Nothing in in_progress/in_review"
+finish
+
+echo
+if [ "$FAILED" -eq 0 ]; then
+    echo "all tests passed"
+    exit 0
+fi
+echo "$FAILED test(s) failed"
+exit 1

@@ -1,0 +1,203 @@
+#!/usr/bin/env bash
+# bd-reconcile-fork — merge another lineage's JSONL-only beads into the local
+# Dolt store, so an export fork heals itself instead of wedging until a human
+# notices.
+#
+# WHY THIS EXISTS
+#
+# `.beads/issues.jsonl` is a passive export of the Dolt database, but the sync
+# hook also carries it through git: every machine commits its own export to
+# `main`, and on divergence the hook converges to origin (`git pull --rebase`,
+# or `git reset --hard origin/main` when the rebase conflicts). That last step
+# drops ANOTHER machine's export into this machine's working tree.
+#
+# bd then refuses to auto-export over it — correctly, because those records are
+# the only local copy of issues this Dolt store has never seen:
+#
+#   Warning: auto-export skipped: .beads/issues.jsonl contains 148 JSONL-only
+#   issue record(s) absent from the local Dolt store (...); refusing to overwrite.
+#
+# The refusal is right and the consequence is not: the export stays frozen from
+# that moment on, so the committed jsonl and the GitHub issue view stop tracking
+# reality, and every mutating bd command prints the warning that everyone
+# scrolls past. Nothing clears it but a human reconcile. That is why the fork
+# healed by hand on three consecutive days, and was back within a day each
+# time: a
+# manual reconcile fixes the symptom while the mechanism that produces it — two
+# lineages exchanging state through a shared git file — keeps running.
+#
+# So reconcile automatically, on the same schedule as the sync.
+#
+# WHAT IT DOES, AND WHAT IT REFUSES TO DO
+#
+# It imports ONLY the records whose ids are absent from the local Dolt store.
+# That is a union merge and it is the whole safety argument: an id the database
+# already knows is never touched, so a stale export from a machine that is
+# behind can never roll back local state. (`bd import` also guards this itself —
+# it only rewrites a row whose updated_at is strictly newer — but this script
+# does not rely on that, because `--allow-stale` is one flag away and the
+# blast radius of getting it wrong is the whole tracker.)
+#
+# It never edits `.beads/issues.jsonl`. Hand-editing the jsonl creates a third
+# lineage (SETUP.md, "Tracker fork"); the import file is a temporary copy.
+#
+# It does not resolve a genuine Dolt divergence — that is `bd dolt pull`'s job,
+# and this script is meant to run right after one. It closes the gap that a
+# pull cannot: records that reached this machine only as jsonl, because the
+# lineage that owns them never pushed them to refs/dolt/data.
+#
+# THE CUSTOM-STATUS WORKAROUND
+#
+# bd 1.1.0's importer validates status against the built-ins only, so records
+# carrying this workspace's custom `in_review` fail with "validation failed:
+# invalid status: in_review" even though `bd statuses` lists it and
+# `bd update --status=in_review` works. Every manual reconcile so
+# far has worked around it the same way, so the workaround lives here now:
+# rewrite non-built-in statuses to `open` for the import, then `bd update` the
+# affected ids back afterwards. Drop this once bd accepts custom statuses on
+# import — the BUILTIN_STATUSES list below is the only thing to delete.
+#
+# Usage: bd-reconcile-fork [--apply] [--quiet]
+#   default  dry run — report the fork, import nothing
+#   --apply  import the JSONL-only records and restore their statuses
+#   --quiet  for session hooks: suppress "no fork". An unreconciled fork and a
+#            completed reconcile are ALWAYS printed — this script is the only
+#            thing that ever moves those records, and a silent merge of 148
+#            beads into the tracker is not something a hook should hide.
+#
+# Exit codes: 0 clean or healed, 3 degraded (something did not import — the
+# fork is still open and a human should look). Never nonzero for "no fork".
+
+set -uo pipefail
+
+APPLY=0
+QUIET=0
+for arg in "$@"; do
+    case "$arg" in
+        --apply) APPLY=1 ;;
+        --quiet) QUIET=1 ;;
+        *) echo "usage: bd-reconcile-fork [--apply] [--quiet]" >&2; exit 0 ;;
+    esac
+done
+
+# Statuses bd's importer accepts. Anything else in a record is a workspace
+# custom status and needs the rewrite-and-restore dance above.
+BUILTIN_STATUSES=(open in_progress blocked deferred closed pinned hooked)
+# Sample ids to name in the report.
+SAMPLES=${BD_RECONCILE_SAMPLES:-5}
+
+say()  { [ "$QUIET" -eq 1 ] || printf '%s\n' "$*"; }
+warn() { printf '%s\n' "$*" >&2; }
+
+for tool in bd jq; do
+    command -v "$tool" >/dev/null 2>&1 || { warn "bd-reconcile-fork: $tool not found"; exit 0; }
+done
+
+beads_db=$(bd where 2>/dev/null | head -1 | tr -d '[:space:]')
+if [ -z "$beads_db" ] || [ ! -e "$beads_db" ]; then
+    warn "bd-reconcile-fork: BEADS_DIR does not resolve to a database (SETUP.md step 4)"
+    exit 0
+fi
+jsonl="$beads_db/issues.jsonl"
+[ -f "$jsonl" ] || exit 0
+
+# Either side coming back empty means the read FAILED, not that the side is
+# empty. Treating a broken jq or an unreadable database as "the Dolt store has
+# no issues" would import the entire jsonl back over the tracker, which is the
+# one mistake this script must never make.
+jsonl_ids=$(jq -r 'select(._type == "issue") | .id' "$jsonl" 2>/dev/null | sort -u)
+dolt_ids=$(bd list --all --limit 0 --json 2>/dev/null | jq -r '.[].id' 2>/dev/null | sort -u)
+if [ -z "$jsonl_ids" ] || [ -z "$dolt_ids" ]; then
+    warn "bd-reconcile-fork: could not read both sides (jsonl or database) — not reconciling"
+    exit 0
+fi
+
+jsonl_only=$(comm -23 <(printf '%s\n' "$jsonl_ids") <(printf '%s\n' "$dolt_ids"))
+n_jsonl_only=$(printf '%s' "$jsonl_only" | grep -c . || true)
+if [ "${n_jsonl_only:-0}" -eq 0 ]; then
+    say "No fork: every issue in $jsonl is in the local Dolt store."
+    exit 0
+fi
+
+sample=$(printf '%s\n' "$jsonl_only" | head -"$SAMPLES" | tr '\n' ' ')
+if [ "$APPLY" -eq 0 ]; then
+    # Dry run prints on --quiet too: an unreconciled fork is exactly the
+    # condition a hook is watching for, and staying silent about it is how the
+    # last two forks sat for a day.
+    printf 'Tracker fork: %s issue(s) in %s are absent from the local Dolt store (e.g. %s).\n' \
+        "$n_jsonl_only" "$jsonl" "${sample% }"
+    printf 'Run `bd dolt pull` first, then `bd-reconcile-fork --apply` to merge them in.\n'
+    exit 0
+fi
+
+tmp=$(mktemp "${TMPDIR:-/tmp}/bd-reconcile-fork.XXXXXX") || exit 0
+trap 'rm -f "$tmp" "$tmp.ids" "$tmp.restore" "$tmp.clean"' EXIT
+printf '%s\n' "$jsonl_only" >"$tmp.ids"
+builtins_json=$(printf '%s\n' "${BUILTIN_STATUSES[@]}" | jq -R . | jq -sc .)
+
+# Extract just the JSONL-only records, rewriting custom statuses to `open` and
+# remembering what to put back. Ids come from a file rather than the command
+# line because 148 of them is normal and argv is not.
+jq -c --argjson builtins "$builtins_json" --rawfile wanted "$tmp.ids" '
+    ($wanted | split("\n") | map(select(length > 0)) | INDEX(.)) as $want
+    | select(._type == "issue" and ($want[.id] != null))
+    | .status as $st
+    | if ($st != null and ($builtins | index($st)) == null)
+      then . + {status: "open", _reconcile_status: $st}
+      else . end
+' "$jsonl" >"$tmp" 2>/dev/null
+
+n_extracted=$(grep -c . <"$tmp" || true)
+if [ "${n_extracted:-0}" -eq 0 ]; then
+    warn "bd-reconcile-fork: found $n_jsonl_only JSONL-only id(s) but extracted 0 records — not reconciling"
+    exit 3
+fi
+
+# id<TAB>status for everything whose status we rewrote, to restore after import.
+jq -r 'select(._reconcile_status != null) | "\(.id)\t\(._reconcile_status)"' "$tmp" >"$tmp.restore"
+# The marker is ours, not bd's — strip it before handing the file to the importer.
+jq -c 'del(._reconcile_status)' "$tmp" >"$tmp.clean" 2>/dev/null && mv "$tmp.clean" "$tmp"
+
+say "Reconciling $n_extracted JSONL-only issue(s) into the local Dolt store (e.g. ${sample% })..."
+import_out=$(bd import "$tmp" 2>&1)
+import_rc=$?
+if [ "$import_rc" -ne 0 ]; then
+    warn "bd-reconcile-fork: bd import failed (rc=$import_rc):"
+    warn "$import_out"
+    exit 3
+fi
+
+# Restore the custom statuses the importer would not accept.
+n_restored=0
+n_restore_failed=0
+while IFS=$'\t' read -r id status; do
+    [ -n "$id" ] || continue
+    if bd update "$id" --status="$status" >/dev/null 2>&1; then
+        n_restored=$((n_restored + 1))
+    else
+        n_restore_failed=$((n_restore_failed + 1))
+        warn "bd-reconcile-fork: could not restore $id to status $status"
+    fi
+done <"$tmp.restore"
+
+# Re-run the same diff rather than trusting the import's own report: the only
+# thing that matters is whether bd will export again. An unreadable database
+# here is "unverified", not "verified clean" — reporting success off a failed
+# read is how a wedged tracker gets a green line in the sync log.
+dolt_ids=$(bd list --all --limit 0 --json 2>/dev/null | jq -r '.[].id' 2>/dev/null | sort -u)
+if [ -z "$dolt_ids" ]; then
+    warn "bd-reconcile-fork: imported $n_extracted record(s) but could not re-read the database to confirm the fork is closed."
+    exit 3
+fi
+remaining=$(comm -23 <(printf '%s\n' "$jsonl_ids") <(printf '%s\n' "$dolt_ids") | grep -c . || true)
+
+if [ "${remaining:-0}" -gt 0 ]; then
+    warn "bd-reconcile-fork: imported $n_extracted record(s) but $remaining id(s) are still JSONL-only — the export is still blocked."
+    warn "$import_out"
+    exit 3
+fi
+
+printf 'Reconciled tracker fork: %s issue(s) imported into the local Dolt store, %s status(es) restored. Auto-export is unblocked.\n' \
+    "$n_extracted" "$n_restored"
+[ "$n_restore_failed" -gt 0 ] && exit 3
+exit 0

@@ -1,0 +1,218 @@
+#!/usr/bin/env bash
+# bd-review-gate — has a bot review looked at this PR's CURRENT head?
+#
+# The last commit on a PR is the highest-risk one. It is new code, written
+# quickly, under the impulse to close out a review finding and merge — and
+# it is systematically the LEAST likely to be reviewed, because the agent
+# merges the moment CI goes green and the bot takes minutes to re-fire.
+#
+# Measured 2026-08-23 across the 20 most recently merged PRs in cluster and
+# portal: 6 of 20 carried commits no bot review ever saw, 7 commits in
+# total, and every one of them was a fix written in response to a review
+# finding. One PR merged with its review-fix commit still in flight, and
+# that commit never reached main at all.
+#
+# The bot is not down and does not review only once — it re-reviewed 5 and
+# 6 times on other PRs in the same sample. The mechanism is a RACE, and
+# "no new findings" reads identically to "the bot has not looked yet".
+# That is the absent-is-not-negative rule applied to our own process: an
+# instrument that cannot observe, reporting as though it had.
+#
+# So the answer here is THREE-VALUED and never a bare boolean, because a
+# bare boolean is exactly what collapses "not yet" into "nothing found":
+#
+#   reviewed          a review exists whose commit IS the PR's head
+#   not-yet           the lane is alive but has not reached this head
+#   lane-unavailable  no review has ever posted on this PR (unbound repo,
+#                     a turn that failed silently, a rolling gateway)
+#
+# Merging is still ALLOWED on not-yet and lane-unavailable — the lane
+# genuinely stalls, and blocking forever would be worse. What is not
+# allowed is merging while believing the commit was reviewed. On those two
+# answers the PR and the handoff must say plainly which commits shipped
+# unreviewed.
+#
+# Usage:
+#   bd-review-gate <pr>                 # repo from the cwd, or pass -R
+#   bd-review-gate -R myorg/web 1554
+#   bd-review-gate --wait 1774          # poll until reviewed or timeout
+#   bd-review-gate --json 1774
+#
+# Exit codes are the verdict, so a caller can branch without parsing:
+#   0  reviewed
+#   1  not-yet
+#   2  lane-unavailable
+#   3  usage / could not ask (no gh, no such PR) — never confused with a
+#      verdict, because "I could not look" is its own answer
+set -uo pipefail
+
+# --- configure me -----------------------------------------------------------
+# Which bot, and how it names the commit it reviewed. Defaults suit a review
+# bot that upserts ONE comment per PR carrying a hidden marker and a footer
+# like "_Reviewed commit 63a231f6bf58._". Point these at whatever posts reviews
+# in your org (a GitHub App, a CI job, Copilot, your own action) via the
+# environment, or edit the defaults here once and commit them.
+#
+# BD_REVIEW_BOT      the comment author's login, e.g. "my-reviewer[bot]"
+# BD_REVIEW_MARKER   a string only the REVIEW comment carries. Required when
+#                    the same bot posts other kinds of comment on the same PR
+#                    (build diagnoses, preview links, mention replies) — none
+#                    of those is a review, and matching on the author alone
+#                    would read the newest of them as one.
+# BD_REVIEW_FOOTER   the regex naming the reviewed commit. The captured sha may
+#                    be short; the verdict compares on its length.
+BOT_LOGIN="${BD_REVIEW_BOT:-my-reviewer[bot]}"
+REVIEW_MARKER="${BD_REVIEW_MARKER:-}"
+REVIEW_FOOTER="${BD_REVIEW_FOOTER:-Reviewed commit [0-9a-f]+}"
+
+# Default repo: whatever `gh` resolves from the current directory. Passing -R
+# always wins.
+REPO="${BD_REVIEW_REPO:-$(gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null || echo "")}"
+PR=""
+WAIT=0
+JSON=0
+QUIET=0
+# Bounded, because the lane does stall. Long enough for a normal re-fire
+# (the bot lands within a minute or so in practice, 10 minutes at the
+# outside), short enough that a stalled lane does not hold an agent.
+WAIT_SECONDS=${BD_REVIEW_GATE_WAIT_SECONDS:-600}
+POLL_SECONDS=${BD_REVIEW_GATE_POLL_SECONDS:-30}
+
+usage() {
+    echo "usage: bd-review-gate [-R owner/repo] [--wait] [--json] [--quiet] <pr-number>" >&2
+    exit 3
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -R|--repo) REPO="${2:-}"; shift 2 ;;
+        --wait)    WAIT=1; shift ;;
+        --json)    JSON=1; shift ;;
+        --quiet)   QUIET=1; shift ;;
+        -h|--help) usage ;;
+        -*)        usage ;;
+        *)         PR="$1"; shift ;;
+    esac
+done
+if [ -z "${BD_REVIEW_GATE_LIB:-}" ]; then
+    [ -n "$PR" ] || usage
+fi
+
+if [ -z "${BD_REVIEW_GATE_LIB:-}" ]; then
+    command -v gh >/dev/null 2>&1 || {
+        echo "bd-review-gate: gh is not installed; cannot ask" >&2
+        exit 3
+    }
+    [ -n "$REPO" ] || {
+        echo "bd-review-gate: no repo — run inside a checkout or pass -R owner/repo" >&2
+        exit 3
+    }
+fi
+
+head_sha() {
+    gh pr view "$PR" -R "$REPO" --json headRefOid --jq .headRefOid 2>/dev/null
+}
+
+# The review comment is UPSERTED in place, so polling for a NEW comment
+# waits forever. The footer names the commit it covers:
+#   _Reviewed commit 63a231f6bf58. This review is read-only and advisory._
+# That short sha is the only thing that says which code was looked at.
+reviewed_commit() {
+    gh api "repos/$REPO/issues/$PR/comments" --paginate 2>/dev/null \
+        | jq -r --arg bot "$BOT_LOGIN" --arg marker "$REVIEW_MARKER" '
+            .[] | select(.user.login == $bot)
+                | select($marker == "" or (.body | contains($marker)))
+                | .body' 2>/dev/null \
+        | grep -oE "$REVIEW_FOOTER" \
+        | tail -1 | grep -oE '[0-9a-f]+$'
+}
+
+# classify_verdict is the whole decision, kept pure so it can be tested
+# without a network: everything else here is fetching its two arguments.
+#
+#   head      the PR's current head sha ("" when the PR could not be read)
+#   reviewed  the sha the newest review names ("" when none has posted)
+classify_verdict() {
+    local head="$1" reviewed="$2"
+    if [ -z "$head" ]; then
+        echo "unaskable"
+        return
+    fi
+    if [ -z "$reviewed" ]; then
+        echo "lane-unavailable"
+        return
+    fi
+    # The footer carries a SHORT sha; compare on its length so a
+    # 12-character footer matches a 40-character head. Comparing the other
+    # way round - or requiring equality - would report every reviewed PR as
+    # not-yet, which is the safe direction but makes the tool useless.
+    local width=${#reviewed}
+    if [ "${head:0:$width}" = "$reviewed" ]; then
+        echo "reviewed"
+    else
+        echo "not-yet"
+    fi
+}
+
+verdict() {
+    local head reviewed state
+    head=$(head_sha)
+    reviewed=""
+    [ -n "$head" ] && reviewed=$(reviewed_commit)
+    state=$(classify_verdict "$head" "$reviewed")
+    echo "$state:$head:$reviewed"
+}
+
+report() {
+    local state="$1" head="$2" reviewed="$3"
+    if [ "$JSON" -eq 1 ]; then
+        jq -n --arg state "$state" --arg head "$head" --arg reviewed "$reviewed" \
+              --arg repo "$REPO" --arg pr "$PR" \
+              '{repo:$repo, pr:$pr, state:$state, head:$head, reviewed_commit:$reviewed}'
+        return
+    fi
+    [ "$QUIET" -eq 1 ] && return
+    case "$state" in
+        reviewed)
+            echo "reviewed: $BOT_LOGIN reviewed ${head:0:12} (this PR's head)" ;;
+        not-yet)
+            echo "NOT YET: the newest review covers ${reviewed}, but the head is ${head:0:12}."
+            echo "  Commits after ${reviewed} have NOT been reviewed. Merging is allowed,"
+            echo "  but say so in the PR and the handoff - do not report a clean review." ;;
+        lane-unavailable)
+            echo "LANE UNAVAILABLE: $BOT_LOGIN has never posted a review on this PR."
+            echo "  Absence is silence, not approval: an unbound repo, a failed turn and a"
+            echo "  clean review are indistinguishable from here. Merging is allowed; say"
+            echo "  plainly that no review was received." ;;
+        unaskable)
+            echo "could not read $REPO#$PR (no such PR, or gh cannot reach it)" >&2 ;;
+    esac
+}
+
+state_exit_code() {
+    case "$1" in
+        reviewed)         echo 0 ;;
+        not-yet)          echo 1 ;;
+        lane-unavailable) echo 2 ;;
+        *)                echo 3 ;;
+    esac
+}
+
+# Sourced by scripts/test-bd-review-gate: define the helpers, do nothing.
+[ -n "${BD_REVIEW_GATE_LIB:-}" ] && return 0 2>/dev/null
+
+deadline=$(( $(date +%s) + WAIT_SECONDS ))
+while :; do
+    IFS=: read -r state head reviewed <<<"$(verdict)"
+
+    if [ "$WAIT" -eq 0 ] || [ "$state" = "reviewed" ] || [ "$state" = "unaskable" ]; then
+        report "$state" "$head" "$reviewed"
+        exit "$(state_exit_code "$state")"
+    fi
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+        [ "$QUIET" -eq 1 ] || echo "waited ${WAIT_SECONDS}s for a review of ${head:0:12}; the lane did not reach it."
+        report "$state" "$head" "$reviewed"
+        exit "$(state_exit_code "$state")"
+    fi
+    sleep "$POLL_SECONDS"
+done

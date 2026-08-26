@@ -1,0 +1,290 @@
+#!/usr/bin/env bash
+# Tests for bd-sweep-merged's delivery-citation match, for the timestamp rule
+# that decides when a citation is only context, and for the open-PR cross-check
+# that has to corroborate the pre-close search before a bead closes.
+#
+# Together they decide whether a merged PR closes a bead, and both ways that can
+# be wrong are expensive:
+#
+#   - too strict, and shipped work never closes. A double-escaped dot
+#     (gsub("\."; "\\.") in jq source) turned every dotted child id into a regex
+#     demanding a literal backslash, so acme-qtdma.{1,4,5,8} sat in in_review
+#     with four merged PRs citing them in the branch name AND on a Bead: line,
+#     and had to be closed by hand.
+#   - too loose, and unshipped work gets marked delivered: an unescaped dot is a
+#     regex wildcard, body prose routinely names beads a PR only FILED as
+#     follow-ups, and a parent id must not match its own children.
+#
+# The tests below are ordered by which failure would hurt most, and every one of
+# them runs offline: the script is sourced with BD_SWEEP_MERGED_LIB=1, which
+# defines cites_bead and stops before any bd or GitHub call.
+#
+# Run: scripts/test-bd-sweep-merged
+
+set -uo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+# shellcheck source=/dev/null
+BD_SWEEP_MERGED_LIB=1 . "$SCRIPT_DIR/bd-sweep-merged"
+
+FAILED=0
+pass() { printf '  ok   %s\n' "$1"; }
+fail() { printf '  FAIL %s\n     %s\n' "$1" "$2"; FAILED=$((FAILED + 1)); }
+
+pr_json() {
+    # pr_json <title> <branch> <body>
+    jq -nc --arg t "$1" --arg h "$2" --arg b "$3" \
+        '{title: $t, headRefName: $h, body: $b, state: "MERGED"}'
+}
+
+check() {
+    # check <expected true|false> <bead-id> <title> <branch> <body> <name>
+    local want=$1 id=$2 name=$6 got
+    got=$(pr_json "$3" "$4" "$5" | cites_bead "$id")
+    if [ "$got" = "$want" ]; then
+        pass "$name"
+    else
+        fail "$name" "cites_bead $id returned '$got', expected '$want'"
+    fi
+}
+
+echo "bd-sweep-merged citation tests"
+
+# --- 1. dotted child ids, the regression --------------------------------
+# All three citation sites, with the dot that used to break every one of them.
+check true acme-qtdma.1 \
+    "fix the sweep" "acme-qtdma.1-fix-the-sweep" "does what it says" \
+    "a dotted child id in the branch name cites the bead"
+check true acme-qtdma.1 \
+    "acme-qtdma.1: fix the sweep" "some-branch" "does what it says" \
+    "a dotted child id in the title cites the bead"
+check true acme-qtdma.1 \
+    "fix the sweep" "some-branch" $'why\n\nBead: acme-qtdma.1\n' \
+    "a dotted child id on a Bead: line cites the bead"
+check true acme-qtdma.1 \
+    "fix the sweep" "some-branch" $'why\n\n**Beads:** acme-qtdma.1, acme-qtdma.4\n' \
+    "a dotted child id in a decorated Beads: list cites the bead"
+check true acme-qtdma.1 \
+    "fix the sweep" "ACME-QTDMA.1-fix" "why" \
+    "citation matching stays case-insensitive for dotted ids"
+
+# --- 2. the dot is escaped, not a wildcard -------------------------------
+# The reason the gsub exists at all. Without escaping these two would pass as
+# citations and close beads whose work never shipped.
+check false acme-qtdma.1 \
+    "fix the sweep" "acme-qtdmax1-fix" "why" \
+    "the dot does not match another character in the branch"
+check false acme-qtdma.1 \
+    "fix the sweep" "some-branch" $'Bead: acme-qtdma-1\n' \
+    "the dot does not match a hyphen on a Bead: line"
+
+# --- 3. boundaries between a parent and its children ---------------------
+check false acme-qtdma \
+    "fix the sweep" "acme-qtdma.1-fix" $'Bead: acme-qtdma.1\n' \
+    "a parent id is not cited by a PR that cites only a child"
+check false acme-qtdma.1 \
+    "fix the sweep" "acme-qtdma.12-fix" $'Bead: acme-qtdma.12\n' \
+    "a child id is not cited by a PR that cites a longer sibling id"
+check false acme-qtdm \
+    "fix the sweep" "acme-qtdma-fix" $'Bead: acme-qtdma\n' \
+    "an id is not cited by a PR citing an id it is a prefix of"
+
+# --- 4. body prose is context, never delivery ---------------------------
+# acme-it9d: a parent feature's merged PR listed its follow-up beads in prose
+# and the sweep closed them while their real PRs were still open.
+check false acme-qtdma.1 \
+    "fix something else" "some-branch" $'Follow-up beads: acme-qtdma.1 covers the rest.\n' \
+    "a dotted id named in body prose is context, not a citation"
+check false acme-x7q2 \
+    "fix something else" "some-branch" $'Prior art: acme-x7q2\n' \
+    "an undotted id named in body prose is context, not a citation"
+
+# --- 5. plain undotted ids still work -----------------------------------
+check true acme-x7q2 \
+    "fix the sweep" "acme-x7q2-fix-the-sweep" "why" \
+    "an undotted id in the branch name cites the bead"
+check true acme-x7q2 \
+    "fix the sweep" "some-branch" $'why\n\nBead: acme-x7q2\n' \
+    "an undotted id on a Bead: line cites the bead"
+check false acme-x7q2 \
+    "fix the sweep" "some-branch" "nothing to see here" \
+    "a PR that cites nothing closes nothing"
+
+# --- 6. a merged PR that predates the work is context, not delivery ------
+# acme-k2zxt: api#1007 merged on 2026-08-11 and named acme-kdod in its
+# title as the sibling lane it had already shipped; the bead's own work started
+# on 2026-08-17 and its real PR was still an open draft when the sweep closed it.
+time_check() {
+    # time_check <expected true|false> <merged-at> <bead-started> <name>
+    local want=$1 name=$4 got=false
+    merged_before_start "$2" "$3" && got=true
+    if [ "$got" = "$want" ]; then
+        pass "$name"
+    else
+        fail "$name" "merged_before_start '$2' '$3' returned '$got', expected '$want'"
+    fi
+}
+
+time_check true 2026-08-11T22:34:20Z 2026-08-17T13:05:00Z \
+    "a PR merged days before the bead started does not deliver it"
+time_check false 2026-08-17T18:08:19Z 2026-08-17T13:05:00Z \
+    "a PR merged after the bead started delivers it"
+time_check false 2026-08-17T09:00:00Z 2026-08-17T13:05:00Z \
+    "same-day slack: merging just before the bead is moved still delivers it"
+time_check false 2026-08-11T22:34:20Z "" \
+    "a bead with no recorded start discounts nothing"
+time_check false "" 2026-08-17T13:05:00Z \
+    "a PR with no merge time discounts nothing"
+time_check false 2026-08-11T22:34:20+02:00 2026-08-17T13:05:00Z \
+    "a timestamp that is not plain UTC is not compared at all"
+
+# --- 7. the open-PR cross-check reads the index correctly ----------------
+# The pre-close GitHub search can succeed and answer incompletely (index lag,
+# GraphQL outage), which is indistinguishable from a clean empty answer, so a
+# REST list of open PRs corroborates it. This filter is where that
+# list turns into a verdict, and it is judged in one jq pass over the whole
+# index — so what has to hold is that each verdict lands on ITS OWN PR, and that
+# an index it cannot read says "could not tell" rather than "nothing found".
+idx_line() {
+    # idx_line <owner/repo> <number> <title> <branch> <body>
+    printf '%s\t%s\t%s\n' "$1" "$2" \
+        "$(jq -nc --arg t "$3" --arg h "$4" --arg b "$5" \
+            '{title: $t, body: $b, headRefName: $h}')"
+}
+
+index_check() {
+    # index_check <expected stdout> <expected rc> <bead-id> <index> <name>
+    local want=$1 want_rc=$2 id=$3 index=$4 name=$5 got rc
+    got=$(printf '%s' "$index" | filter_citing_prs "$id")
+    rc=$?
+    if [ "$got" = "$want" ] && [ "$rc" = "$want_rc" ]; then
+        pass "$name"
+    else
+        fail "$name" "got rc=$rc out='$got', expected rc=$want_rc out='$want'"
+    fi
+}
+
+# acme-kdod's shape: the delivering PR is open, cites the bead in title and
+# branch, and the search never returned it.
+index_check "$(printf 'acme/api\t1244')" 0 acme-kdod \
+    "$(idx_line acme/api 1244 "acme-kdod: fix the sweep" \
+        "acme-kdod-fix-the-sweep" "why")" \
+    "an open PR citing the bead is found by the cross-check"
+
+# Alignment: three PRs, one citation. A verdict pasted onto the wrong row would
+# block the wrong bead or, worse, clear this one.
+index_check "$(printf 'acme/web\t951')" 0 acme-x7q2 \
+    "$(idx_line acme/api 1244 "something else" "other-branch" "why"
+       idx_line acme/web 951 "fix it" "acme-x7q2-fix-it" $'why\n\nBead: acme-x7q2\n'
+       idx_line acme/worker 77 "third" "third-branch" "why")" \
+    "each verdict lands on its own PR in a multi-repo index"
+
+index_check "" 0 acme-x7q2 \
+    "$(idx_line acme/api 1244 "fix something else" "other-branch" \
+        $'Follow-up beads: acme-x7q2 covers the rest.\n')" \
+    "an open PR that only mentions the bead in prose does not block a close"
+
+index_check "" 0 acme-x7q2 "" \
+    "an index with no open PRs answers 'none', not an error"
+
+# The one that must not fail open: an unreadable row ends jq's stream, so the
+# verdicts no longer line up with the PRs and the honest answer is "could not
+# tell" — which the caller turns into DEGRADED, leaving the bead open.
+index_check "" 1 acme-x7q2 \
+    "$(idx_line acme/api 1244 "fix it" "acme-x7q2-fix-it" "why"
+       printf 'acme/web\t951\t{not json\n'
+       idx_line acme/worker 77 "third" "third-branch" "why")" \
+    "an index line jq cannot parse is 'could not tell', not 'nothing found'"
+
+# --- 8. a body-less PR is answerable, not a crash ------------------------
+got=$(jq -nc '{title: "acme-x7q2: fix", headRefName: "b", state: "MERGED"}' | cites_bead acme-x7q2)
+case "$got" in
+    true) pass "a PR with no body field is still matched on title and branch" ;;
+    *) fail "a PR with no body field is still matched on title and branch" "returned '$got'" ;;
+esac
+
+# --- 9. the reverse audit's citation extractor ---------------------------
+#
+# The audit reports a merged PR whose bead is still `open` or
+# does not exist at all, so it has to agree with cites_bead
+# about what a delivery citation IS. Reading a body-prose mention as a
+# delivery would report every follow-up bead a PR filed as leaked work, and
+# missing a title or branch citation would report nothing at all.
+cited_ids() {
+    printf '%s' "$1" | delivery_cited_ids acme | tr '\n' ' ' | sed 's/ $//'
+}
+
+audit_check() {
+    expected=$1; description=$2; payload=$3
+    got=$(cited_ids "$payload")
+    if [ "$got" = "$expected" ]; then
+        pass "$description"
+    else
+        fail "$description" "extracted '$got', expected '$expected'"
+    fi
+}
+
+audit_check "acme-x7q2" \
+    "a title citation is a delivery citation" \
+    "$(jq -nc '{title: "fix(x): thing (acme-x7q2)", headRefName: "fix/thing", body: ""}')"
+
+audit_check "acme-x7q2" \
+    "a branch citation is a delivery citation" \
+    "$(jq -nc '{title: "fix the thing", headRefName: "fix/acme-x7q2-thing", body: ""}')"
+
+audit_check "acme-x7q2" \
+    "a Bead: line is a delivery citation" \
+    "$(jq -nc '{title: "fix", headRefName: "b", body: "Some prose.\n\nBead: acme-x7q2\n"}')"
+
+# The rule that keeps the audit from reporting every follow-up a PR filed:
+# body prose is context, exactly as it is for the close path.
+audit_check "" \
+    "a bead named only in body prose is not extracted" \
+    "$(jq -nc '{title: "fix", headRefName: "b", body: "Follow-up beads: acme-later, acme-other"}')"
+
+audit_check "acme-a1b2 acme-c3d4" \
+    "several delivery citations are all extracted" \
+    "$(jq -nc '{title: "fix two (acme-a1b2)", headRefName: "b", body: "Beads: acme-c3d4"}')"
+
+audit_check "acme-qtdma.7" \
+    "a dotted child id survives extraction" \
+    "$(jq -nc '{title: "fix", headRefName: "b", body: "Bead: acme-qtdma.7"}')"
+
+audit_check "" \
+    "a PR citing no bead extracts nothing" \
+    "$(jq -nc '{title: "chore: bump deps", headRefName: "deps", body: "routine"}')"
+
+# The reason the prefix is required rather than inferred from the id shape.
+# A generic "<word>-<word>" pattern read ordinary branch names as bead ids
+# and reported a dozen phantoms per PR, which is an audit nobody reads.
+audit_check "" \
+    "ordinary hyphenated branch words are not bead ids" \
+    "$(jq -nc '{title: "fix(agent): prune manifests", headRefName: "fix/manifest-delete-teardown-rebased", body: ""}')"
+
+audit_check "acme-bu2ii" \
+    "a real id is still found among hyphenated words" \
+    "$(jq -nc '{title: "feat: auto-prune cluster-scoped resources (acme-bu2ii)", headRefName: "feat/native-release", body: ""}')"
+
+# tracker_id_prefix reads the prefix off bd's own ids, so the script serves
+# any workspace rather than hardcoding this one.
+prefix_got=$(tracker_id_prefix "$(printf 'acme-a1\topen\nacme-b2\tclosed\nacme-c3.1\topen\n')")
+if [ "$prefix_got" = "acme" ]; then
+    pass "the tracker prefix is derived from bd's own ids"
+else
+    fail "the tracker prefix is derived from bd's own ids" "got '$prefix_got'"
+fi
+
+prefix_got=$(tracker_id_prefix "$(printf 'widget-a1\topen\nwidget-b2\tclosed\n')")
+if [ "$prefix_got" = "widget" ]; then
+    pass "another workspace's prefix is derived just as well"
+else
+    fail "another workspace's prefix is derived just as well" "got '$prefix_got'"
+fi
+
+echo
+if [ "$FAILED" -eq 0 ]; then
+    echo "all tests passed"
+    exit 0
+fi
+echo "$FAILED test(s) failed"
+exit 1

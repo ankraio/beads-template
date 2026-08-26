@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# test-bd-review-gate — pin the three-valued verdict and its exit codes.
+#
+# The whole point of this tool is that the answer is NOT a boolean. A
+# boolean collapses "the bot has not looked yet" into "the bot found
+# nothing", which is the failure acme-sepie measured: 6 of 20 merged PRs
+# carried commits no review ever saw, every one of them a fix written in
+# response to a review finding.
+#
+# So the cases that matter most here are the two that are NOT "reviewed",
+# and the fact that they carry distinct exit codes a caller can branch on
+# without parsing prose.
+#
+# Runs offline: the script is sourced with BD_REVIEW_GATE_LIB=1, which
+# defines the helpers and stops before touching gh.
+#
+# Run: scripts/test-bd-review-gate
+
+set -uo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+# shellcheck source=/dev/null
+BD_REVIEW_GATE_LIB=1 . "$SCRIPT_DIR/bd-review-gate"
+
+FAILED=0
+
+check() {
+    local label="$1" expected="$2" actual="$3"
+    if [ "$expected" = "$actual" ]; then
+        printf 'ok    %-58s %s\n' "$label" "$actual"
+    else
+        printf 'FAIL  %-58s want=%s got=%s\n' "$label" "$expected" "$actual"
+        FAILED=$((FAILED + 1))
+    fi
+}
+
+HEAD40="3b2e169742fa1c0de4b5a7c9f0112233445566aa"
+
+# --- the verdict ------------------------------------------------------------
+
+# The review footer carries a SHORT sha and the API returns a full one, so
+# the common success case is a prefix match, not equality. Requiring
+# equality would report every reviewed PR as not-yet: safe, and useless.
+check "review footer's short sha matches the full head" \
+    "reviewed" "$(classify_verdict "$HEAD40" "3b2e169742fa")"
+
+check "a full-length match is still a match" \
+    "reviewed" "$(classify_verdict "$HEAD40" "$HEAD40")"
+
+# The case that cost web#1527 its review-fix commit: a review exists,
+# it is recent, it looks like success - and it covers the PREVIOUS commit.
+check "review covers an older commit than the head" \
+    "not-yet" "$(classify_verdict "$HEAD40" "9d4a9a990bb9")"
+
+# Absence is silence, not approval. An unbound repo, a failed turn and a
+# clean review are indistinguishable from outside, so they get their own
+# answer rather than being folded into either of the others.
+check "no review has ever posted" \
+    "lane-unavailable" "$(classify_verdict "$HEAD40" "")"
+
+# "I could not look" is not a verdict about the code.
+check "the PR could not be read at all" \
+    "unaskable" "$(classify_verdict "" "")"
+check "no head, but a stale review string" \
+    "unaskable" "$(classify_verdict "" "9d4a9a990bb9")"
+
+# A prefix collision is the one way a prefix match can lie. It cannot be
+# ruled out from the footer alone, and treating a 12-hex-character prefix
+# as identity is the same assumption git itself makes.
+check "a same-prefix sha reads as reviewed (documented limit)" \
+    "reviewed" "$(classify_verdict "3b2e169742fadeadbeef" "3b2e169742fa")"
+
+# --- the exit codes ---------------------------------------------------------
+# A caller branches on these. They must stay distinct, and "could not ask"
+# must never be confusable with a verdict.
+
+check "exit code: reviewed"         "0" "$(state_exit_code reviewed)"
+check "exit code: not-yet"          "1" "$(state_exit_code not-yet)"
+check "exit code: lane-unavailable" "2" "$(state_exit_code lane-unavailable)"
+check "exit code: unaskable"        "3" "$(state_exit_code unaskable)"
+check "exit code: anything unknown" "3" "$(state_exit_code something-new)"
+
+distinct=$(for state in reviewed not-yet lane-unavailable unaskable; do
+    state_exit_code "$state"
+done | sort -u | wc -l | tr -d ' ')
+check "the four states carry four distinct exit codes" "4" "$distinct"
+
+# --- the wording ------------------------------------------------------------
+# The non-reviewed answers exist to be pasted into a handoff. If they read
+# as reassurance the tool has failed at its actual job.
+
+JSON=0 QUIET=0
+not_yet_text=$(report not-yet "$HEAD40" "9d4a9a990bb9")
+case "$not_yet_text" in
+    *"NOT YET"*"have NOT been reviewed"*"do not report a clean review"*)
+        printf 'ok    %-58s %s\n' "not-yet says plainly what was not reviewed" "warns" ;;
+    *)
+        printf 'FAIL  %-58s %s\n' "not-yet says plainly what was not reviewed" "$not_yet_text"
+        FAILED=$((FAILED + 1)) ;;
+esac
+
+unavailable_text=$(report lane-unavailable "$HEAD40" "")
+case "$unavailable_text" in
+    *"Absence is silence, not approval"*)
+        printf 'ok    %-58s %s\n' "lane-unavailable refuses to read as approval" "warns" ;;
+    *)
+        printf 'FAIL  %-58s %s\n' "lane-unavailable refuses to read as approval" "$unavailable_text"
+        FAILED=$((FAILED + 1)) ;;
+esac
+
+echo
+if [ "$FAILED" -eq 0 ]; then
+    echo "all bd-review-gate cases pass"
+    exit 0
+fi
+echo "$FAILED case(s) FAILED"
+exit 1

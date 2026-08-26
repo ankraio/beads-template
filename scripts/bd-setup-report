@@ -1,0 +1,193 @@
+#!/usr/bin/env bash
+# bd-setup-report — which machines are running the current beads setup?
+#
+# Reads the heartbeats bd-setup-sync publishes into .beads-setup/heartbeats/
+# (one file per machine) and prints them against the setup version computed
+# from templates/ right now. That is the whole "who has gotten the update?"
+# answer, and before this it did not exist in any form: improvements to how we
+# work with beads are distributed by copying files OUT of this repo to places
+# no git repo can see, so a machine running last month's rules was
+# indistinguishable from one running today's -- see the hook-drift incident
+# in scripts/bd-health for what that costs.
+#
+# Three verdicts, and the third is the point:
+#
+#   current   heartbeat's version == the version templates/ computes now
+#   behind    heartbeat's version is something else — that machine has not
+#             even pulled the change
+#   not-applied  it has the current templates and has NOT installed them. A
+#             separate verdict because it is a different fix (run --apply)
+#             and because collapsing it into "current" is the bug the first
+#             version of this shipped: matching versions prove only that the
+#             machine READ the templates.
+#   silent    the heartbeat itself has not been updated inside the window.
+#             A machine that stopped reporting is NOT a machine that is fine;
+#             it is the one we know least about, and it reads as "current"
+#             forever if you only compare version strings. Same lesson as the
+#             sync log's OK heartbeat: logging only failures
+#             makes an absent reporter look exactly like a healthy one.
+#
+# Usage: bd-setup-report [<beads-repo>] [--json] [--stale-hours N]
+# Exit: 0 every machine current and reporting, 3 at least one behind or
+#       silent, 1 environment error. Report-only — it never writes anything.
+
+set -uo pipefail
+
+JSON=0
+STALE_HOURS=48
+BEADS_REPO=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --json) JSON=1 ;;
+        --stale-hours) shift; STALE_HOURS=${1:-48} ;;
+        -h|--help) sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -*) echo "bd-setup-report: unknown option $1" >&2; exit 1 ;;
+        *) BEADS_REPO=$1 ;;
+    esac
+    shift
+done
+
+if [ -z "$BEADS_REPO" ]; then
+    BEADS_REPO="${BEADS_SETUP_REPO:-}"
+fi
+if [ -z "$BEADS_REPO" ] && [ -n "${BEADS_DIR:-}" ]; then
+    BEADS_REPO=$(dirname "$BEADS_DIR")
+fi
+if [ -z "$BEADS_REPO" ]; then
+    # No hardcoded fallback: on a machine running two trackers a default path
+    # silently answers about the wrong one, and "which tracker did you mean?"
+    # is the one question this tool must never guess at.
+    echo "$(basename "$0"): pass the path to your beads repo (or set BEADS_SETUP_REPO / BEADS_DIR)" >&2
+    exit 1
+fi
+[ -d "$BEADS_REPO/templates" ] || {
+    echo "bd-setup-report: no templates/ under $BEADS_REPO" >&2; exit 1; }
+BEADS_REPO=$(cd "$BEADS_REPO" && pwd)
+
+# Reuse the version and manifest definitions rather than restating them: two
+# implementations of "what is current" is how the answer starts depending on
+# which tool you asked.
+BD_SETUP_SYNC_LIB=1 . "$(dirname "$0")/bd-setup-sync"
+
+main_checkout=$(git -C "$BEADS_REPO" worktree list 2>/dev/null | head -1 | awk '{print $1}')
+if [ -n "$main_checkout" ] && [ -d "$main_checkout" ]; then
+    WS=$(dirname "$main_checkout")
+else
+    WS=$(dirname "$BEADS_REPO")
+fi
+
+CURRENT=$(setup_version "$BEADS_REPO" "$WS")
+HBDIR=$(heartbeat_dir "$BEADS_REPO")
+NOW=$(date -u '+%s')
+
+# Heartbeats are published by other machines and arrive over git, so they are
+# other people's data: a malformed one must skip its row, never abort the run.
+epoch_of() {
+    ts=$1
+    case "$ts" in ????-??-??T??:??:??Z) ;; *) echo ""; return ;; esac
+    if date -u -d "$ts" '+%s' >/dev/null 2>&1; then
+        date -u -d "$ts" '+%s'
+    elif date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "$ts" '+%s' >/dev/null 2>&1; then
+        date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "$ts" '+%s'
+    else
+        echo ""
+    fi
+}
+
+rows=""
+behind=0
+count=0
+
+if [ -d "$HBDIR" ]; then
+    for hb in "$HBDIR"/*.json; do
+        [ -f "$hb" ] || continue
+        count=$((count + 1))
+        machine=$(read_json_field "$hb" machine)
+        [ -n "$machine" ] || machine=$(basename "$hb" .json)
+        version=$(read_json_field "$hb" setup_version)
+        checked=$(read_json_field "$hb" last_checked)
+        ws_name=$(read_json_field "$hb" workspace)
+        cron=$(read_json_field "$hb" cron_installed)
+        [ -n "$cron" ] || cron="unknown"
+        uptodate=$(read_json_field "$hb" up_to_date)
+
+        age_h="?"
+        epoch=$(epoch_of "$checked")
+        if [ -n "$epoch" ]; then
+            age_h=$(( (NOW - epoch) / 3600 ))
+        fi
+
+        # Two independent ways to be behind, and both have to be checked.
+        # Matching versions only says the machine READ the current templates;
+        # up_to_date is what says it is running them. A machine that pulls
+        # every day and installs nothing matches on version forever.
+        if [ -n "$epoch" ] && [ "$age_h" -gt "$STALE_HOURS" ]; then
+            verdict="silent"
+        elif [ "$version" != "$CURRENT" ]; then
+            verdict="behind"
+        elif [ "$uptodate" = "true" ]; then
+            verdict="current"
+        else
+            verdict="not-applied"
+        fi
+        [ "$verdict" = current ] || behind=1
+        rows="$rows$machine|$ws_name|$version|$age_h|$cron|$verdict
+"
+    done
+fi
+
+if [ "$JSON" = 1 ]; then
+    printf '{\n  "current_version": "%s",\n  "machines": [\n' "$CURRENT"
+    first=1
+    printf '%s' "$rows" | while IFS='|' read -r m w v a c verd; do
+        [ -n "$m" ] || continue
+        [ "$first" = 1 ] || printf ',\n'
+        first=0
+        printf '    {"machine":"%s","workspace":"%s","setup_version":"%s","age_hours":"%s","cron_installed":"%s","verdict":"%s"}' \
+            "$m" "$w" "$v" "$a" "$c" "$verd"
+    done
+    printf '\n  ]\n}\n'
+    [ "$behind" = 0 ] || exit 3
+    exit 0
+fi
+
+echo "Beads setup — current version: $CURRENT"
+echo
+
+if [ "$count" = 0 ]; then
+    echo "No heartbeats in $HBDIR."
+    echo
+    echo "Nothing has reported in yet, which is not the same as everything being fine —"
+    echo "it means no machine is running bd-setup-sync. Wire one up:"
+    echo "  $BEADS_REPO/scripts/bd-setup-sync '$BEADS_REPO' --install-cron"
+    exit 3
+fi
+
+printf '%-34s %-18s %-14s %6s %8s  %s\n' MACHINE WORKSPACE VERSION AGE_H CRON VERDICT
+printf '%s' "$rows" | sort | while IFS='|' read -r m w v a c verd; do
+    [ -n "$m" ] || continue
+    printf '%-34s %-18s %-14s %6s %8s  %s\n' "$m" "$w" "${v:-?}" "$a" "$c" "$verd"
+done
+
+echo
+if [ "$behind" = 0 ]; then
+    echo "All $count reporting machine(s) are on the current setup."
+else
+    echo "behind       has not even pulled the current templates/. It is running older"
+    echo "             rules and nothing on that machine will say so. Fix on that machine:"
+    echo "               git -C <beads repo> pull && scripts/bd-setup-sync --apply"
+    echo
+    echo "not-applied  has the current templates and has not installed them — the copy"
+    echo "             step never happened. Fix on that machine:"
+    echo "               <beads repo>/scripts/bd-setup-sync --apply"
+    echo "             --apply deliberately refuses artifacts whose installed copy may be"
+    echo "             NEWER than the template; those are reported for a human to upstream."
+    echo
+    echo "silent       has not reported within ${STALE_HOURS}h. The weakest signal, not the"
+    echo "             strongest: its last known version may be stale too, and it is the"
+    echo "             machine we know least about. Usually the cron is missing (CRON):"
+    echo "               <beads repo>/scripts/bd-setup-sync --install-cron"
+fi
+
+[ "$behind" = 0 ] || exit 3
+exit 0

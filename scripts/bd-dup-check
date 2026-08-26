@@ -1,0 +1,209 @@
+#!/usr/bin/env bash
+# bd-dup-check — report likely-duplicate beads among non-closed issues.
+#
+# Twin beads get born when two sessions each file a follow-up for the same
+# deferred work without searching first (2026-07-23).
+# The twins then get batch-launched as separate "fix <bead>" jobs and two
+# agents race on the same change. This check runs bd find-duplicates
+# (mechanical text similarity, local, no API key) so every session sees
+# lurking pairs before claiming work; that pair scored 79% against the
+# 50% default threshold, so the scan catches real twins while sibling
+# beads on the same feature stay below it.
+#
+# ...mostly. Some sibling beads score ABOVE it. In one real case four child
+# beads splitting a feature one-cloud-provider-per-lane paired with each
+# other at up to 82%, six ways, and were four different integrations the
+# parent's own scope note required be shipped as separate PRs. On 2026-08-18 seven of the eight reported pairs were that
+# kind of false positive, which is how a session-start check becomes eight
+# lines everyone scrolls past -- and the next real twin then goes unnoticed.
+#
+# Raising --threshold cannot fix it: the twin the check exists for scored 79%,
+# BELOW the lanes at 82%. So known-distinct pairs are listed explicitly in
+# scripts/dup-check-known-distinct.txt, by a human who read both beads. That
+# file's header carries the rules; the important one is that suppression is
+# always counted and named here, never silent.
+#
+# Report-only: it never merges or closes anything. Resolving a pair is a
+# judgment call — fold true dupes with `bd duplicate <dup> --of <keeper>`
+# or `bd close <dup> --reason "duplicate of <keeper>"`.
+#
+# Usage: bd-dup-check [--quiet]
+#   default  always print the scan result, plus any allowlist entries that
+#            matched nothing (the prompt to prune the file)
+#   --quiet  print only when there is something to act on: an unsuppressed
+#            pair, or a malformed allowlist line (for session hooks)
+#
+# Always exits 0: this runs from SessionStart hooks and must never block
+# a session. Findings are also appended to ~/.claude/logs/beads-dup-check.log,
+# including the suppressed pairs, so the log stays a complete record even
+# when the console output is filtered.
+
+set -uo pipefail
+
+QUIET=0
+for arg in "$@"; do
+    case "$arg" in
+        --quiet) QUIET=1 ;;
+        *) echo "usage: bd-dup-check [--quiet]" >&2; exit 0 ;;
+    esac
+done
+
+SCRIPT_DIR=$(cd "$(dirname "$0")" 2>/dev/null && pwd) || SCRIPT_DIR="."
+ALLOWLIST="${BD_DUP_CHECK_ALLOWLIST:-$SCRIPT_DIR/dup-check-known-distinct.txt}"
+
+# A duplicate scan is only as good as the database it reads. beads-sync.sh
+# drops this marker while the local tracker cannot sync with the remote
+# (2026-08-22: two machines each fixed cluster's alembic fork because each
+# ran a clean-looking dup check against its own partitioned store). Warn
+# even under --quiet: a blind scan pretending to be clean is exactly the
+# failure mode --quiet must not hide.
+BEADS_REPO_DIR=$(cd "$SCRIPT_DIR/.." 2>/dev/null && pwd) || BEADS_REPO_DIR=""
+if [ -n "$BEADS_REPO_DIR" ]; then
+    # Test seam: BD_DUP_CHECK_STALE_MARKER overrides the path (point it at
+    # /dev/null to keep a real partition out of test output).
+    STALE_MARKER="${BD_DUP_CHECK_STALE_MARKER:-$HOME/.claude/logs/beads-tracker-stale-$(basename "$(dirname "$BEADS_REPO_DIR")")}"
+    if [ -f "$STALE_MARKER" ]; then
+        echo "bd-dup-check: TRACKER PARTITIONED - $(head -1 "$STALE_MARKER" 2>/dev/null)"
+        echo "  This scan (and bd find-duplicates / bd list) cannot see other machines' beads, in either direction."
+        echo "  Search GitHub open PRs before claiming or filing anything incident-class, and heal the partition"
+        echo "  first (SETUP.md 'Dolt pull conflict: operator merge') before batch-launching fixes."
+    fi
+fi
+
+# Test seam: read a recorded scan instead of querying bd, so the filtering
+# below can be exercised without a database. Unset in normal use.
+if [ -n "${BD_DUP_CHECK_JSON:-}" ] && [ -r "${BD_DUP_CHECK_JSON}" ]; then
+    json=$(cat "${BD_DUP_CHECK_JSON}") || exit 0
+else
+    json=$(bd find-duplicates --json 2>/dev/null) || exit 0
+fi
+count=$(printf '%s' "$json" | jq -r '.count // 0' 2>/dev/null) || exit 0
+
+if [ -z "$count" ] || [ "$count" = "0" ]; then
+    [ "$QUIET" = 1 ] || echo "bd-dup-check: no likely duplicates among non-closed beads."
+    exit 0
+fi
+
+# --- the allowlist -------------------------------------------------------
+# Parsed into newline-separated "a|b" keys with the two ids sorted, so an entry
+# matches a scanned pair whichever order either was written in. Plain strings
+# and grep -F rather than associative arrays: macOS still ships bash 3.2, and a
+# check that runs from a session hook must not depend on which bash won $PATH.
+keys=""
+malformed=""
+used=""
+if [ -r "$ALLOWLIST" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+        # Strip comments and surrounding whitespace.
+        body=${line%%#*}
+        reason=""
+        case "$line" in *#*) reason=${line#*#} ;; esac
+        body=$(printf '%s' "$body" | tr -s ' \t' ' ' | sed 's/^ //; s/ $//')
+        [ -z "$body" ] && continue
+
+        a=${body%% *}
+        b=${body#* }
+        reason=$(printf '%s' "$reason" | sed 's/^ *//; s/ *$//')
+        # A third field means the line is not "<a> <b>  # reason".
+        extra=0
+        case "$b" in *' '*) extra=1 ;; esac
+        if [ -z "$a" ] || [ -z "$b" ] || [ "$a" = "$b" ] || [ "$extra" = 1 ]; then
+            malformed="$malformed
+  $line   <- expected exactly two bead ids"
+            continue
+        fi
+        if [ -z "$reason" ]; then
+            malformed="$malformed
+  $line   <- no reason given; say why they are distinct"
+            continue
+        fi
+        # Sort the pair so order never matters.
+        if [ "$a" \> "$b" ]; then tmp=$a; a=$b; b=$tmp; fi
+        keys="$keys
+$a|$b"
+    done < "$ALLOWLIST"
+fi
+
+# --- split the scan into "act on this" and "known distinct" --------------
+tsv=$(printf '%s' "$json" | jq -r '
+    .pairs[] | [.issue_a_id, .issue_b_id, (.similarity * 100 | floor),
+                .issue_a_title, .issue_b_title] | @tsv' 2>/dev/null) || exit 0
+
+pairs=""
+suppressed=""
+n_pairs=0
+n_suppressed=0
+while IFS=$'\t' read -r a b sim ta tb; do
+    [ -z "$a" ] && continue
+    if [ "$a" \> "$b" ]; then ka=$b; kb=$a; else ka=$a; kb=$b; fi
+    if printf '%s' "$keys" | grep -qxF "$ka|$kb" 2>/dev/null; then
+        n_suppressed=$((n_suppressed + 1))
+        suppressed="$suppressed
+  $a ~ $b  (${sim}% similar) — known distinct"
+        used="$used
+$ka|$kb"
+        continue
+    fi
+    n_pairs=$((n_pairs + 1))
+    pairs="$pairs
+  $a ~ $b  (${sim}% similar)
+    a: $ta
+    b: $tb"
+done <<EOF
+$tsv
+EOF
+
+# Allowlist entries that matched nothing this scan: usually one of the pair has
+# been closed, so the line can go. Only surfaced on a hand run -- it is a
+# tidiness prompt, not something worth interrupting a session for.
+stale=""
+n_stale=0
+while IFS= read -r key; do
+    [ -z "$key" ] && continue
+    if ! printf '%s' "$used" | grep -qxF "$key" 2>/dev/null; then
+        n_stale=$((n_stale + 1))
+        stale="$stale
+  ${key%|*} ~ ${key#*|}"
+    fi
+done <<EOF
+$keys
+EOF
+
+# --- report --------------------------------------------------------------
+note=""
+[ "$n_suppressed" -gt 0 ] && note="
+  ($n_suppressed pair(s) listed as known-distinct in $(basename "$ALLOWLIST") and not shown above:$suppressed)"
+
+if [ "$n_pairs" -gt 0 ]; then
+    msg="bd-dup-check: $n_pairs likely-duplicate bead pair(s) found:
+$pairs
+  Resolve before claiming or batch-launching fixes for any bead above:
+  compare with \`bd show <a> <b>\`, then fold true dupes with
+  \`bd duplicate <dup> --of <keeper>\` or \`bd close <dup> --reason \"duplicate of <keeper>\"\`.
+  If they are NOT duplicates, add them to $ALLOWLIST with a reason.$note"
+else
+    msg="bd-dup-check: no likely duplicates among non-closed beads needing a decision.$note"
+fi
+
+if [ -n "$malformed" ]; then
+    msg="$msg
+
+  WARNING: $(basename "$ALLOWLIST") has unusable line(s) — these suppress nothing:$malformed"
+fi
+
+if [ "$QUIET" = 1 ] && [ "$n_pairs" = 0 ] && [ -z "$malformed" ]; then
+    printf '' # nothing to act on; stay silent for session hooks
+else
+    printf '%s\n' "$msg"
+    if [ "$QUIET" = 0 ] && [ "$n_stale" -gt 0 ]; then
+        printf '  %s entr%s in %s matched nothing in this scan and can be pruned:%s\n' \
+            "$n_stale" "$([ "$n_stale" = 1 ] && echo y || echo ies)" \
+            "$(basename "$ALLOWLIST")" "$stale"
+    fi
+fi
+
+mkdir -p "$HOME/.claude/logs" 2>/dev/null
+{ date '+--- %Y-%m-%dT%H:%M:%S'; printf '%s\n' "$msg"; } \
+    >> "$HOME/.claude/logs/beads-dup-check.log" 2>/dev/null
+
+exit 0

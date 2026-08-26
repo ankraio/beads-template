@@ -1,0 +1,789 @@
+#!/usr/bin/env bash
+# bd-sweep-merged — close beads whose delivering GitHub PRs have all merged.
+#
+# The bead lifecycle usually ends at "PR opened", but the PR merges after the
+# session is gone, leaving done work parked in in_progress forever. This sweep
+# scans in_progress + in_review beads, pulls PR references out of the
+# description and comments, asks gh for each PR's state, and closes beads
+# where every PR that delivers the bead is merged (at least one, zero
+# unmerged) — after confirming GitHub-side that no other PR cites the bead.
+#
+# Workspace-agnostic: the GitHub owner comes from this beads repo's origin
+# remote, and `repo#123` refs match any sibling git checkout in the workspace
+# root, so one copy of the script serves every workspace you run. Where no
+# sibling checkouts exist (CI), set BD_SWEEP_REPOS to a space-separated list
+# of repo names to use as the reference vocabulary instead.
+#
+# Recognized references:
+#   - full URLs      github.com/<owner>/<repo>/pull/123
+#   - qualified      api#605, web #951, api PR #692
+#                    (repo = sibling dir name or BD_SWEEP_REPOS entry)
+#   - bare           PR #605, #605 — only when exactly one sibling repo name
+#                    appears anywhere in the bead text; otherwise skipped
+#
+# With --search-citing, each swept bead is also looked up on GitHub itself
+# (gh search prs --owner <owner> "<bead-id>"), so a merged PR that cites the
+# bead id is found even when nobody pasted the PR number back into the bead.
+# Search hits join the candidate set and pass through the same delivery-
+# citation check below. Searches are rate-limited (~30/min), so this path
+# sleeps between beads and is meant for the nightly sweep, not session hooks.
+#
+# Harvested references are only CANDIDATES. A candidate counts as "this
+# bead's PR" solely when it DELIVERY-CITES the bead: the bead id appears in
+# the PR title, in the branch name, or on a `Bead:` / `Beads:` line in the
+# body. A mention anywhere else in the body is context — PR bodies routinely
+# name beads they FILED as follow-ups ("Follow-up beads: acme-x ..."), cite
+# parent features, or reference sibling branches, and any of those would
+# close unfinished work if body prose counted: a parent feature's merged PR
+# once listed its follow-up beads in prose and the sweep closed them while
+# their real PRs were still open.
+# The citation match is boundary-aware: bead acme-xvt does not match a PR
+# that cites only acme-xvt.9.
+#
+# A citation is not a delivery when the PR merged before the work began. A PR
+# title routinely names several beads — one it delivers, one whose lane it only
+# touches — and that is a title citation for both, which no amount of parsing
+# can tell apart. So a merged PR that merged on an earlier UTC day than the
+# bead's own `started_at` is DISCOUNTED: it is reported, it neither authorizes
+# nor blocks a close, and if it was the only merged citing PR the bead is left
+# open for a manual check. Real case: a bead was closed on api#1007, merged
+# six days earlier and named in the bead's own title as the sibling lane that
+# had already shipped, while the bead's real PR — api#1244, opened the day the
+# work started — was still an open draft. Day granularity is deliberate slack
+# for the human who merges first and moves the bead afterwards; the shape this
+# catches is days wide. Beads for which bd recorded no `started_at` have no
+# evidence either way, so the check stays inert for them rather than guessing.
+#
+# Close rule: at least one delivery-citing PR merged, zero unmerged. A PR that
+# is CLOSED without merging is ABANDONED, not unmerged: it delivers nothing, so
+# it does not block. Re-opening a PR on a corrected base is routine, and while
+# closed PRs counted as unmerged, every bead with a superseded PR in its history
+# was unclosable forever and showed up nightly as if the work had not shipped
+# (web#1219 closed, replaced by web#1220 which merged).
+# OPEN and unresolved states still block, as they must. Before
+# closing, the sweep always confirms GitHub-side (same search as
+# --search-citing, run lazily for beads about to close) that no unmerged PR
+# delivery-cites the bead — references harvested from the bead's own text
+# alone never authorize a close, because the delivering PR may never have
+# been pasted back into the bead. If the search cannot run (gh error, no
+# token), the bead stays open.
+#
+# That search can also SUCCEED and answer incompletely, and its exit status
+# says nothing about which it did: GitHub's issue-search index lags a
+# just-opened PR by minutes, and search runs on GraphQL, which was failing
+# org-wide during the 2026-08-17 incident. An empty result then reads exactly
+# like a clean one — that is how acme-kdod's real PR (api#1244, opened
+# that morning, the bead id in its title AND its branch name) failed to block
+# the close. So a close is corroborated on a second surface: the open PRs of
+# the candidate repos are REST-listed (`repos/<owner>/<repo>/pulls?state=open`,
+# the same fallback surface pr_lookup uses for state) and run through the same
+# delivery-citation check. An open PR that cites the bead blocks the close and
+# is reported as one the search did not return; an index that could not be
+# completed is DEGRADED, never "nothing found".
+# Caveat: a delivering PR that never cites the bead id back is invisible —
+# put the bead id in the title, branch name, or a `Bead:` line of every PR.
+# The cross-check only enumerates the candidate repos (sibling checkouts, or
+# BD_SWEEP_REPOS), so the org-wide search stays the wider net of the two.
+#
+# A PR whose state cannot be determined never closes a bead, so the bead
+# stays open. Closing wrongly is recoverable with
+# `bd update <id> --status=open`.
+#
+# "Cannot be determined" and "not merged" are reported as DIFFERENT things,
+# because they used to look identical: on 2026-08-17 a GitHub GraphQL
+# incident made every `gh pr view` fail, the errors were discarded, and the
+# run reported "citing PRs not all merged — …(UNKNOWN)" for beads whose PRs
+# had in fact merged. That is indistinguishable from a healthy run over
+# genuinely open PRs, so a whole sweep did nothing and looked correct
+#. Now a failed lookup falls back to the REST API (a separate
+# GitHub surface, healthy throughout that incident), retries once, and if it
+# still cannot answer, the bead is reported as DEGRADED and the run exits 3.
+# A definitive 404 is an answer, not a failure: the ref is reported MISSING
+# and the run stays clean, so a bead citing a deleted PR does not paint every
+# nightly run red.
+#
+# Usage: bd-sweep-merged [--apply] [--quiet] [--search-citing]
+#   default          dry run: print what would happen
+#   --apply          actually close fully-merged beads
+#   --quiet          print only actions (for use from hooks)
+#   --search-citing  also discover PRs via GitHub search (slow; nightly CI)
+#
+# Exit: 0 clean, 1 no workspace/owner, 2 usage, 3 ran but degraded (at least
+# one GitHub lookup could not be resolved; those beads were left open),
+# 5 ran cleanly but found MISRECORDED beads (see below).
+#
+# 3 and 5 both mean the sweep RAN and its closes are real: a caller must
+# still push/commit whatever it did, and must not treat either as "the sweep
+# failed". They differ in what they say about the run — 3 is this run being
+# incomplete and clears on a re-run; 5 is a finding about tracker DATA that
+# holds until a human records the right PR, so a caller that paints itself
+# red on 5 stays red forever. The nightly workflow got this wrong in both
+# directions at once: it aborted on 5 before its push-back step and threw
+# four real closes away.
+
+set -uo pipefail
+
+# Does the PR JSON on stdin DELIVERY-CITE bead $1? The bead id, boundary-aware,
+# in the PR title, in the branch name, or on a `Bead:`/`Beads:` line of the
+# body; a mention anywhere else in the body is context (see the header).
+#
+# The dot of a dotted child id must reach the regex engine as `\.` — ONE
+# backslash. jq's replacement string is literal, so the obvious-looking
+# gsub("\\."; "\\\\.") emits `\\.`, which asks for a literal backslash followed
+# by any character and therefore matches nothing a human would ever write: every
+# dotted child bead reported "no PR cites this bead" and parked in in_review
+# forever, however correctly both directions were cited (seen on
+# acme-qtdma.{1,4,5,8}). Escaping is still required — an unescaped dot is a
+# wildcard, so acme-qtdma.1 would match a PR citing acme-qtdmaX1.
+# scripts/test-bd-sweep-merged pins both halves of that.
+cites_bead() {
+    jq -r --arg id "$1" '($id | ascii_downcase | gsub("\\."; "\\.")) as $re
+        | (([.title, .headRefName] | join(" ")) + " "
+           + ((.body // "") | split("\n")
+              | map(select(test("^[\\s*_>#-]*beads?\\s*[:=]"; "i"))) | join(" "))
+           | ascii_downcase) as $t
+        | $t | test($re + "(?![a-z0-9.])")'
+}
+
+# The still-open children of bead $1, as " id(status)" entries, or empty
+# when it has none. Derived from bd's own `parent` field rather than from
+# the id shape: a dotted id is the usual spelling of a child, but the field
+# is what bd actually means by one, and a hierarchy that stops encoding the
+# relationship in the id would silently make an id-prefix check answer "no
+# children" for every epic.
+# Read from `bd list`, which is the PARENT-side view and agrees with
+# `bd show <parent>`'s own CHILDREN section. Note that `bd show <child>
+# --json` can report a DIFFERENT `parent` for the same bead - observed
+# 2026-08-23 on acme-i3hx8, which `bd list` and `bd show acme-56ujf`
+# both place under acme-56ujf while `bd show acme-i3hx8 --json` answers
+# acme-8ae4i. Asking the child would therefore have let exactly the
+# close this guard exists to stop go through.
+#
+# Returns non-zero when bd could not be read at all, so the caller can hold
+# the bead on an unknown answer instead of closing on a guessed one.
+children_still_open() {
+    listing=$(bd list --limit 0 --json 2>/dev/null) || return 1
+    [ -n "$listing" ] || return 1
+    printf '%s' "$listing" | jq -r --arg parent "$1" '
+        [ .[]
+          | select((.parent // "") == $parent)
+          | select((.status // "") != "closed")
+          | " \(.id)(\(.status))" ]
+        | join("")' 2>/dev/null || return 1
+}
+
+# Every child of bead $1, one id per line, regardless of status — the set a
+# PR could be delivering on this bead's behalf. Same parent-field sourcing
+# and the same reasoning as children_still_open above; CLOSED children are
+# included here on purpose, because a parent parks precisely while its
+# already-delivered children pile up behind the ones still open.
+# Empty output (and success) for a bead with no children.
+#
+# Called once per swept bead, so the listing is fetched once and reused:
+# this reads only the id→parent mapping, which the sweep never writes (it
+# only ever changes a status), so a cached answer cannot go stale the way
+# children_still_open's would. That one deliberately keeps reading live.
+children_listing_cache=""
+children_listing_failed=0
+children_of() {
+    if [ -z "$children_listing_cache" ] && [ "$children_listing_failed" = 0 ]; then
+        # --all is load-bearing: bd hides closed issues by default, and the
+        # children that matter most here are exactly the delivered (closed)
+        # ones a parent is parked behind. Without it every child that had
+        # already shipped was invisible and the parent read as MISRECORDED.
+        children_listing_cache=$(bd list --all --limit 0 --json 2>/dev/null) || children_listing_cache=""
+        [ -n "$children_listing_cache" ] || children_listing_failed=1
+    fi
+    [ "$children_listing_failed" = 0 ] || return 1
+    printf '%s' "$children_listing_cache" | jq -r --arg parent "$1" '
+        .[] | select((.parent // "") == $parent) | .id' 2>/dev/null || return 1
+}
+
+# Did a PR that merged at $1 merge before bead work started at $2 (see the
+# header)? Both timestamps must be ISO-8601 UTC as bd and gh emit them, because
+# the compare is lexicographic on the date — no `date` parsing, which differs
+# between the BSD date on the laptops and the GNU date in CI. Anything else
+# (an empty started_at, a fractional or offset timestamp) answers "no", so an
+# unreadable timestamp can only fail open: it never invents a reason to hold a
+# bead the sweep would otherwise close.
+merged_before_start() {
+    case ${1:-} in ????-??-??T??:??:??Z) ;; *) return 1 ;; esac
+    case ${2:-} in ????-??-??T??:??:??Z) ;; *) return 1 ;; esac
+    [[ ${1:0:10} < ${2:0:10} ]]
+}
+
+# Reduce an open-PR index on stdin — "owner/repo<TAB>number<TAB><PR JSON>"
+# lines, one per open PR, built by open_pr_index() — to the PRs that
+# delivery-cite bead $1, printed as "owner/repo<TAB>number".
+#
+# cites_bead answers one line per JSON object it reads, so the whole index is
+# judged in a single jq pass and the verdicts are pasted back onto the refs.
+# That alignment is the risk: one line jq cannot parse ends the stream and every
+# later PR would inherit a verdict belonging to another PR. So the verdicts are
+# counted against the index, and a mismatch returns 1 — "could not tell", which
+# the caller must not read as "no open PR cites this bead", since that is the
+# reading this whole cross-check exists to stop being silent.
+filter_citing_prs() {
+    idx=$(grep -E '.' || true)
+    [ -n "$idx" ] || return 0
+    verdicts=$(printf '%s\n' "$idx" | cut -f3- | cites_bead "$1" 2>/dev/null)
+    [ "$(printf '%s\n' "$verdicts" | grep -cE '^(true|false)$')" \
+        = "$(printf '%s\n' "$idx" | grep -cE '.')" ] || return 1
+    printf '%s\n' "$verdicts" | paste - <(printf '%s\n' "$idx" | cut -f1,2) |
+        awk -F'\t' '$1 == "true" { print $2 "\t" $3 }'
+}
+
+# Every bead id DELIVERY-CITED by the PR JSON on stdin, one per line,
+# deduplicated. $1 is the tracker's id prefix (e.g. "acme").
+#
+# The citation surface is identical to cites_bead's - title, branch name,
+# and `Bead:`/`Beads:` lines - because the reverse audit must agree with the
+# close path about what "this PR delivers that bead" means. Body prose is
+# excluded for the same reason it is there: PR bodies routinely list beads
+# they FILED as follow-ups, and those are legitimately open.
+#
+# The prefix is REQUIRED rather than inferred from the id shape. A generic
+# "<word>-<word>" pattern reads ordinary branch names as bead ids -
+# manifest-delete, auto-prune, cluster-scoped, load-balancer all matched in
+# a first run - and an audit that reports a dozen phantoms per PR is an
+# audit nobody reads, which is the same silence it was written to fix.
+delivery_cited_ids() {
+    jq -r --arg prefix "${1:-}" '
+        ($prefix | gsub("[^a-zA-Z0-9]"; "")) as $safe
+        | (([.title, .headRefName] | join(" ")) + " "
+           + ((.body // "") | split("\n")
+              | map(select(test("^[\\s*_>#-]*beads?\\s*[:=]"; "i"))) | join(" ")))
+        | ascii_downcase
+        | [ match($safe + "-[a-z0-9]+(\\.[0-9]+)*"; "g").string ]
+        | unique | .[]' 2>/dev/null
+}
+
+# The tracker's id prefix, from the ids bd actually carries: the text before
+# the first "-" of the most common shape. Derived rather than hardcoded so
+# the script stays workspace-agnostic, which is the same reason the GitHub
+# owner is read off the origin remote.
+tracker_id_prefix() {
+    printf '%s\n' "$1" | awk -F'\t' '{ split($1, part, "-"); if (part[1] != "") print part[1] }' |
+        sort | uniq -c | sort -rn | head -1 | awk '{print $2}'
+}
+
+# Sourced with BD_SWEEP_MERGED_LIB=1, the script stops here: the helpers above
+# are defined and nothing has touched the workspace, bd or GitHub yet, so the
+# test script can exercise them offline.
+if [ "${BD_SWEEP_MERGED_LIB:-0}" = 1 ]; then
+    return 0 2>/dev/null || exit 0
+fi
+
+APPLY=0
+QUIET=0
+SEARCH=0
+AUDIT=0
+AUDIT_DAYS=14
+for arg in "$@"; do
+    case "$arg" in
+        --apply) APPLY=1 ;;
+        --quiet) QUIET=1 ;;
+        --search-citing) SEARCH=1 ;;
+        --audit-merged) AUDIT=1 ;;
+        --audit-days=*) AUDIT_DAYS=${arg#--audit-days=} ;;
+        *) echo "usage: bd-sweep-merged [--apply] [--quiet] [--search-citing] [--audit-merged] [--audit-days=N]" >&2; exit 2 ;;
+    esac
+done
+
+say() { [ "$QUIET" = 1 ] || echo "$@"; }
+
+beads_db=$(bd where 2>/dev/null | head -1 | tr -d '[:space:]')
+if [ -z "$beads_db" ] || [ ! -e "$beads_db" ]; then
+    echo "bd-sweep-merged: no beads workspace found (set BEADS_DIR)" >&2
+    exit 1
+fi
+beads_repo=$(dirname "$beads_db")
+workspace_root=$(dirname "$beads_repo")
+
+origin=$(git -C "$beads_repo" remote get-url origin 2>/dev/null || true)
+owner=$(printf '%s' "$origin" | sed -E 's/\.git$//; s#.*[:/]([^/]+)/[^/]+$#\1#')
+if [ -z "$owner" ]; then
+    echo "bd-sweep-merged: cannot derive GitHub owner from $beads_repo origin" >&2
+    exit 1
+fi
+
+# Sibling git checkouts = the vocabulary for `repo#123` references.
+# BD_SWEEP_REPOS overrides detection where no sibling checkouts exist (CI).
+sibling_repos=()
+if [ -n "${BD_SWEEP_REPOS:-}" ]; then
+    for r in $BD_SWEEP_REPOS; do sibling_repos+=("$r"); done
+else
+    for d in "$workspace_root"/*/; do
+        [ -e "$d.git" ] && sibling_repos+=("$(basename "$d")")
+    done
+fi
+
+# All PRs in the owner org that mention the bead id, as "owner/repo<TAB>num".
+# Exit status is gh's own, so callers can tell "no hits" from "search broke".
+search_citing() {
+    gh search prs --owner "$owner" "$1" --json number,repository \
+        --jq '.[] | "\(.repository.nameWithOwner)\t\(.number)"' 2>/dev/null
+}
+
+# Every open PR in the candidate repos, as an index of
+# "owner/repo<TAB>number<TAB><PR JSON>" lines for filter_citing_prs.
+#
+# REST, on purpose: this is the corroborating surface for the pre-close search
+# (see the header), so it must not share the search's failure modes — no
+# GraphQL, and no issue-search index that a PR opened minutes ago has not
+# reached yet. Built at most once per run, lazily, so a sweep that closes
+# nothing pays nothing; 0 = usable index, 1 = could not be completed.
+open_pr_index_file=""
+open_pr_index_state=""      # "" not built yet | ok | failed
+
+open_pr_index() {
+    case "$open_pr_index_state" in
+        ok) return 0 ;;
+        failed) return 1 ;;
+    esac
+    # Pessimistic until the last repo is in: any early return leaves "failed",
+    # and a half-built index never answers "nothing cites this bead".
+    open_pr_index_state=failed
+    [ "${#sibling_repos[@]}" -gt 0 ] || return 1
+    open_pr_index_file=$(mktemp "${TMPDIR:-/tmp}/bd-sweep-open-prs.XXXXXX") || return 1
+    gh_err_file=$(mktemp "${TMPDIR:-/tmp}/bd-sweep-gh-err.XXXXXX") || return 1
+    trap 'rm -f "$open_pr_index_file" "$gh_err_file"' EXIT
+    for repo in "${sibling_repos[@]}"; do
+        if out=$(gh api --paginate "repos/$owner/$repo/pulls?state=open&per_page=100" \
+                    --jq '.[] | "\(.number)\t" + ({title, body, headRefName: .head.ref} | tostring)' \
+                    2>"$gh_err_file" |
+                 awk -v prefix="$owner/$repo" '{ print prefix "\t" $0 }'); then
+            [ -n "$out" ] && printf '%s\n' "$out" >> "$open_pr_index_file"
+        elif grep -q 'HTTP 404' "$gh_err_file"; then
+            # No such repo under this owner — a sibling checkout from somewhere
+            # else. It hosts none of our PRs, so a definitive 404 is an answer
+            # and the rest of the index still stands (same rule as pr_lookup).
+            continue
+        else
+            return 1
+        fi
+    done
+    open_pr_index_state=ok
+}
+
+# Which open PRs delivery-cite bead $1, as "owner/repo<TAB>number" lines?
+# 1 = the question could not be answered, which is not the same as "none".
+open_prs_citing() {
+    open_pr_index || return 1
+    filter_citing_prs "$1" < "$open_pr_index_file"
+}
+
+# One PR's state as gh-pr-view-shaped JSON on stdout.
+# 0 = answered, 2 = definitively no such PR (404), 1 = could not tell.
+# GraphQL (`gh pr view`) first, then REST, which is a separate GitHub surface
+# and stayed up through the GraphQL incident that motivated this. One retry
+# on top of that — a sweep that retry-loops through an outage is no more
+# useful than one that reports it honestly.
+pr_lookup() {
+    or=$1
+    num=$2
+    if out=$(gh pr view "$num" --repo "$or" --json state,title,body,headRefName,mergedAt 2>/dev/null); then
+        printf '%s' "$out"
+        return 0
+    fi
+    for attempt in 1 2; do
+        if out=$(gh api "repos/$or/pulls/$num" 2>&1); then
+            # REST reports merged separately from state; gh pr view folds the
+            # two into MERGED/OPEN/CLOSED, which is what the caller expects.
+            mapped=$(printf '%s' "$out" | jq -c '{
+                state: (if .merged then "MERGED" else (.state | ascii_upcase) end),
+                title, body, headRefName: .head.ref, mergedAt: .merged_at }' 2>/dev/null) || mapped=""
+            [ -n "$mapped" ] || return 1
+            printf '%s' "$mapped"
+            return 0
+        fi
+        case "$out" in *"HTTP 404"*) return 2 ;; esac
+        [ "$attempt" = 1 ] && sleep 2
+    done
+    return 1
+}
+
+# Evaluate $refs for bead $id into merged_list / unmerged_list /
+# abandoned_list / predates_list / context_list, plus error_list for refs
+# GitHub would not resolve.
+# Delivery citation = bead id (boundary-aware) in the PR title, branch name,
+# or a `Bead:`/`Beads:` line of the body; anything else is context. A citing
+# PR that merged before $bead_started is discounted into predates_list.
+evaluate_refs() {
+    merged_list=""
+    unmerged_list=""
+    abandoned_list=""
+    predates_list=""
+    context_list=""
+    child_delivery_list=""
+    error_list=""
+    while IFS=$'\t' read -r or num; do
+        [ -n "$num" ] || continue
+        pr=$(pr_lookup "$or" "$num")
+        rc=$?
+        if [ "$rc" = 2 ]; then
+            unmerged_list="$unmerged_list $or#$num(MISSING)"
+            continue
+        fi
+        if [ "$rc" != 0 ] || [ -z "$pr" ]; then
+            error_list="$error_list $or#$num"
+            continue
+        fi
+        cites=$(printf '%s' "$pr" | cites_bead "$id")
+        if [ "$cites" != "true" ]; then
+            # A PR delivering one of this bead's own CHILDREN is not context
+            # and not a misrecord — it is a parent parked on the work it was
+            # split into, which is the normal shape of an epic. Separated
+            # from context_list so report_no_delivery can say which it is.
+            child_hit=""
+            for child in $bead_children; do
+                if [ "$(printf '%s' "$pr" | cites_bead "$child")" = "true" ]; then
+                    child_hit="$child"
+                    break
+                fi
+            done
+            if [ -n "$child_hit" ]; then
+                child_delivery_list="$child_delivery_list $or#$num(→$child_hit)"
+            else
+                context_list="$context_list $or#$num"
+            fi
+            continue
+        fi
+        state=$(printf '%s' "$pr" | jq -r .state)
+        if [ "$state" = "MERGED" ]; then
+            merged_at=$(printf '%s' "$pr" | jq -r '.mergedAt // ""')
+            if merged_before_start "$merged_at" "$bead_started"; then
+                # Cited, but it shipped before this work began: context in a
+                # PR title, not this bead's delivery.
+                predates_list="$predates_list $or#$num(merged ${merged_at%%T*})"
+            else
+                merged_list="$merged_list $or#$num"
+            fi
+        elif [ "$state" = "CLOSED" ]; then
+            # Closed without merging: superseded, delivered nothing, blocks
+            # nothing. Reported alongside the close for transparency.
+            abandoned_list="$abandoned_list $or#$num"
+        else
+            unmerged_list="$unmerged_list $or#$num($state)"
+        fi
+    done <<EOF
+$refs
+EOF
+}
+
+# Nothing merged delivery-cites bead $id: say which of the three shapes it is,
+# because they mean different things — the work was abandoned, or it shipped
+# before this bead started and the citation is a title mentioning a sibling
+# lane, or nobody ever cited the bead at all.
+report_no_delivery() {
+    if [ -n "$predates_list" ]; then
+        say "$id: the only citing merged PRs predate this bead's start ($bead_started) —$predates_list — cited as context, not delivery; manual check"
+    elif [ -n "$abandoned_list" ]; then
+        say "$id: only closed, never-merged PRs cite this bead —$abandoned_list — nothing delivered, manual check"
+    elif [ -n "$child_delivery_list" ] && [ -z "$context_list" ]; then
+        # Not a misrecord: every PR it names delivers one of its own children,
+        # which is a parent correctly parked on the work it was split into.
+        # Calling this MISRECORDED made the sweep exit 5 on a healthy, and
+        # permanent, state — and exit 5 used to abort the nightly job before
+        # it pushed its closes back, so this false positive was discarding
+        # real work every night (acme-fluna; the bead was acme-9myv, whose
+        # own notes say "Parent stays open until .1 and .3 land").
+        say "$id: parent parked on its children — the PRs it names deliver$child_delivery_list; it closes when its children do, not on these"
+    elif [ "$bead_status" = "in_review" ] && [ -n "$context_list" ]; then
+        misrecord "$id: MISRECORDED — in_review, but every PR it names is merged and delivery-cites some OTHER bead:$context_list. The delivering PR was never recorded, so no sweep can close this and --search-citing will not find it either. Add it: bd comment $id \"PR: https://github.com/<owner>/<repo>/pull/<n>\""
+    else
+        say "$id: no PR cites this bead (context only:$context_list) — manual check"
+    fi
+}
+
+ids=$(bd list --status=in_progress,in_review --limit 0 --json 2>/dev/null | jq -r '.[].id')
+if [ -z "$ids" ]; then
+    say "Nothing in in_progress/in_review — nothing to sweep."
+    exit 0
+fi
+
+closed_any=0
+degraded=0
+# Loud on purpose: printed even under --quiet, because the whole point is
+# that a degraded run must not read like a clean one.
+degrade() { degraded=1; echo "$@"; }
+
+# A bead whose every harvested PR is merged and none of which is about it.
+# Loud on purpose, like degrade: this one is printed even under --quiet
+# because it is the shape that LOOKS recorded. The bead names a real, merged
+# PR, so a reader skimming it sees a delivery reference and moves on - and
+# the nightly --search-citing pass cannot rescue it either, because it asks
+# GitHub which PRs cite the bead and the answer is none. Nothing in the
+# system will ever revisit it. Real case: a bead carried a reference to
+# api#1484, a merged PR that delivered a DIFFERENT bead, and sat in in_review
+# for four days.
+misrecorded=0
+misrecord() { misrecorded=1; echo "$@"; }
+
+for id in $ids; do
+    bead=$(bd show "$id" --json --include-comments 2>/dev/null)
+    text=$(printf '%s' "$bead" |
+        jq -r '.[0] | ([.title, .description] + [(.comments // [])[].text]) | join("\n")')
+    [ -n "$text" ] || continue
+    # When work began, for the predating-merge discount above. "" for a bead bd
+    # never recorded a start for, which leaves that check inert.
+    bead_started=$(printf '%s' "$bead" | jq -r '.[0].started_at // ""')
+    # in_review asserts "the work is delivered and waiting to merge". That
+    # claim is what makes a non-citing reference a fault rather than a
+    # work-in-progress note, so the misrecord report below is scoped to it.
+    bead_status=$(printf '%s' "$bead" | jq -r '.[0].status // ""')
+    # The children a PR could be delivering on this bead's behalf, so
+    # evaluate_refs can tell a parked parent from a misrecord. An unreadable
+    # listing yields "" — the same answer as "no children", which only ever
+    # costs the parked-parent wording and can never authorize a close.
+    bead_children=$(children_of "$id" 2>/dev/null) || bead_children=""
+
+    # Collect refs as "owner/repo<TAB>number" lines.
+    refs=$(printf '%s\n' "$text" |
+        grep -oE 'github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[0-9]+' |
+        sed -E 's#github\.com/([^/]+)/([^/]+)/pull/([0-9]+)#\1/\2\t\3#' || true)
+    mentioned=()
+    for repo in "${sibling_repos[@]}"; do
+        if printf '%s\n' "$text" | grep -qiE "(^|[^A-Za-z0-9_-])$repo([^A-Za-z0-9_-]|$)"; then
+            mentioned+=("$repo")
+        fi
+        # api#605, web #951, and prose forms: api PR #692, cluster pr#692
+        qualified=$(printf '%s\n' "$text" | grep -oiE "$repo ?(pr ?)?#[0-9]+" |
+            grep -oE '#[0-9]+' | tr -d '#' | sed "s#^#$owner/$repo\t#" || true)
+        [ -n "$qualified" ] && refs=$(printf '%s\n%s' "$refs" "$qualified")
+    done
+    # Bare "#123" / "PR #123": attributable only if exactly one sibling repo
+    # is mentioned anywhere in the bead text.
+    if [ "${#mentioned[@]}" = 1 ]; then
+        bare=$(printf '%s\n' "$text" | grep -oE '(^|[^A-Za-z0-9/#])#[0-9]+' |
+            grep -oE '[0-9]+' | sed "s#^#$owner/${mentioned[0]}\t#" || true)
+        [ -n "$bare" ] && refs=$(printf '%s\n%s' "$refs" "$bare")
+    fi
+    # GitHub-side discovery: PRs that cite the bead id even though the bead
+    # never references them back. Hits pass the same delivery-citation check.
+    search_ok=0
+    if [ "$SEARCH" = 1 ]; then
+        if hits=$(search_citing "$id"); then
+            search_ok=1
+            [ -n "$hits" ] && refs=$(printf '%s\n%s' "$refs" "$hits")
+        else
+            # Not fatal on its own — the close path below retries the search
+            # and refuses to close without it — but a sweep that silently
+            # stopped discovering PRs is exactly the invisible failure.
+            degrade "$id: DEGRADED — GitHub citing-PR search failed; PRs the bead never references back were not discovered"
+        fi
+        sleep 2.2   # search API allows ~30 requests/min
+    fi
+    refs=$(printf '%s\n' "$refs" | grep -E '.' | sort -u || true)
+
+    if [ -z "$refs" ]; then
+        say "$id: no PR references found — skipping"
+        continue
+    fi
+
+    evaluate_refs
+
+    # Unresolved state is not "not merged" — say so, and leave the bead open.
+    if [ -n "$error_list" ]; then
+        degrade "$id: DEGRADED — GitHub would not resolve:$error_list — state unknown, leaving open"
+        continue
+    fi
+    if [ -n "$unmerged_list" ]; then
+        say "$id: citing PRs not all merged —$unmerged_list"
+        continue
+    fi
+    if [ -z "$merged_list" ]; then
+        report_no_delivery
+        continue
+    fi
+
+    # About to close — bead-text refs alone never authorize it. Confirm on
+    # GitHub that no unmerged PR delivery-cites this bead (the delivering PR
+    # is often never pasted back into the bead). Skipped only when the
+    # --search-citing pass above already ran this exact search successfully.
+    if [ "$search_ok" = 0 ]; then
+        if ! vhits=$(search_citing "$id"); then
+            degrade "$id: DEGRADED — would close, but the GitHub citing-PR search failed — leaving open (check gh auth/rate limit)"
+            continue
+        fi
+        sleep 2.2   # search API allows ~30 requests/min
+        if [ -n "$vhits" ]; then
+            merged_refs=$(printf '%s\n%s' "$refs" "$vhits" | grep -E '.' | sort -u)
+            if [ "$merged_refs" != "$refs" ]; then
+                refs=$merged_refs
+                evaluate_refs
+            fi
+        fi
+        if [ -n "$error_list" ]; then
+            degrade "$id: DEGRADED — GitHub would not resolve:$error_list — state unknown, leaving open"
+            continue
+        fi
+        if [ -n "$unmerged_list" ]; then
+            say "$id: citing PRs not all merged (GitHub-side) —$unmerged_list"
+            continue
+        fi
+        if [ -z "$merged_list" ]; then
+            report_no_delivery
+            continue
+        fi
+    fi
+
+    # Second surface. The search above answers "nothing else cites this bead"
+    # the same way whether it looked and found nothing or looked through a lagging
+    # index (or a failing GraphQL) and returned early — see the header. So the
+    # open PRs of the candidate repos are listed over REST and put through the
+    # same delivery-citation check before anything closes.
+    if ! open_hits=$(open_prs_citing "$id"); then
+        degrade "$id: DEGRADED — would close, but the open-PR cross-check could not be completed — leaving open (check gh auth/rate limit, and BD_SWEEP_REPOS where there are no sibling checkouts)"
+        continue
+    fi
+    blocking=""
+    while IFS=$'\t' read -r hit_or hit_num; do
+        [ -n "$hit_num" ] || continue
+        # The index is a snapshot taken at the first close candidate of the run.
+        # A PR that has merged since then already got a fresh per-PR lookup
+        # above, and that answer is the newer one.
+        case " $merged_list $abandoned_list " in *" $hit_or#$hit_num "*) continue ;; esac
+        blocking="$blocking $hit_or#$hit_num(OPEN)"
+    done <<EOF
+$open_hits
+EOF
+    if [ -n "$blocking" ]; then
+        say "$id: citing PRs not all merged (open-PR cross-check) —$blocking — the GitHub search did not return these; treating its empty answer as incomplete"
+        continue
+    fi
+
+    # An epic is the unit people plan and report against, so a closed
+    # parent says the initiative shipped. Closing one over open children
+    # stops those children being weighed as outstanding work while they
+    # still surface individually in `bd ready` — acme-2gtn was closed on
+    # its own PR citations with EIGHT children open, six of them P1, and a
+    # full scan found five closed parents holding eighteen open children
+    #. The parent's own PRs merging is evidence about the
+    # parent's PRs, not about its children.
+    open_children=$(children_still_open "$id") || {
+        degrade "$id: DEGRADED — would close, but its children could not be listed — leaving open"
+        continue
+    }
+    if [ -n "$open_children" ]; then
+        say "$id: PRs merged ($merged_list) but children still open —$open_children — a closed parent reads as a shipped initiative; close or reparent them first"
+        continue
+    fi
+
+    close_notes=""
+    [ -n "$abandoned_list" ] && close_notes=" (superseded, closed unmerged:$abandoned_list)"
+    [ -n "$predates_list" ] && close_notes="$close_notes (discounted, merged before this bead started:$predates_list)"
+    if [ "$APPLY" = 1 ]; then
+        bd close "$id" --reason="all referenced PRs merged:$merged_list$close_notes (bd-sweep-merged)" &&
+            echo "$id: CLOSED —$merged_list$close_notes"
+        closed_any=1
+    else
+        echo "$id: would close —$merged_list$close_notes (dry run; pass --apply)"
+        closed_any=1
+    fi
+done
+
+# --- reverse audit over recently merged PRs -----------------------------
+#
+# Everything above starts from a BEAD and asks which PRs it references, so it
+# can only see beads in in_progress/in_review. Two shapes are invisible to it,
+# and both leak work out of the tracker silently:
+#
+#   acme-zdq99 — a bead whose delivering PR merged while the bead was still
+#   `open` is scanned by neither lane, including the nightly --search-citing
+#   pass. Nothing reports that shipped work is sitting on the backlog, so it
+#   gets re-triaged and re-dispatched: acme-aeqb8 lost a full agent dispatch
+#   to a second implementation of an already-merged change. The trap is
+#   self-sealing — re-claiming moves started_at past the merge date, so the
+#   merged_before_start rule then correctly discounts the real PR and no later
+#   sweep can auto-close it either.
+#
+#   acme-os8hu — a PR can delivery-cite a bead id that does not exist. The
+#   work is discharged against a phantom, the real beads stay open forever,
+#   and from the sweep's side it is indistinguishable from a PR citing
+#   nothing. Two confirmed instances in one day.
+#
+# One reverse query answers both: list the org's recently merged PRs, harvest
+# their delivery citations, and report the ones naming a bead still `open` or
+# no bead at all. REPORT ONLY, never auto-close — a merged PR routinely names
+# beads it FILED as follow-ups (the acme-it9d rule), and those are correctly
+# open.
+run_merged_audit() {
+    since=$(date -u -v-"${AUDIT_DAYS}"d +%Y-%m-%d 2>/dev/null ||
+            date -u -d "${AUDIT_DAYS} days ago" +%Y-%m-%d 2>/dev/null) || {
+        echo "AUDIT DEGRADED — could not compute the window start date"
+        return 1
+    }
+
+    statuses=$(bd list --limit 0 --json 2>/dev/null | jq -r '.[] | "\(.id)\t\(.status)"' 2>/dev/null)
+    if [ -z "$statuses" ]; then
+        echo "AUDIT DEGRADED — bd would not list; cannot tell an open bead from a phantom one"
+        return 1
+    fi
+
+    prefix=$(tracker_id_prefix "$statuses")
+    if [ -z "$prefix" ]; then
+        echo "AUDIT DEGRADED — could not derive the tracker id prefix from bd's own ids"
+        return 1
+    fi
+
+    audited=0
+    findings=0
+    for repo in "${sibling_repos[@]}"; do
+        merged_prs=$(gh pr list --repo "$owner/$repo" --state merged --limit 200 \
+            --search "merged:>=$since" --json number,title,body,headRefName 2>/dev/null) || {
+            echo "AUDIT DEGRADED — could not list merged PRs for $owner/$repo"
+            findings=1
+            continue
+        }
+        count=$(printf '%s' "$merged_prs" | jq 'length' 2>/dev/null || echo 0)
+        [ "$count" -gt 0 ] 2>/dev/null || continue
+        index=0
+        while [ "$index" -lt "$count" ]; do
+            pr=$(printf '%s' "$merged_prs" | jq -c ".[$index]")
+            index=$((index + 1))
+            number=$(printf '%s' "$pr" | jq -r .number)
+            audited=$((audited + 1))
+            for cited in $(printf '%s' "$pr" | delivery_cited_ids "$prefix"); do
+                status=$(printf '%s\n' "$statuses" | awk -F'\t' -v want="$cited" \
+                    '$1 == want { print $2; exit }')
+                case "$status" in
+                    "")
+                        echo "AUDIT: $owner/$repo#$number delivery-cites $cited, which does not exist — the work was discharged against a phantom id and the real bead is still open somewhere"
+                        findings=1
+                        ;;
+                    open)
+                        echo "AUDIT: $owner/$repo#$number merged delivering $cited, which is still 'open' — no sweep can see it, so it will be re-triaged and re-dispatched; move it to in_review or close it"
+                        findings=1
+                        ;;
+                esac
+            done
+        done
+    done
+
+    say "Audited $audited merged PR(s) across ${#sibling_repos[@]} repo(s) since $since."
+    return "$findings"
+}
+
+audit_findings=0
+if [ "$AUDIT" = 1 ]; then
+    run_merged_audit || audit_findings=1
+fi
+
+if [ "$degraded" = 1 ]; then
+    echo "Sweep DEGRADED — some GitHub lookups did not resolve; the beads above were left open on an unknown state, not on a known one. Re-run when GitHub is healthy."
+    exit 3
+fi
+
+if [ "$audit_findings" = 1 ]; then
+    echo "Reverse audit found merged PRs whose beads are open or nonexistent — see AUDIT lines above. Nothing was closed automatically."
+    exit 4
+fi
+
+if [ "$misrecorded" = 1 ]; then
+    echo "Sweep found in_review beads whose recorded PRs deliver some other bead — see MISRECORDED lines above. They cannot close until the real PR is recorded on the bead."
+    exit 5
+fi
+
+[ "$closed_any" = 1 ] || say "Sweep complete — nothing to close."
+exit 0

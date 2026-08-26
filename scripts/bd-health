@@ -1,0 +1,524 @@
+#!/usr/bin/env bash
+# bd-health — report tracker health problems that otherwise fail silently.
+#
+# Every other part of this setup is fail-soft so it can never block a
+# session. That is correct, but it means a broken tracker looks exactly
+# like a healthy one. On 2026-08-10 the nightly sweep stopped running
+# (GitHub Actions billing: "the job was not started"), and because the job
+# never STARTED, no in-workflow notification could fire. Eight nights
+# failed unnoticed while in_review grew past 360 beads.
+#
+# The lesson: anything that watches a scheduled job has to live OUTSIDE
+# that job. This script runs from the laptop session hooks and checks the
+# things that go quietly wrong:
+#
+#   1. nightly sweep    — last successful run older than 48h (billing,
+#                         disabled schedule, expired token, red main), or a
+#                         run that reports success while closing nothing
+#                         (missing BEADS_SWEEP_TOKEN — green, but blind)
+#   2. bd version drift — local bd vs the CI-pinned BD_VERSION; the shared
+#                         Dolt schema is tied to the version, so a stray
+#                         `brew upgrade` is a data hazard
+#   3. sync failures    — recent WARNING lines in the sync log
+#   4. hook drift       — the installed ~/.claude/hooks/beads-sync.sh is not
+#                         the copy this repo ships; nothing versions the
+#                         installed file, so an old one is invisible
+#                         (2026-08-19)
+#   5. sync liveness    — no successful sync on this machine for days; the
+#                         hook is fail-soft, so "never ran" and "ran fine"
+#                         used to look identical from the outside
+#   6. export fork      — .beads/issues.jsonl and the Dolt store hold
+#                         different issues, i.e. the tracker has split into
+#                         two lineages (2026-08-17) — reported
+#                         as work only when the sync hook is not already
+#                         healing it (2026-08-20)
+#   7. review backlog   — in_review beads older than the staleness window
+#   8. workspace wiring — BEADS_DIR resolves to a real database
+#   9. setup drift      — the OTHER files this repo copies out (the workspace
+#                         CLAUDE.md every agent reads, .claude/settings.json)
+#                         are not current, or no periodic checker is installed
+#                         to notice when they stop being. Check 4
+#                         covers only the sync hook; a machine could run last
+#                         month's agent rules with every other check green.
+#
+# Report-only. Never closes, never mutates, always exits 0 — like
+# bd-dup-check, this runs from SessionStart and must never block a session.
+#
+# Usage: bd-health [--quiet] [--json]
+#   default  print the full report
+#   --quiet  print only when something is wrong (for session hooks)
+#   --json   machine-readable findings
+#
+# Checks needing network (`gh`) degrade to a skip, never to a failure:
+# being offline is not a tracker problem.
+
+set -uo pipefail
+
+QUIET=0
+JSON=0
+for arg in "$@"; do
+    case "$arg" in
+        --quiet) QUIET=1 ;;
+        --json)  JSON=1 ;;
+        *) echo "usage: bd-health [--quiet] [--json]" >&2; exit 0 ;;
+    esac
+done
+
+# Hours before a missing nightly sweep counts as broken. The sweep runs
+# daily, so 48h means one full miss plus slack for a late scheduler.
+STALE_SWEEP_HOURS=${BD_HEALTH_SWEEP_HOURS:-48}
+# Days an in_review bead may sit before it is presumed abandoned.
+STALE_REVIEW_DAYS=${BD_HEALTH_REVIEW_DAYS:-21}
+# in_review backlog size that means the drain is not keeping up.
+REVIEW_BACKLOG_MAX=${BD_HEALTH_REVIEW_MAX:-150}
+# Days without a successful sync before this machine is presumed cut off.
+STALE_SYNC_DAYS=${BD_HEALTH_SYNC_DAYS:-7}
+# Sample ids to quote per side of an export fork.
+FORK_SAMPLES=${BD_HEALTH_FORK_SAMPLES:-4}
+# How long a Dolt-only fork may be the auto-export simply lagging the newest
+# write. bd re-exports on every mutating command, so an untouched jsonl older
+# than this while the database has ids it lacks is a frozen export, not lag.
+FORK_EXPORT_GRACE=${BD_HEALTH_FORK_GRACE:-3600}
+
+findings=()   # human lines
+jfind=()      # json objects
+add() { findings+=("$1"); jfind+=("{\"severity\":\"$2\",\"check\":\"$3\",\"message\":$(printf '%s' "$1" | jq -Rs .)}"); }
+
+# Epoch for a sync-log timestamp ("2026-08-20 12:06:02"), 0 if unparseable.
+log_ts_epoch() {
+    date -j -f "%Y-%m-%d %H:%M:%S" "$1" +%s 2>/dev/null ||
+        date -d "$1" +%s 2>/dev/null || echo 0
+}
+
+# Epoch of a file's last modification, 0 if it cannot be read. BSD stat first
+# (this runs on laptops), GNU second; a reply that is not a plain number is one
+# of them having answered something else entirely, and counts as unreadable.
+mtime_epoch() {
+    local m
+    m=$(stat -f %m "$1" 2>/dev/null) || m=$(stat -c %Y "$1" 2>/dev/null) || m=0
+    case "$m" in ''|*[!0-9]*) m=0 ;; esac
+    printf '%s\n' "$m"
+}
+
+# fork_verdict <n_jsonl> <n_dolt> <hook_current> <synclog> <jsonl> <now> [repo]
+#
+# The optional 7th argument scopes the sync-log reads to one tracker's lines
+# (the log is per MACHINE: on a laptop running two workspaces, both trackers'
+# runs interleave in the same file, and the newest reconcile line can belong
+# to the other tracker). Empty or absent means unscoped.
+#
+# A fork is no longer automatically a task for a human. Since #9 the sync hook
+# runs scripts/bd-reconcile-fork after every `bd dolt pull`, so the ordinary
+# fork — another machine's export arriving through git convergence — is healed
+# by the session's own sync a moment after this check runs at SessionStart.
+# Reporting that as "run bd dolt pull and re-export" is worse than useless: it
+# reads as manual work, and it got filed as a bead and dispatched to an agent
+# on 2026-08-20 for a fork the hook had already merged at 12:06.
+#
+# What still deserves a human is a fork the hook is NOT clearing, so that is
+# what this separates:
+#
+#   self-healing    the reconciler is wired and this fork arrived after its
+#                   last run — the next sync merges it
+#   no-hook         the installed hook is not the copy templates/ ships, so
+#                   nothing reconciles (check 4 says so too, and says how)
+#   failed:<ts>     the reconciler ran and exited nonzero: the export is stuck
+#   survived:<ts>   the reconciler completed cleanly AFTER this jsonl was last
+#                   written and the two sides still disagree — a union merge
+#                   is not covering this fork
+#   export-lag      Dolt-only side only, jsonl written within the grace window:
+#                   the auto-export trailing the newest writes, which clears
+#                   itself on the next one
+#   export-frozen   Dolt-only side only, jsonl stale: the export is not running
+#
+# Only the JSONL-only side is the reconciler's to heal (it imports ids the
+# database lacks, nothing else), and clearing it unblocks the export that
+# produced the Dolt-only side — so whenever there is a JSONL-only side, the
+# reconciler is the relevant healer and the last two verdicts do not apply.
+fork_verdict() {
+    local n_jsonl=$1 n_dolt=$2 hook_current=$3 synclog=$4 jsonl=$5 now=$6 repo=${7:-}
+    local last rc ts rec_epoch jsonl_epoch
+
+    jsonl_epoch=$(mtime_epoch "$jsonl")
+
+    if [ "$n_jsonl" -eq 0 ]; then
+        if [ "$jsonl_epoch" -gt 0 ] && [ $((now - jsonl_epoch)) -lt "$FORK_EXPORT_GRACE" ]; then
+            echo "export-lag"
+        else
+            echo "export-frozen"
+        fi
+        return
+    fi
+
+    [ "$hook_current" = 1 ] || { echo "no-hook"; return; }
+
+    last=""
+    if [ -f "$synclog" ]; then
+        if [ -n "$repo" ]; then
+            last=$(grep 'reconcile-fork (rc=' "$synclog" 2>/dev/null |
+                grep -F " in $repo:" | tail -1)
+        else
+            last=$(grep 'reconcile-fork (rc=' "$synclog" 2>/dev/null | tail -1)
+        fi
+    fi
+    # Wired but never run here yet: nothing says it will not work.
+    [ -n "$last" ] || { echo "self-healing"; return; }
+
+    rc=$(printf '%s' "$last" | sed -n 's/.*(rc=\([^)]*\)).*/\1/p')
+    ts=$(printf '%s' "$last" | cut -c2-20)
+    [ "$rc" = 0 ] || { echo "failed:$ts"; return; }
+
+    rec_epoch=$(log_ts_epoch "$ts")
+    if [ "$rec_epoch" -gt 0 ] && [ "$jsonl_epoch" -gt 0 ] && [ "$rec_epoch" -gt "$jsonl_epoch" ]; then
+        echo "survived:$ts"
+    else
+        echo "self-healing"
+    fi
+}
+
+# Sourced with BD_HEALTH_LIB=1, the script stops here: the helpers above are
+# defined and nothing below runs, so scripts/test-bd-health can pin the fork
+# verdict offline without touching bd, gh or the live tracker.
+if [ "${BD_HEALTH_LIB:-0}" = 1 ]; then
+    return 0 2>/dev/null || exit 0
+fi
+
+now=$(date +%s)
+
+# --- 1. workspace wiring ---------------------------------------------------
+beads_db=$(bd where 2>/dev/null | head -1 | tr -d '[:space:]')
+if [ -z "$beads_db" ] || [ ! -e "$beads_db" ]; then
+    add "BEADS_DIR does not resolve to a database — bd will report 'no beads database found' from inside sub-repos. Set BEADS_DIR=<workspace>/beads/.beads (see SETUP.md step 4)." error wiring
+    beads_repo=""
+else
+    beads_repo=$(dirname "$beads_db")
+fi
+
+# --- 2. bd version drift ---------------------------------------------------
+local_bd=$(bd version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+pinned_bd=""
+if [ -n "$beads_repo" ] && [ -f "$beads_repo/.github/workflows/nightly-review-sweep.yml" ]; then
+    pinned_bd=$(grep -oE 'BD_VERSION: *"?[0-9]+\.[0-9]+\.[0-9]+' \
+        "$beads_repo/.github/workflows/nightly-review-sweep.yml" |
+        grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+fi
+if [ -n "$local_bd" ] && [ -n "$pinned_bd" ] && [ "$local_bd" != "$pinned_bd" ]; then
+    add "bd version drift: this machine runs $local_bd, CI pins $pinned_bd. The shared Dolt schema is tied to the version — bump laptops and BD_VERSION together, or downgrade back to $pinned_bd. See SETUP.md step 1." error version
+fi
+# An unpinned Homebrew install is one `brew upgrade` away from that drift.
+if command -v brew >/dev/null 2>&1 && brew list --versions beads >/dev/null 2>&1; then
+    if ! brew list --pinned 2>/dev/null | grep -qx beads; then
+        add "Homebrew's beads formula is not pinned — a routine 'brew upgrade' would move bd off $pinned_bd and risk schema drift in the shared database. Run: brew pin beads" warn version
+    fi
+fi
+
+# --- 3. nightly sweep liveness --------------------------------------------
+# Deliberately queried from here rather than from inside the workflow: a job
+# that never starts cannot report its own death.
+if command -v gh >/dev/null 2>&1 && [ -n "$beads_repo" ]; then
+    origin=$(git -C "$beads_repo" remote get-url origin 2>/dev/null || true)
+    slug=$(printf '%s' "$origin" | sed -E 's#\.git$##; s#^.*[:/]([^/]+/[^/]+)$#\1#')
+    if [ -n "$slug" ]; then
+        runs=$(gh run list --repo "$slug" --workflow nightly-review-sweep.yml \
+                 --limit 20 --json conclusion,createdAt,databaseId 2>/dev/null || true)
+        if [ -n "$runs" ]; then
+            last_ok=$(printf '%s' "$runs" |
+                jq -r '[.[] | select(.conclusion == "success")] | sort_by(.createdAt) | last | .createdAt // empty' 2>/dev/null)
+            if [ -z "$last_ok" ]; then
+                add "Nightly sweep: no successful run in the last 20 attempts (repo $slug). Beads whose PRs merged are not being closed automatically." error sweep
+            else
+                ok_epoch=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$last_ok" +%s 2>/dev/null ||
+                           date -d "$last_ok" +%s 2>/dev/null || echo 0)
+                if [ "$ok_epoch" -gt 0 ]; then
+                    age_h=$(( (now - ok_epoch) / 3600 ))
+                    if [ "$age_h" -gt "$STALE_SWEEP_HOURS" ]; then
+                        recent=$(printf '%s' "$runs" | jq -r 'sort_by(.createdAt) | last | .conclusion // "unknown"')
+                        add "Nightly sweep last succeeded ${age_h}h ago (threshold ${STALE_SWEEP_HOURS}h); most recent run: $recent. Check https://github.com/$slug/actions — a job that fails to START (Actions billing, disabled schedule) cannot alert on itself." error sweep
+                    else
+                        # A fresh success is not proof the sweep did anything. Without
+                        # BEADS_SWEEP_TOKEN the job token cannot see PRs in other org
+                        # repos, so the run closes nothing and still exits 0 — SETUP.md
+                        # calls that a deliberate "loud no-op". It is only loud in the
+                        # job log, which nothing reads; the age check above stays green
+                        # forever while the tracker quietly stops draining. So ask the
+                        # run itself what it warned about. The same blind spot as the
+                        # comment at the top of this section, one level in: a job that
+                        # runs blind cannot report that it closed nothing.
+                        last_ok_id=$(printf '%s' "$runs" |
+                            jq -r '[.[] | select(.conclusion == "success")] | sort_by(.createdAt) | last | .databaseId // empty' 2>/dev/null)
+                        if [ -n "$last_ok_id" ]; then
+                            sweep_job=$(gh api "repos/$slug/actions/runs/$last_ok_id/jobs" \
+                                          -q '.jobs[0].id' 2>/dev/null || true)
+                            if [ -n "$sweep_job" ]; then
+                                blind=$(gh api "repos/$slug/check-runs/$sweep_job/annotations" \
+                                          -q '.[] | .message' 2>/dev/null |
+                                        grep -c 'will close nothing' || true)
+                                if [ "${blind:-0}" -gt 0 ]; then
+                                    add "Nightly sweep runs green but closes nothing: BEADS_SWEEP_TOKEN is missing or expired, so the job token cannot see PRs in other org repos (run $last_ok_id). Add the repo secret to https://github.com/$slug/settings/secrets/actions — a fine-grained PAT, org-wide, Pull requests: read + Metadata: read. Until then sweep by hand: scripts/bd-sweep-merged --search-citing --apply" error sweep
+                                fi
+                            fi
+                        fi
+                    fi
+                fi
+            fi
+        fi
+    fi
+fi
+
+# --- 4. installed sync hook: drift from the versioned template -------------
+# `~/.claude/hooks/beads-sync.sh` has to live outside every git repo to work,
+# so nothing versions the installed copy: no diff, no status, no CI ever shows
+# that a machine is running an old one. That makes hook drift the quietest
+# failure here — the machine keeps syncing, so every other check stays green
+# while the fix you shipped never runs.
+#
+# It is not hypothetical. The automatic fork repair shipped in
+# templates/beads-sync.sh on 2026-08-19 (#9), but this laptop's hook had been
+# installed on 2026-08-17 and was never re-copied, so it never called
+# scripts/bd-reconcile-fork. The tracker re-forked on every sync and was healed
+# by hand three times in three days while nothing could see why: 56
+# JSONL-only and 254 Dolt-only issues, auto-export refused throughout.
+# Comparing the installed file with the template is the whole check.
+hook_current=0
+hook_installed="${BD_HEALTH_SYNC_HOOK:-$HOME/.claude/hooks/beads-sync.sh}"
+hook_template="$beads_repo/templates/beads-sync.sh"
+if [ -n "$beads_repo" ] && [ -f "$hook_template" ]; then
+    reinstall="cp '$hook_template' '$hook_installed' && chmod +x '$hook_installed'"
+    if [ ! -f "$hook_installed" ]; then
+        add "No beads sync hook installed at $hook_installed — this machine's bead changes never reach the team, and its Dolt lineage drifts from everyone else's. Install it: $reinstall (then wire SessionStart/SessionEnd per SETUP.md step 8)." error hook
+    elif [ ! -x "$hook_installed" ]; then
+        add "The beads sync hook at $hook_installed is not executable, so the session hooks silently do nothing. Fix: chmod +x '$hook_installed'." error hook
+    elif ! cmp -s "$hook_installed" "$hook_template"; then
+        add "Installed sync hook differs from the copy this repo ships: $hook_installed vs $hook_template. Nothing versions the installed file, so an outdated hook is invisible — a pre-2026-08-19 copy does not run scripts/bd-reconcile-fork and re-forks the tracker on every sync. Reinstall: $reinstall — while no sync is in flight, because sh reads a running script by byte offset and overwriting it mid-run executes a mix of both. If the difference is an uncommitted local edit to the template, commit it here instead so teammates get it too." error hook
+    else
+        hook_current=1
+    fi
+fi
+
+# --- 5. sync log: recent failures, and last success ------------------------
+synclog="${BD_HEALTH_SYNC_LOG:-$HOME/.claude/logs/beads-sync.log}"
+if [ -f "$synclog" ]; then
+    # Read recency from each line's own timestamp, not from the file's mtime
+    # or the last N lines: the log now also carries an OK heartbeat per
+    # successful run, so a fresh mtime no longer means "a failure happened
+    # recently" and the tail is no longer mostly failures.
+    cutoff_day=$(date -v-2d +%F 2>/dev/null || date -d '2 days ago' +%F 2>/dev/null || echo "")
+    if [ -n "$cutoff_day" ]; then
+        # The log is per machine, not per tracker: scope the count to THIS
+        # tracker's lines, or a second workspace's failures read as ours
+        # (2026-08-24: the other workspace's first bd-health run reported the first workspace's pushes).
+        if [ -n "$beads_repo" ]; then
+            recent_warn=$(awk -v cutoff="$cutoff_day" -v repo=" in $beads_repo:" \
+                '/FAILED \(rc=/ && index($0, repo) && substr($0, 2, 10) >= cutoff { n++ } END { print n+0 }' \
+                "$synclog" 2>/dev/null)
+        else
+            recent_warn=$(awk -v cutoff="$cutoff_day" \
+                '/FAILED \(rc=/ && substr($0, 2, 10) >= cutoff { n++ } END { print n+0 }' \
+                "$synclog" 2>/dev/null)
+        fi
+        if [ "${recent_warn:-0}" -gt 0 ]; then
+            add "Dolt sync reported failures in the last 2 days ($recent_warn in $synclog). A swallowed pull conflict forked this tracker for 5 days in July 2026 — read the log before trusting the tracker state." error sync
+        fi
+    fi
+
+fi
+
+# Sync liveness. The hook only ever spoke up on failure, so a hook that had
+# stopped running entirely produced exactly the same silence as a healthy one.
+# It now logs an OK line per successful run — and check 4 above resolves what
+# used to make a missing heartbeat unreadable: "no OK line" could mean an old
+# hook copy or a machine that had never synced, so it had to stay silent. When
+# the installed hook matches the template, it is neither, and the silence means
+# the hook is not running or has never completed cleanly. Missing log file
+# included: that is the strongest form of no heartbeat — on the laptop that
+# hit the hook-drift incident above, the log did not exist at all, and
+# nothing said so.
+last_ok_ts=""
+if [ -f "$synclog" ]; then
+    # Same per-machine log caveat as check 5: another workspace's heartbeat
+    # must not vouch for this tracker's hook.
+    if [ -n "$beads_repo" ]; then
+        last_ok_ts=$(grep 'sync OK' "$synclog" 2>/dev/null |
+            grep -F " in $beads_repo" | tail -1 | cut -c2-20)
+    else
+        last_ok_ts=$(grep 'sync OK' "$synclog" 2>/dev/null | tail -1 | cut -c2-20)
+    fi
+fi
+if [ -n "$last_ok_ts" ]; then
+    ok_epoch=$(log_ts_epoch "$last_ok_ts")
+    if [ "$ok_epoch" -gt 0 ]; then
+        sync_age_d=$(( (now - ok_epoch) / 86400 ))
+        if [ "$sync_age_d" -gt "$STALE_SYNC_DAYS" ]; then
+            add "Dolt sync last succeeded on this machine ${sync_age_d}d ago (threshold ${STALE_SYNC_DAYS}d). The beads-sync hook is not running — check the SessionStart/SessionEnd wiring in ~/.claude/settings.json (SETUP.md step 8). Bead changes made here are not reaching the team." error sync
+        fi
+    fi
+elif [ "$hook_current" = 1 ]; then
+    add "The installed beads-sync hook is current — it logs a heartbeat on every clean run — but $synclog holds no successful-sync line, so the hook is either not running or has never completed cleanly. Check the SessionStart/SessionEnd wiring in ~/.claude/settings.json (SETUP.md step 8) and read the log. Bead changes made here are not reaching the team." error sync
+fi
+
+# --- 6. export fork: issues.jsonl vs the Dolt store ------------------------
+# The jsonl is a passive export, so its ids and the database's must match.
+# When they do not, the tracker has forked: JSONL-only ids mean another
+# machine's lineage is ahead of ours and bd is refusing to export over it
+# (its per-write "auto-export skipped" warning is the only existing signal,
+# and everyone scrolls past it); Dolt-only ids mean our export is frozen, so
+# the committed jsonl — the GitHub view of issues — is stale. On 2026-08-17
+# both were true for days and nothing here noticed.
+if [ -n "$beads_db" ] && [ -f "$beads_db/issues.jsonl" ] && command -v jq >/dev/null 2>&1; then
+    jsonl_ids=$(jq -r 'select(._type == "issue") | .id' "$beads_db/issues.jsonl" 2>/dev/null | sort -u)
+    dolt_ids=$(bd list --all --limit 0 --json 2>/dev/null | jq -r '.[].id' 2>/dev/null | sort -u)
+    # Either side coming back empty means the read failed, not that the side
+    # is empty — reporting "everything is missing" on a broken jq or an
+    # unreadable database would be a lie the size of the tracker.
+    if [ -n "$jsonl_ids" ] && [ -n "$dolt_ids" ]; then
+        jsonl_only=$(comm -23 <(printf '%s\n' "$jsonl_ids") <(printf '%s\n' "$dolt_ids"))
+        dolt_only=$(comm -13 <(printf '%s\n' "$jsonl_ids") <(printf '%s\n' "$dolt_ids"))
+        n_jsonl=$(printf '%s' "$jsonl_only" | grep -c . || true)
+        n_dolt=$(printf '%s' "$dolt_only" | grep -c . || true)
+        if [ "${n_jsonl:-0}" -gt 0 ] || [ "${n_dolt:-0}" -gt 0 ]; then
+            detail=""
+            if [ "${n_jsonl:-0}" -gt 0 ]; then
+                s=$(printf '%s\n' "$jsonl_only" | head -"$FORK_SAMPLES" | tr '\n' ' ')
+                detail="$n_jsonl issue(s) only in issues.jsonl (e.g. ${s% }) — another machine's lineage is ahead of this one and bd is skipping the auto-export"
+            fi
+            if [ "${n_dolt:-0}" -gt 0 ]; then
+                s=$(printf '%s\n' "$dolt_only" | head -"$FORK_SAMPLES" | tr '\n' ' ')
+                [ -n "$detail" ] && detail="$detail; "
+                detail="$detail$n_dolt issue(s) only in the Dolt store (e.g. ${s% }) — the export is frozen, so the committed jsonl and the GitHub issue view are stale"
+            fi
+            repair="Run 'bd dolt pull' in $beads_repo, then 'scripts/bd-reconcile-fork --apply'; do not hand-edit the jsonl (SETUP.md, 'Tracker fork')."
+            verdict=$(fork_verdict "${n_jsonl:-0}" "${n_dolt:-0}" "$hook_current" "$synclog" "$beads_db/issues.jsonl" "$now" "$beads_repo")
+            case "$verdict" in
+                self-healing)
+                    add "Tracker fork, self-healing — no action, and not worth a bead: $detail. The installed sync hook runs scripts/bd-reconcile-fork after every 'bd dolt pull', so this session's own sync merges the two lineages and unblocks the export; a fork lives at most one session (#9). Escalate only if it is still reported after a sync has run (grep reconcile-fork $synclog), or if forks keep arriving at all — that is the cross-machine Dolt lineage cause, which no repair of this fork touches." warn fork
+                    ;;
+                failed:*)
+                    ts=${verdict#failed:}
+                    add "Tracker fork the sync hook could NOT heal — $detail. scripts/bd-reconcile-fork last ran at $ts and exited nonzero, so the export stays frozen and the GitHub issue view stops tracking reality until someone looks. Read $synclog first: an import that half-finished is the one case where the tracker needs a human before the next sync. $repair" error fork
+                    ;;
+                survived:*)
+                    ts=${verdict#survived:}
+                    add "Tracker fork that survived a clean reconcile — $detail. scripts/bd-reconcile-fork finished successfully at $ts, after this jsonl was last written, and the two sides still disagree: the union merge is not covering this fork, so it will not heal on the next sync either. Read $synclog. $repair" error fork
+                    ;;
+                export-lag)
+                    add "Tracker fork, self-healing — no action, and not worth a bead: $detail. There is no JSONL-only side, so nothing blocks the auto-export; bd re-exports on the next mutating command and the sync hook commits it. Escalate only if it is still reported an hour from now, which would mean the export is frozen rather than trailing." warn fork
+                    ;;
+                export-frozen)
+                    add "Tracker fork: the export is frozen, not merely trailing — $detail. Nothing is blocking it from the jsonl side, yet .beads/issues.jsonl has not been rewritten in over $((FORK_EXPORT_GRACE / 60))m while the database has issues it lacks, so the committed jsonl and the GitHub issue view are stale. Check that bd can write it (permissions, disk) and read $synclog." error fork
+                    ;;
+                *)
+                    add "Tracker fork: .beads/issues.jsonl and the local Dolt store hold different issues — $detail. Nothing will repair this automatically: the installed sync hook is not the copy templates/ ships, so it does not run scripts/bd-reconcile-fork (see the hook finding above, which has the reinstall command). $repair" error fork
+                    ;;
+            esac
+        fi
+    fi
+fi
+
+# --- 7. review backlog -----------------------------------------------------
+if [ -n "$beads_repo" ]; then
+    review=$(bd list --status=in_review --limit 0 --json 2>/dev/null || true)
+    if [ -n "$review" ]; then
+        n=$(printf '%s' "$review" | jq -r 'length' 2>/dev/null || echo 0)
+        cutoff=$(( now - STALE_REVIEW_DAYS * 86400 ))
+        stale_n=$(printf '%s' "$review" | jq -r --argjson c "$cutoff" \
+            '[.[] | select((.updated_at | sub("\\.[0-9]+"; "") | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime) < $c)] | length' 2>/dev/null || echo 0)
+        if [ "${n:-0}" -gt "$REVIEW_BACKLOG_MAX" ]; then
+            add "in_review backlog is $n beads (soft cap $REVIEW_BACKLOG_MAX), $stale_n of them untouched for over $STALE_REVIEW_DAYS days. in_review means 'PR open'; beads only leave it when a merged PR delivery-cites the bead id. Run scripts/bd-sweep-merged --search-citing for a dry-run report." warn backlog
+        elif [ "${stale_n:-0}" -gt 0 ]; then
+            add "$stale_n in_review beads have been untouched for over $STALE_REVIEW_DAYS days — their PRs likely merged without delivery-citing the bead id. Run scripts/bd-sweep-merged --search-citing." warn backlog
+        fi
+    fi
+fi
+
+# --- 8. setup distribution: the rest of what we copy out -------------------
+# Check 4 above covers the sync hook, which is one of THREE files this repo
+# distributes by copying them outside every git repo. The other two — the
+# workspace-root CLAUDE.md that tells every agent how we work, and the
+# .claude/settings.json that wires the hooks up — had no check at all, so a
+# machine could run last month's agent rules indefinitely with every other
+# check green.
+#
+# This section is deliberately thin: it reuses bd-setup-sync's own manifest
+# and verdicts rather than restating them, because two implementations of
+# "what is current" is how the answer starts depending on which tool you
+# asked. It never writes — bd-health is report-only — so it reads the install
+# record but does not update it.
+#
+# The cron matters as much as the drift: a session-start check cannot see the
+# machine that has not started a session, and that is exactly the machine most
+# likely to be behind. A machine with no periodic checker is one whose state
+# nobody learns until someone sits down at it.
+# Resolved next to THIS script, not under `bd where`'s repo. In production they
+# are the same directory; from a worktree they are not, and taking the sibling
+# means a change to these scripts is checked by the copy under test rather than
+# by whatever is installed in the main checkout — which is how you find out
+# your change works before shipping it.
+setup_dir=$(cd "$(dirname "$0")" && pwd)
+setup_sync="$setup_dir/bd-setup-sync"
+setup_repo=$(dirname "$setup_dir")
+if [ -n "$beads_repo" ] && [ -r "$setup_sync" ]; then
+    # shellcheck disable=SC1090
+    BD_SETUP_SYNC_LIB=1 . "$setup_sync" 2>/dev/null || true
+    if command -v verify_artifact >/dev/null 2>&1 || type verify_artifact >/dev/null 2>&1; then
+        sd_main=$(git -C "$setup_repo" worktree list 2>/dev/null | head -1 | awk '{print $1}')
+        if [ -n "$sd_main" ] && [ -d "$sd_main" ]; then sd_ws=$(dirname "$sd_main"); else sd_ws=$(dirname "$setup_repo"); fi
+        [ -n "${BEADS_DIR:-}" ] && [ -d "${BEADS_DIR:-}" ] && sd_ws=$(dirname "$(dirname "$BEADS_DIR")")
+        sd_wsname=$(basename "$sd_ws")
+        sd_record=$(record_path "$sd_wsname")
+        sd_state=$(state_path "$sd_wsname")
+        sd_version=$(setup_version "$setup_repo" "$sd_ws")
+        sd_behind=""
+        while IFS=$'\t' read -r sd_name sd_tmpl sd_target sd_mode _; do
+            # The hook has its own, better-worded finding in check 4; naming it
+            # twice in one report just teaches people to skim.
+            [ "$sd_name" = hook ] && continue
+            sd_sha=""; [ -f "$sd_tmpl" ] && sd_sha=$(_sha256 "$sd_tmpl")
+            sd_rec=$(recorded_sha_for "$sd_record" "$sd_name")
+            sd_v=$(verify_artifact "$sd_tmpl" "$sd_target" "$sd_mode" "$sd_ws" "$sd_rec" "$sd_sha")
+            [ "$sd_v" = current ] || sd_behind="$sd_behind $sd_name=$sd_v"
+        done <<SETUP_EOF
+$(setup_manifest "$setup_repo" "$sd_ws")
+SETUP_EOF
+        if [ -n "$sd_behind" ]; then
+            add "Beads setup artifacts are not current on this machine (setup version $sd_version):$sd_behind. These are copied out of templates/ and nothing versions the installed copy, so an old workspace CLAUDE.md means your agents follow last month's rules while every other check stays green. Inspect and repair: $setup_sync '$setup_repo' — it reports which side is newer and refuses to overwrite an installed copy that may carry an un-upstreamed fix." warn setup
+        fi
+        if ! cron_installed "$sd_wsname" 2>/dev/null; then
+            add "No periodic beads-setup check on this machine. Session-start checks cannot see a machine that has not started a session, which is the one most likely to be running old rules — and nothing publishes this machine's state to the team without it. Install: $setup_sync '$setup_repo' --install-cron" warn setup
+        else
+            sd_checked=$(read_json_field "$sd_state" last_checked)
+            sd_epoch=0
+            case "$sd_checked" in
+                ????-??-??T??:??:??Z)
+                    sd_epoch=$(date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "$sd_checked" '+%s' 2>/dev/null ||
+                               date -u -d "$sd_checked" '+%s' 2>/dev/null || echo 0) ;;
+            esac
+            if [ "${sd_epoch:-0}" -gt 0 ] && [ $(( (now - sd_epoch) / 3600 )) -gt 48 ]; then
+                add "The beads-setup checker is installed but has not run in over 48h (last $sd_checked). It is scheduled, so silence means it is failing or never firing — check $HOME/.claude/logs/beads-setup-sync.log. While it is silent this machine neither learns it is behind nor tells the team what it is running." warn setup
+            fi
+        fi
+    fi
+fi
+
+# --- report ----------------------------------------------------------------
+if [ "$JSON" = 1 ]; then
+    printf '{"count":%d,"findings":[%s]}\n' "${#findings[@]}" "$(IFS=,; echo "${jfind[*]:-}")"
+    exit 0
+fi
+
+if [ "${#findings[@]}" -eq 0 ]; then
+    [ "$QUIET" = 1 ] || echo "bd-health: tracker healthy (sync, hook, sweep, version, backlog, setup all nominal)."
+    exit 0
+fi
+
+msg="bd-health: ${#findings[@]} tracker problem(s) found:"
+for f in "${findings[@]}"; do
+    msg="$msg
+  - $f"
+done
+
+printf '%s\n' "$msg"
+mkdir -p "$HOME/.claude/logs" 2>/dev/null
+{ date '+--- %Y-%m-%dT%H:%M:%S'; printf '%s\n' "$msg"; } \
+    >> "$HOME/.claude/logs/beads-health.log" 2>/dev/null
+
+exit 0

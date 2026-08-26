@@ -1,0 +1,197 @@
+#!/usr/bin/env bash
+# Tests for bd-dup-check's allowlist filtering.
+#
+# The thing worth pinning is not that suppression works -- it is that it stays
+# NARROW and VISIBLE. A duplicate check that quietly swallows a real twin is
+# worse than no check at all, because the team believes it is covered: that is
+# exactly how acme-0z8/acme-b8c ended with two agents racing on one change.
+#
+# So these tests assert, in order of what would hurt most if it broke:
+#   1. an unlisted pair is still reported
+#   2. a listed pair is suppressed but still COUNTED and NAMED
+#   3. suppression is per-pair, never per-family: listing two lanes of a family
+#      does not hide a third
+#   4. a line with no reason suppresses nothing and is reported as unusable
+#   5. --quiet stays silent only when there is genuinely nothing to act on
+#
+# Run: scripts/test-bd-dup-check
+
+set -uo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+CHECK="$SCRIPT_DIR/bd-dup-check"
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+
+# Keep the real log out of the way: these runs are not findings.
+export HOME="$TMP/home"
+mkdir -p "$HOME"
+
+FAILED=0
+pass() { printf '  ok   %s\n' "$1"; }
+fail() { printf '  FAIL %s\n     %s\n' "$1" "$2"; FAILED=$((FAILED + 1)); }
+
+pair_json() {
+    # pair_json a b sim  [a b sim ...]
+    local out="" first=1
+    while [ "$#" -ge 3 ]; do
+        [ "$first" = 1 ] || out="$out,"
+        first=0
+        out="$out{\"issue_a_id\":\"$1\",\"issue_b_id\":\"$2\",\"similarity\":$3,\"issue_a_title\":\"title of $1\",\"issue_b_title\":\"title of $2\"}"
+        shift 3
+    done
+    printf '{"count":%s,"pairs":[%s]}' "$(( $(printf '%s' "$out" | tr -cd ',' | wc -c) + 1 ))" "$out"
+}
+
+run() {
+    # run <allowlist-file> <json-file> [--quiet]
+    # The stale-marker override keeps a real tracker partition on the
+    # machine running the tests from injecting its warning into the output
+    # under comparison (/dev/null is never a regular file, so -f fails).
+    # Test 8 pre-sets the variable to point at a fixture instead.
+    BD_DUP_CHECK_STALE_MARKER="${BD_DUP_CHECK_STALE_MARKER:-/dev/null}" \
+        BD_DUP_CHECK_ALLOWLIST="$1" BD_DUP_CHECK_JSON="$2" "$CHECK" ${3:-} 2>&1
+}
+
+echo "bd-dup-check allowlist tests"
+
+# --- 1. an unlisted pair is still reported -------------------------------
+pair_json acme-0z8 acme-b8c 0.79 > "$TMP/scan.json"
+: > "$TMP/empty.txt"
+out=$(run "$TMP/empty.txt" "$TMP/scan.json")
+case "$out" in
+    *"acme-0z8 ~ acme-b8c"*) pass "an unlisted pair is reported" ;;
+    *) fail "an unlisted pair is reported" "$out" ;;
+esac
+
+# The twin that motivated this check scored 79%, BELOW the 82% false positives.
+# If anybody ever tries to fix the noise with a threshold again, this is the
+# case that must keep working.
+case "$out" in
+    *"79% similar"*) pass "the reported similarity survives filtering" ;;
+    *) fail "the reported similarity survives filtering" "$out" ;;
+esac
+
+# --- 2. a listed pair is suppressed, counted and named -------------------
+printf 'acme-0z8 acme-b8c   # these are actually different\n' > "$TMP/allow.txt"
+out=$(run "$TMP/allow.txt" "$TMP/scan.json")
+case "$out" in
+    *"likely-duplicate bead pair(s) found"*) fail "a listed pair is suppressed" "$out" ;;
+    *) pass "a listed pair is suppressed" ;;
+esac
+case "$out" in
+    *"1 pair(s) listed as known-distinct"*) pass "suppression is counted" ;;
+    *) fail "suppression is counted" "$out" ;;
+esac
+case "$out" in
+    *"acme-0z8 ~ acme-b8c"*) pass "suppression names the pair (never silent)" ;;
+    *) fail "suppression names the pair (never silent)" "$out" ;;
+esac
+
+# --- 2b. order does not matter -------------------------------------------
+printf 'acme-b8c acme-0z8   # written the other way round\n' > "$TMP/allow.txt"
+out=$(run "$TMP/allow.txt" "$TMP/scan.json")
+case "$out" in
+    *"known-distinct"*) pass "the pair matches whichever order it is written" ;;
+    *) fail "the pair matches whichever order it is written" "$out" ;;
+esac
+
+# --- 3. suppression is per-pair, never per-family ------------------------
+# Two lanes of a family are listed; a third pair in the same family is NOT,
+# and must still be reported. This is the property that keeps a family rule
+# from hiding the one genuine twin among siblings.
+pair_json acme-gbwri.1 acme-gbwri.2 0.82 \
+          acme-gbwri.1 acme-gbwri.3 0.82 \
+          acme-gbwri.2 acme-gbwri.3 0.81 > "$TMP/family.json"
+printf 'acme-gbwri.1 acme-gbwri.2  # distinct providers\nacme-gbwri.1 acme-gbwri.3  # distinct providers\n' > "$TMP/allow.txt"
+out=$(run "$TMP/allow.txt" "$TMP/family.json")
+case "$out" in
+    *"acme-gbwri.2 ~ acme-gbwri.3"*) pass "an unlisted pair inside a listed family is still reported" ;;
+    *) fail "an unlisted pair inside a listed family is still reported" "$out" ;;
+esac
+case "$out" in
+    *"1 likely-duplicate"*) pass "only the unlisted pair is counted" ;;
+    *) fail "only the unlisted pair is counted" "$out" ;;
+esac
+
+# --- 4. a line with no reason suppresses nothing and is reported ---------
+printf 'acme-0z8 acme-b8c\n' > "$TMP/noreason.txt"
+out=$(run "$TMP/noreason.txt" "$TMP/scan.json")
+case "$out" in
+    *"acme-0z8 ~ acme-b8c"*"79% similar"*) pass "a reasonless line suppresses nothing" ;;
+    *) fail "a reasonless line suppresses nothing" "$out" ;;
+esac
+case "$out" in
+    *"no reason given"*) pass "a reasonless line is reported as unusable" ;;
+    *) fail "a reasonless line is reported as unusable" "$out" ;;
+esac
+
+# A line with three ids is not a pair, and must not silently match the first two.
+printf 'acme-0z8 acme-b8c acme-xxx  # three is not a pair\n' > "$TMP/three.txt"
+out=$(run "$TMP/three.txt" "$TMP/scan.json")
+case "$out" in
+    *"expected exactly two bead ids"*) pass "a three-id line is reported as unusable" ;;
+    *) fail "a three-id line is reported as unusable" "$out" ;;
+esac
+case "$out" in
+    *"79% similar"*) pass "a three-id line suppresses nothing" ;;
+    *) fail "a three-id line suppresses nothing" "$out" ;;
+esac
+
+# --- 5. --quiet stays silent only when there is nothing to act on --------
+printf 'acme-0z8 acme-b8c  # distinct\n' > "$TMP/allow.txt"
+out=$(run "$TMP/allow.txt" "$TMP/scan.json" --quiet)
+if [ -z "$(printf '%s' "$out" | tr -d '[:space:]')" ]; then
+    pass "--quiet is silent when every pair is known-distinct"
+else
+    fail "--quiet is silent when every pair is known-distinct" "$out"
+fi
+
+out=$(run "$TMP/empty.txt" "$TMP/scan.json" --quiet)
+case "$out" in
+    *"acme-0z8 ~ acme-b8c"*) pass "--quiet still speaks for a real pair" ;;
+    *) fail "--quiet still speaks for a real pair" "$out" ;;
+esac
+
+# A broken allowlist is worth interrupting a session for: it means suppressions
+# somebody believes are in force are not.
+out=$(run "$TMP/noreason.txt" "$TMP/scan.json" --quiet)
+case "$out" in
+    *"no reason given"*) pass "--quiet still speaks for an unusable allowlist line" ;;
+    *) fail "--quiet still speaks for an unusable allowlist line" "$out" ;;
+esac
+
+# --- 6. a missing allowlist is not an error ------------------------------
+out=$(run "$TMP/does-not-exist.txt" "$TMP/scan.json")
+case "$out" in
+    *"acme-0z8 ~ acme-b8c"*) pass "a missing allowlist degrades to reporting everything" ;;
+    *) fail "a missing allowlist degrades to reporting everything" "$out" ;;
+esac
+
+# --- 7. the shipped allowlist is well-formed -----------------------------
+# The file in this repo must itself pass the parser, or the suppressions the
+# team thinks are in force silently are not.
+out=$(BD_DUP_CHECK_STALE_MARKER=/dev/null BD_DUP_CHECK_JSON="$TMP/scan.json" BD_DUP_CHECK_ALLOWLIST="$SCRIPT_DIR/dup-check-known-distinct.txt" "$CHECK" 2>&1)
+case "$out" in
+    *"unusable line"*) fail "the shipped allowlist parses cleanly" "$out" ;;
+    *) pass "the shipped allowlist parses cleanly" ;;
+esac
+
+# --- 8. a partitioned tracker is announced, even under --quiet -----------
+# The scan is only as good as the database behind it; while beads-sync.sh's
+# stale marker exists, a clean-looking result is the dangerous outcome
+# (2026-08-22: two machines twin-fixed one incident on clean local scans).
+printf 'partitioned since 2026-08-22 18:35:00 - test\n' >"$TMP/stale-marker"
+out=$(BD_DUP_CHECK_STALE_MARKER="$TMP/stale-marker" run "$TMP/none.txt" "$TMP/scan.json" --quiet)
+case "$out" in
+    *"TRACKER PARTITIONED"*) pass "--quiet still announces a partitioned tracker" ;;
+    *) fail "--quiet still announces a partitioned tracker" "$out" ;;
+esac
+
+echo
+if [ "$FAILED" -eq 0 ]; then
+    echo "all tests passed"
+    exit 0
+fi
+echo "$FAILED test(s) failed"
+exit 1

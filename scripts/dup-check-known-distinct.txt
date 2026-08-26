@@ -1,0 +1,33 @@
+# Bead pairs a human has compared and found genuinely distinct.
+#
+# bd find-duplicates is mechanical text similarity. Sibling beads on one feature
+# legitimately share most of their vocabulary, so some pairs score high and are
+# still different work. Listing them here keeps the SessionStart report about
+# pairs somebody still has to look at.
+#
+# This exists because thresholds cannot separate the two cases. In the tracker
+# this setup grew in, the twin that motivated the check at all -- two sessions
+# filing the same follow-up, then two agents racing on one change -- scored
+# 79%. Four child beads splitting one feature across four cloud providers
+# scored up to 82%. Any threshold that hides the lanes also hides the twin.
+#
+# Format, one pair per line:
+#
+#     <bead-a> <bead-b>   # why they are distinct
+#
+# Order does not matter. The reason is REQUIRED -- an entry without one is
+# reported as malformed, because "somebody suppressed this once" is not a reason
+# anybody can re-check later.
+#
+# Rules:
+#   * Name both beads explicitly. No wildcards, no prefixes, no family rules --
+#     the whole risk is a family rule hiding the one real twin inside a family.
+#   * Suppression is counted and named in the report. It is never silent.
+#   * Add an entry only after actually reading both beads (`bd show <a> <b>`).
+#
+# Prune an entry when either bead closes; `scripts/bd-dup-check` (run by hand,
+# without --quiet) lists entries that matched nothing in the last scan.
+#
+# Start empty. Add entries as your own false positives show up, for example:
+#
+#     acme-4f2k.1 acme-4f2k.2   # AWS vs GCP: different provider APIs, one PR each

@@ -1,0 +1,50 @@
+{
+  "env": {
+    "BEADS_DIR": "/ABSOLUTE/PATH/TO/WORKSPACE/beads/.beads"
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd /ABSOLUTE/PATH/TO/WORKSPACE/beads && bd prime --hook-json"
+          },
+          {
+            "type": "command",
+            "command": "cd /ABSOLUTE/PATH/TO/WORKSPACE/beads && scripts/bd-health --quiet",
+            "timeout": 30,
+            "statusMessage": "Checking beads tracker health"
+          },
+          {
+            "type": "command",
+            "command": "cd /ABSOLUTE/PATH/TO/WORKSPACE/beads && scripts/bd-dup-check --quiet",
+            "timeout": 30,
+            "statusMessage": "Checking beads for duplicates"
+          },
+          {
+            "type": "command",
+            "command": "\"$HOME\"/.claude/hooks/beads-sync.sh /ABSOLUTE/PATH/TO/WORKSPACE/beads",
+            "async": true,
+            "timeout": 90,
+            "statusMessage": "Syncing beads with remote"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$HOME\"/.claude/hooks/beads-sync.sh /ABSOLUTE/PATH/TO/WORKSPACE/beads",
+            "timeout": 90,
+            "statusMessage": "Syncing beads to remote"
+          }
+        ]
+      }
+    ]
+  }
+}

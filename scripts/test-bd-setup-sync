@@ -1,0 +1,271 @@
+#!/usr/bin/env bash
+# Offline tests for bd-setup-sync's decision functions.
+#
+# Everything here runs with no network, no bd database, and no beads repo: the
+# script is sourced with BD_SETUP_SYNC_LIB=1, which defines the functions and
+# returns before it touches anything.
+#
+# What is pinned and why:
+#
+#   verify_artifact   the whole point of the tool. It has to distinguish a
+#                     machine that is STALE (re-copy) from one whose installed
+#                     copy is NEWER than the template (upstream it, and do NOT
+#                     overwrite). The very first live run found the second
+#                     case — the workspace CLAUDE.md carried a lint-slot fix
+#                     the template did not — so a tool that assumed "differs
+#                     means behind" would have destroyed it.
+#   setup_version     must change when any template's CONTENT changes, and
+#                     must NOT depend on manifest order. A version that fails
+#                     to move is worse than no version: every machine reports
+#                     "current" while running different files.
+#   read_json_field   jq's `//` treats FALSE as empty, so `"x": false` read
+#                     back as "" and was indistinguishable from a missing key.
+#                     That made cron_installed:false report as "unknown".
+#
+# Usage: scripts/test-bd-setup-sync
+
+set -uo pipefail
+
+HERE=$(cd "$(dirname "$0")" && pwd)
+BD_SETUP_SYNC_LIB=1 . "$HERE/bd-setup-sync"
+
+PASS=0; FAIL=0
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+
+ok()   { PASS=$((PASS+1)); printf '  ok   %s\n' "$1"; }
+bad()  { FAIL=$((FAIL+1)); printf '  FAIL %s\n' "$1"; printf '       %s\n' "$2"; }
+is()   { # is <label> <expected> <actual>
+    if [ "$2" = "$3" ]; then ok "$1"; else bad "$1" "expected '$2', got '$3'"; fi
+}
+
+echo "bd-setup-sync decision tests"
+
+# --- verify_artifact: exact -------------------------------------------------
+printf 'rules v2\n' > "$TMP/template"
+printf 'rules v2\n' > "$TMP/installed"
+SHA_T=$(_sha256 "$TMP/template")
+
+is "an installed copy identical to its template is current" \
+   current "$(verify_artifact "$TMP/template" "$TMP/installed" exact "$TMP" "$SHA_T" "$SHA_T")"
+
+is "an artifact that was never installed is missing" \
+   missing "$(verify_artifact "$TMP/template" "$TMP/absent" exact "$TMP" "$SHA_T" "$SHA_T")"
+
+# The template moved on from what this machine last matched: we are behind.
+printf 'rules v1 (what we installed)\n' > "$TMP/installed"
+is "a differing copy whose recorded template has since moved is stale" \
+   stale "$(verify_artifact "$TMP/template" "$TMP/installed" exact "$TMP" "sha-of-v1" "$SHA_T")"
+
+# acme-auanj, found on the first live run: the installed workspace CLAUDE.md
+# carried a lint-slot fix the template did not. The template has NOT moved
+# since we matched it, so the difference is ours and newer. Reporting this as
+# "behind, re-copy" would hand every teammate the older, deadlocking rule.
+printf 'rules v2 plus a local fix\n' > "$TMP/installed"
+is "a differing copy whose recorded template is unchanged is a local edit" \
+   local-edits "$(verify_artifact "$TMP/template" "$TMP/installed" exact "$TMP" "$SHA_T" "$SHA_T")"
+
+# No record at all: we genuinely cannot tell which side is newer. Guessing
+# either way risks destroying work, so it says so.
+is "a differing copy with no install record has an unknown direction" \
+   differs "$(verify_artifact "$TMP/template" "$TMP/installed" exact "$TMP" "" "$SHA_T")"
+
+is "a manifest entry whose template is absent is unverifiable" \
+   unverifiable "$(verify_artifact "$TMP/no-such-template" "$TMP/installed" exact "$TMP" "" "")"
+
+# --- verify_artifact: templated --------------------------------------------
+# settings.json has the workspace path substituted in at install time, so it
+# NEVER equals its template byte for byte. Reverse-substituting must recover it.
+WS="/Users/someone/work/workspace"
+printf '{"dir":"/ABSOLUTE/PATH/TO/WORKSPACE/beads"}\n' > "$TMP/tmpl.json"
+printf '{"dir":"%s/beads"}\n' "$WS" > "$TMP/inst.json"
+SHA_J=$(_sha256 "$TMP/tmpl.json")
+is "a templated artifact with the workspace path substituted in is current" \
+   current "$(verify_artifact "$TMP/tmpl.json" "$TMP/inst.json" templated "$WS" "" "$SHA_J")"
+
+# A hand-merged settings.json (SETUP.md tells people to merge the blocks into
+# an existing file) will not reverse-substitute cleanly. With a record proving
+# it was installed at THIS template, it is current, not drift — reporting drift
+# on every run is how a check becomes something people scroll past.
+printf '{"dir":"%s/beads","mine":true}\n' "$WS" > "$TMP/inst.json"
+is "a hand-merged templated artifact recorded at this template is current" \
+   current "$(verify_artifact "$TMP/tmpl.json" "$TMP/inst.json" templated "$WS" "$SHA_J" "$SHA_J")"
+
+is "a hand-merged templated artifact with no record is unverifiable, not drift" \
+   unverifiable "$(verify_artifact "$TMP/tmpl.json" "$TMP/inst.json" templated "$WS" "" "$SHA_J")"
+
+# --- setup_version ----------------------------------------------------------
+mkdir -p "$TMP/repo/templates" "$TMP/ws"
+printf 'hook\n'     > "$TMP/repo/templates/beads-sync.sh"
+printf 'rules\n'    > "$TMP/repo/templates/workspace-CLAUDE.md"
+printf 'settings\n' > "$TMP/repo/templates/workspace-settings.json"
+V1=$(setup_version "$TMP/repo" "$TMP/ws")
+V1_AGAIN=$(setup_version "$TMP/repo" "$TMP/ws")
+is "the setup version is stable for unchanged templates" "$V1" "$V1_AGAIN"
+
+printf 'rules, revised\n' > "$TMP/repo/templates/workspace-CLAUDE.md"
+V2=$(setup_version "$TMP/repo" "$TMP/ws")
+if [ "$V1" != "$V2" ]; then
+    ok "changing any template's content changes the setup version"
+else
+    bad "changing any template's content changes the setup version" \
+        "version stayed $V1 — a version that does not move lets every machine report 'current' while running different files"
+fi
+
+if [ -n "$V1" ] && [ "${#V1}" = 12 ]; then
+    ok "the setup version is a short, fixed-width hash"
+else
+    bad "the setup version is a short, fixed-width hash" "got '$V1'"
+fi
+
+# A missing template must still produce a version rather than an empty string:
+# an empty version compares equal to another machine's empty version, which
+# would report two differently-broken machines as agreeing.
+rm "$TMP/repo/templates/workspace-settings.json"
+V3=$(setup_version "$TMP/repo" "$TMP/ws")
+if [ -n "$V3" ] && [ "$V3" != "$V2" ]; then
+    ok "a missing template still yields a distinct, non-empty version"
+else
+    bad "a missing template still yields a distinct, non-empty version" "got '$V3' (V2 was $V2)"
+fi
+
+# --- read_json_field --------------------------------------------------------
+cat > "$TMP/hb.json" <<'JSON'
+{
+  "machine": "laptop-a",
+  "up_to_date": false,
+  "cron_installed": true,
+  "setup_version": "abc123"
+}
+JSON
+is "a string field reads back"            laptop-a "$(read_json_field "$TMP/hb.json" machine)"
+is "a true boolean reads back as true"    true     "$(read_json_field "$TMP/hb.json" cron_installed)"
+# The bug: jq's `//` treats false as empty, so this returned "" and the fleet
+# report printed "unknown" for every machine whose cron was NOT installed —
+# the exact machines it exists to find.
+is "a FALSE boolean reads back as false, not empty" \
+   false "$(read_json_field "$TMP/hb.json" up_to_date)"
+is "an absent key reads back empty"       ""       "$(read_json_field "$TMP/hb.json" nope)"
+
+# --- what the library exposes ----------------------------------------------
+# cron_installed started out defined BELOW the library early-return, next to
+# the install code. bd-health sources this file for its verdicts and called it
+# anyway — against unset variables — and reported "no periodic check installed"
+# on a machine where one was loaded and running. Neither the unit tests nor
+# bash -n saw it, because both halves were individually fine.
+for fn in setup_manifest setup_version verify_artifact read_json_field \
+          machine_id heartbeat_dir record_path recorded_sha_for cron_installed; do
+    if type "$fn" >/dev/null 2>&1; then
+        ok "sourcing the library defines $fn"
+    else
+        bad "sourcing the library defines $fn" "not defined — a caller that sources this file cannot use it"
+    fi
+done
+
+# --- end-to-end smoke -------------------------------------------------------
+# The unit tests above call functions directly, so they never execute the main
+# body — and the main body is where `set -u` bites. A stale $RECORDED reference
+# survived every test here and killed the very first real cron run with
+# "RECORDED: unbound variable", writing nothing and reporting nothing. This
+# runs the whole script against a throwaway repo with HOME redirected, so an
+# unbound variable or a syntax error in any branch fails the suite.
+SMOKE="$TMP/smoke"
+mkdir -p "$SMOKE/repo/templates" "$SMOKE/home" "$SMOKE/ws/.claude"
+printf 'hook\n'     > "$SMOKE/repo/templates/beads-sync.sh"
+printf 'rules\n'    > "$SMOKE/repo/templates/workspace-CLAUDE.md"
+printf 'settings\n' > "$SMOKE/repo/templates/workspace-settings.json"
+
+smoke_run() { HOME="$SMOKE/home" "$HERE/bd-setup-sync" "$SMOKE/repo" --no-publish "$@" 2>&1; }
+
+out=$(smoke_run); rc=$?
+case "$out" in
+    *"unbound variable"*|*"command not found"*|*"syntax error"*)
+        bad "a full run has no unbound variables" "$out" ;;
+    *) ok "a full run has no unbound variables" ;;
+esac
+is "a machine with nothing installed exits 3" 3 "$rc"
+
+# Nothing installed, so every artifact must be reported missing rather than
+# quietly passing.
+case "$out" in
+    *"NOT INSTALLED"*) ok "an uninstalled artifact is reported" ;;
+    *) bad "an uninstalled artifact is reported" "$out" ;;
+esac
+
+# --apply installs the exact artifacts and the run then comes back clean. This
+# also pins that the state file is written where the report can find it.
+out=$(smoke_run --apply); rc=$?
+case "$out" in
+    *"unbound variable"*) bad "an --apply run has no unbound variables" "$out" ;;
+    *) ok "an --apply run has no unbound variables" ;;
+esac
+if [ -f "$SMOKE/home/.claude/hooks/beads-sync.sh" ]; then
+    ok "--apply installs a missing exact artifact"
+else
+    bad "--apply installs a missing exact artifact" "hook was not written"
+fi
+if [ -f "$(HOME="$SMOKE/home"; state_path ws)" ] || [ -n "$(ls "$SMOKE/home/.claude"/beads-setup-state-* 2>/dev/null)" ]; then
+    ok "a run records local state"
+else
+    bad "a run records local state" "no state file under $SMOKE/home/.claude"
+fi
+
+# The one --apply must never do: overwrite an installed copy that may be the
+# NEWER side. Install cleanly, then edit the installed file so it differs while
+# the record still points at this template — that is `local-edits`.
+printf 'hook, with a local fix\n' > "$SMOKE/home/.claude/hooks/beads-sync.sh"
+out=$(smoke_run --apply)
+if grep -q 'local fix' "$SMOKE/home/.claude/hooks/beads-sync.sh"; then
+    ok "--apply refuses to overwrite a locally-edited artifact"
+else
+    bad "--apply refuses to overwrite a locally-edited artifact" \
+        "the local edit was destroyed — this is the acme-menmd regression"
+fi
+case "$out" in
+    *"LOCAL EDITS"*) ok "a locally-edited artifact is reported as such" ;;
+    *) bad "a locally-edited artifact is reported as such" "$out" ;;
+esac
+
+# The STALE branch, reached only when a record EXISTS and the template has
+# moved since. Every other smoke path above skips it, which is how a stale
+# `$RECORDED` reference in its message survived the whole suite and then
+# killed the first real cron run with "RECORDED: unbound variable" — writing
+# nothing, publishing nothing, and reporting nothing. Under `set -u` a message
+# is executable code, so an unreachable branch is an unexploded one.
+smoke_run --apply >/dev/null 2>&1          # back to a clean, recorded install
+printf 'hook, revised upstream\n' > "$SMOKE/repo/templates/beads-sync.sh"
+out=$(smoke_run); rc=$?
+case "$out" in
+    *"unbound variable"*|*"command not found"*)
+        bad "the STALE branch has no unbound variables" "$out" ;;
+    *) ok "the STALE branch has no unbound variables" ;;
+esac
+case "$out" in
+    *"STALE"*) ok "a template that moved after install is reported STALE" ;;
+    *) bad "a template that moved after install is reported STALE" "$out" ;;
+esac
+is "a stale machine exits 3" 3 "$rc"
+
+# And --apply resolves it, which is the difference between STALE and the two
+# verdicts --apply refuses.
+smoke_run --apply >/dev/null 2>&1
+if grep -q 'revised upstream' "$SMOKE/home/.claude/hooks/beads-sync.sh"; then
+    ok "--apply updates a stale artifact"
+else
+    bad "--apply updates a stale artifact" "the hook was not updated"
+fi
+
+# --- machine_id -------------------------------------------------------------
+MID=$(machine_id)
+case "$MID" in
+    *[!A-Za-z0-9._-]*) bad "the machine id is filesystem-safe" "got '$MID'" ;;
+    "") bad "the machine id is filesystem-safe" "empty" ;;
+    *) ok "the machine id is filesystem-safe" ;;
+esac
+
+echo
+if [ "$FAIL" -gt 0 ]; then
+    echo "$FAIL test(s) failed"
+    exit 1
+fi
+echo "all tests passed"
