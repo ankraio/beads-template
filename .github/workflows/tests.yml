@@ -1,0 +1,67 @@
+# Runs every offline suite in scripts/ on pull requests and on pushes to main
+# that touch the scripts or templates. Everything here is hermetic (fake bd
+# and gh on PATH, scratch Dolt store, redirected HOME): no token, no tracker,
+# no network beyond installing the two pinned binaries. About a minute.
+#
+# The nightly sweep runs none of these, and until 2026-09-01 nothing did: a
+# suite that only runs on the author's laptop is a suite that is skipped the
+# day it matters. This is also the status check a require-PR rule on main
+# can eventually demand.
+name: tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/**'
+      - 'templates/**'
+      - '.github/workflows/tests.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  offline-suites:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      # test-bd-precreate-check reads it; the setup-sync smoke pins its own.
+      BEADS_DIR: ${{ github.workspace }}/.beads
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.2.2
+
+      # Same pinned dolt as the nightly (test-bd-resolve-conflicts drives a
+      # scratch Dolt store). Bump the two workflows together.
+      - name: Install dolt
+        env:
+          DOLT_VERSION: "2.6.2"
+          DOLT_SHA256: "e27a7957b8626946a5022fe0ad6ce4bfb3c8f51544c7f1372b0e6db14c1549cf"
+        run: |
+          curl -fsSL -o /tmp/dolt.tar.gz "https://github.com/dolthub/dolt/releases/download/v${DOLT_VERSION}/dolt-linux-amd64.tar.gz"
+          echo "${DOLT_SHA256}  /tmp/dolt.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/dolt.tar.gz -C /tmp
+          sudo install -m 0755 /tmp/dolt-linux-amd64/bin/dolt /usr/local/bin/dolt
+          dolt config --global --add user.name  "beads-tests"
+          dolt config --global --add user.email "github-actions[bot]@users.noreply.github.com"
+          dolt config --global --add metrics.disabled true
+          dolt version
+
+      - name: Syntax
+        run: |
+          set -e
+          # Two of the scripts are Python without a .py suffix: go by shebang.
+          for f in scripts/bd-* scripts/beads-precreate-guard.py; do
+            if head -1 "$f" | grep -q python; then python3 -m py_compile "$f"; else bash -n "$f"; fi
+          done
+          sh -n templates/beads-sync.sh
+          jq empty templates/workspace-settings.json
+
+      - name: Offline suites
+        run: |
+          set -e
+          for t in scripts/test-*; do
+            echo "::group::$t"
+            "$t"
+            echo "::endgroup::"
+          done

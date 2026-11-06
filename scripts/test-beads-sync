@@ -1,0 +1,548 @@
+#!/usr/bin/env bash
+# Offline tests for templates/beads-sync.sh.
+#
+# Pins lock_is_reclaimable, the rule that decides whether one session's sync
+# may take the lock from another's. It is three-valued on purpose: "the owner
+# is still working" and "there is no owner recorded" are different facts, and
+# collapsing them is what the 2026-08-30 outage was made of. The hook used to
+# drop any lock older than ten minutes, which measures duration rather than
+# staleness - so a run that took longer had its own lock stolen, a second sync
+# started underneath it, and 28 bd processes piled up behind a wedged
+# `bd dolt pull` until the machine could not file a bead at all.
+#
+# Runs offline in a few seconds: no bd, no network, no tracker. The git
+# convergence helpers at the end drive real scratch git repos (git only).
+
+set -u
+
+HOOK="$(cd "$(dirname "$0")/.." && pwd)/templates/beads-sync.sh"
+# shellcheck disable=SC1090
+BEADS_SYNC_LIB=1 . "$HOOK"
+
+failures=0
+pass() { printf '  ok   %s\n' "$1"; }
+fail() { printf '  FAIL %s\n' "$1"; failures=$((failures + 1)); }
+
+check() {
+    label="$1"; want="$2"; lockdir="$3"
+    lock_is_reclaimable "$lockdir"
+    got=$?
+    if [ "$got" = "$want" ]; then pass "$label"; else fail "$label (want $want, got $got)"; fi
+}
+
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"; kill "$live_pid" 2>/dev/null' EXIT
+
+echo "network classification:"
+for message in 'ssh: connect to host github.com port 22: Undefined error: 0' 'Could not resolve hostname github.com' 'Network is unreachable'; do
+    network_unavailable "$message" && pass "connectivity failure" || fail "connectivity failure"
+done
+for message in 'merge conflict' 'push cancelled by force' 'TIMED OUT Could not resolve host' 'Permission denied Could not resolve host' 'conflict Network is unreachable'; do
+    network_unavailable "$message" && fail "ambiguous failure became offline" || pass "ambiguous failure retained"
+done
+
+echo "lock_is_reclaimable:"
+
+# A lock whose owner is still running must never be reclaimed. This is the
+# case the old age rule got wrong, and the only one that can corrupt a sync.
+sleep 60 &
+live_pid=$!
+mkdir -p "$TMP/live.lock"
+echo "$live_pid" >"$TMP/live.lock/pid"
+check "a live owner holds its lock" 1 "$TMP/live.lock"
+
+# A crashed run's lock is reclaimed immediately - no ten-minute wait, which
+# is what made a crash block every other session for the rest of the window.
+dead_pid=$(sh -c 'echo $$')
+while kill -0 "$dead_pid" 2>/dev/null; do dead_pid=$((dead_pid + 1)); done
+mkdir -p "$TMP/dead.lock"
+echo "$dead_pid" >"$TMP/dead.lock/pid"
+check "a dead owner's lock is reclaimable" 0 "$TMP/dead.lock"
+
+# A lock from a hook that predates owner recording is UNKNOWN, not
+# reclaimable: the caller falls back to the age rule for it, so upgrading
+# cannot steal the lock of the one live run that straddles the change.
+mkdir -p "$TMP/legacy.lock"
+check "a lock with no pid file is unknown" 2 "$TMP/legacy.lock"
+
+# An unreadable or empty pid file is unknown for the same reason - it must
+# never read as "nobody owns this".
+mkdir -p "$TMP/empty.lock"
+: >"$TMP/empty.lock/pid"
+check "an empty pid file is unknown" 2 "$TMP/empty.lock"
+
+echo
+echo "lock_holder_is_abandoned:"
+
+holder_check() {
+    label="$1"; want="$2"; pid="$3"
+    lock_holder_is_abandoned "$pid"
+    got=$?
+    if [ "$got" = "$want" ]; then pass "$label"; else fail "$label (want $want, got $got)"; fi
+}
+
+# The case that wedges the machine: a bd reparented to init when its session
+# hook was killed, or left behind by an operator's closed terminal. Nobody is
+# waiting on it and nobody will collect its exit code, so it holds the Dolt
+# lock until a human finds the pid. PID 1 itself is the only process on a mac
+# guaranteed to be present and parented to 0, so use a real orphan instead:
+# a grandchild whose parent exits immediately is reparented to init.
+orphan_pid=$(sh -c '{ sleep 60 >/dev/null 2>&1 & echo $!; } ' )
+# Wait for the intermediate shell to exit so the reparent has happened.
+tries=0
+while [ "$(ps -o ppid= -p "$orphan_pid" 2>/dev/null | tr -d ' ')" != "1" ] && [ "$tries" -lt 50 ]; do
+    tries=$((tries + 1))
+    sleep 0.1
+done
+holder_check "an orphaned holder is abandoned" 0 "$orphan_pid"
+kill "$orphan_pid" 2>/dev/null
+
+# A holder with a live parent belongs to a session that is waiting on it.
+# Killing it would turn a slow sync into a lost write, which is the whole
+# reason this is a liveness test and not an age test.
+sleep 60 &
+attached_pid=$!
+holder_check "a holder with a live parent is attached" 1 "$attached_pid"
+kill "$attached_pid" 2>/dev/null
+
+# A pid that no longer exists is "gone", not "abandoned": there is nothing to
+# kill, and answering 0 would make the reaper log a reap that never happened.
+gone_pid=$(sh -c 'echo $$')
+while kill -0 "$gone_pid" 2>/dev/null; do gone_pid=$((gone_pid + 1)); done
+holder_check "a dead pid is gone, not abandoned" 2 "$gone_pid"
+
+echo
+echo "push_fsck_false_positive:"
+
+fsck_check() {
+    label="$1"; want="$2"; msg="$3"
+    push_fsck_false_positive "$msg"
+    got=$?
+    if [ "$got" = "$want" ]; then pass "$label"; else fail "$label (want $want, got $got)"; fi
+}
+
+# The real message, verbatim, from the machine this was written for. Note the
+# trailing colon with NOTHING after it: bd's pre-push fsck was killed by its
+# own 30s timeout and its empty output got wrapped as a dangling-chunk error.
+fsck_check "the empty-ref timeout message is a false positive" 0 \
+    "Pushing to Dolt remote...
+Error: dangling chunk reference: aborting push to prevent propagating corrupt chunks: "
+
+# THE SAFETY CASE. A real fsck finding prints chunk addresses. Treating that as
+# a false positive would push a genuinely corrupt store to the remote, which is
+# the one outcome the pre-push check exists to prevent - so it must NOT match.
+fsck_check "a message naming a chunk is NOT a false positive" 1 \
+    "Error: dangling chunk reference: aborting push to prevent propagating corrupt chunks: q3frhla5uubflvve2ctfv84pp3vpg6i0"
+
+# Unrelated push failures must fall through untouched - a rejected push is a
+# real problem the fallback has no business papering over.
+fsck_check "a non-fast-forward rejection is not this failure" 1 \
+    "Error: push to origin/main: Error 1105: ! [rejected] main -> main (non-fast-forward)"
+fsck_check "an auth failure is not this failure" 1 \
+    "Error: permission denied (publickey)"
+fsck_check "empty output is not this failure" 1 ""
+
+echo
+echo "step_output_is_failure:"
+
+step_check() {
+    label="$1"; want="$2"; rc="$3"; msg="$4"
+    step_output_is_failure "$rc" "$msg"
+    got=$?
+    if [ "$got" = "$want" ]; then pass "$label"; else fail "$label (want $want, got $got)"; fi
+}
+
+# The regression this classifier fixes: bd printed a benign per-write warning
+# on a commit that SUCCEEDED, and the old whole-output grep matched "failed"
+# in it, logged "dolt commit FAILED (rc=0)" and tripped the stale-tracker
+# marker for a sync that was fine (acme-ob9dq, verbatim from the log).
+step_check "rc=0 with only a Warning line is success" 1 0 \
+    "Committed.
+Warning: auto-backup failed: register backup remote: add backup backup_export: Error 1105 (HY000): backup 'backup_export' already exists"
+
+# THE SAFETY CASE, and the reason output is grepped at all: the July 2026
+# fork ran on a `bd dolt pull` whose merge conflict exited 0. A swallowed
+# conflict has no Warning prefix and must still read as failure.
+step_check "rc=0 with a swallowed CONFLICT is failure" 0 0 \
+    "Updating abc..def
+CONFLICT (content): Merge conflict in issues
+Automatic merge failed; 1 table(s) are unmerged."
+
+step_check "rc=1 is failure regardless of output" 0 1 "Committed."
+step_check "rc=0 with clean output is success" 1 0 "Committed."
+step_check "rc=0 with a non-warning error line is failure" 0 0 \
+    "Error: failed to push some refs"
+
+echo
+echo "strip_dolt_noise:"
+
+stripped=$(strip_dolt_noise "$(printf -- '- Pulling...\r\\ Pulling...\r| Pulling...\r/ Pulling...\r\\ Pulling...Auto-merging issues\nCONFLICT (content): Merge conflict in issues')")
+case "$stripped" in
+    *"Pulling..."*) fail "spinner frames removed (still present: $stripped)" ;;
+    *) pass "spinner frames removed" ;;
+esac
+case "$stripped" in
+    *"Auto-merging issues"*) pass "real output on a frame-prefixed line survives" ;;
+    *) fail "real output on a frame-prefixed line survives (got: $stripped)" ;;
+esac
+case "$stripped" in
+    *"CONFLICT (content)"*) pass "plain output lines survive" ;;
+    *) fail "plain output lines survive (got: $stripped)" ;;
+esac
+
+echo
+echo "abs_repo_path:"
+
+# The relative-path defect (acme-eh8hs): the hook cds into the repo and then
+# globs "$BEADS_REPO"/.beads/dolt/*/ for the push fallback, so a relative
+# argument resolved once and never again - 9 of 9 claim-syncs run as
+# `beads-sync.sh beads --quick` from the workspace root lost their fallback
+# and ended `sync FAILED (quick) in beads`. The path must be absolute before
+# anything else reads it.
+mkdir -p "$TMP/ws/beads"
+want_abs=$(cd "$TMP/ws/beads" && pwd -P)
+got_abs=$(cd "$TMP/ws" && abs_repo_path beads)
+if [ "$got_abs" = "$want_abs" ]; then pass "a relative repo path is made absolute"; else fail "a relative repo path is made absolute (want $want_abs, got $got_abs)"; fi
+got_abs=$(abs_repo_path "$want_abs")
+if [ "$got_abs" = "$want_abs" ]; then pass "an absolute repo path is unchanged"; else fail "an absolute repo path is unchanged (got $got_abs)"; fi
+got_abs=$(abs_repo_path "$TMP/ws/no-such-repo")
+if [ "$got_abs" = "$TMP/ws/no-such-repo" ]; then pass "a missing repo path is passed through for the cd to refuse"; else fail "a missing repo path is passed through (got $got_abs)"; fi
+
+echo
+echo "pin_tracker_env:"
+
+# The multi-tracker defect (acme-pkza2): bd prefers BEADS_DOLT_SERVER_SOCKET
+# over BEADS_DIR, so a session that inherited another workspace's socket
+# synced against THAT workspace's server. The hook must only ever talk to the
+# server of the repo it was given. Each case runs in a subshell so the exports
+# cannot leak into the next.
+mkdir -p "$TMP/pin/mine/.beads" "$TMP/pin/other/.beads" "$TMP/pin/nosock/.beads"
+python3 -c 'import socket,sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])' "$TMP/pin/mine/.beads/dolt.sock"
+pin_env() { # pin_env <repo> <inherited-socket-or-empty> -> "BEADS_DIR|SOCKET"
+    (
+        if [ -n "$2" ]; then BEADS_DOLT_SERVER_SOCKET=$2; export BEADS_DOLT_SERVER_SOCKET; else unset BEADS_DOLT_SERVER_SOCKET; fi
+        BEADS_DIR=/somewhere/else/.beads; export BEADS_DIR
+        pin_tracker_env "$1"
+        printf '%s|%s' "$BEADS_DIR" "${BEADS_DOLT_SERVER_SOCKET:-}"
+    )
+}
+pin_check() { # pin_check <label> <want> <got>
+    if [ "$3" = "$2" ]; then pass "$1"; else fail "$1 (want $2, got $3)"; fi
+}
+pin_check "another workspace's socket is replaced by this repo's own" \
+    "$TMP/pin/mine/.beads|$TMP/pin/mine/.beads/dolt.sock" \
+    "$(pin_env "$TMP/pin/mine" "$TMP/pin/other/.beads/dolt.sock")"
+pin_check "another workspace's socket is dropped when this repo has none" \
+    "$TMP/pin/nosock/.beads|" \
+    "$(pin_env "$TMP/pin/nosock" "$TMP/pin/other/.beads/dolt.sock")"
+pin_check "this repo's socket is set when none was inherited" \
+    "$TMP/pin/mine/.beads|$TMP/pin/mine/.beads/dolt.sock" \
+    "$(pin_env "$TMP/pin/mine" "")"
+pin_check "a socket under this repo is kept" \
+    "$TMP/pin/nosock/.beads|$TMP/pin/nosock/.beads/custom.sock" \
+    "$(pin_env "$TMP/pin/nosock" "$TMP/pin/nosock/.beads/custom.sock")"
+
+echo
+echo "fsck_probe_due:"
+
+probe_check() {
+    label="$1"; want="$2"; marker="$3"; hours="$4"
+    fsck_probe_due "$marker" "$hours"
+    got=$?
+    if [ "$got" = "$want" ]; then pass "$label"; else fail "$label (want $want, got $got)"; fi
+}
+
+# No marker means nothing is known: bd's own check goes first, as it always
+# did. This is also the state a `bd dolt push` that completes clean restores.
+probe_check "no marker: probe bd dolt push" 0 "$TMP/no-marker" 24
+
+# A rescue was just recorded: the probe is a doomed 30s that the SessionEnd
+# hook's 60s cap cannot afford, so the direct push goes first.
+: >"$TMP/fresh-marker"
+probe_check "a fresh marker: skip the probe, push directly" 1 "$TMP/fresh-marker" 24
+
+# THE SAFETY CASE. The skip must not be permanent: once the marker is older
+# than the re-probe window, bd's check is tried again, so a store that has
+# shrunk (or a bd that has been fixed) puts its guard back in front of every
+# push without anyone touching the marker.
+: >"$TMP/old-marker"
+touch -t "$(date -v-2d '+%Y%m%d%H%M' 2>/dev/null || date -d '2 days ago' '+%Y%m%d%H%M')" "$TMP/old-marker"
+probe_check "a marker older than the window: probe again" 0 "$TMP/old-marker" 24
+
+# A window of 0 disables the skip entirely (the operator opt-out), so a fresh
+# marker still probes.
+probe_check "window 0: always probe" 0 "$TMP/fresh-marker" 0
+
+echo
+echo "push_is_rejected_nonff:"
+
+nonff_check() {
+    label="$1"; want="$2"; msg="$3"
+    push_is_rejected_nonff "$msg"
+    got=$?
+    if [ "$got" = "$want" ]; then pass "$label"; else fail "$label (want $want, got $got)"; fi
+}
+
+# Verbatim shapes from the log: bd wraps git's words, the direct fallback
+# prints them raw.
+nonff_check "bd-wrapped non-fast-forward matches" 0 \
+    "Error: dolt push failed: Error 1105 (HY000): To git+ssh://git@github.com/acme/beads.git
+ ! [rejected]            main -> main (non-fast-forward)"
+nonff_check "raw git rejection matches" 0 \
+    "hint: Updates were rejected because the tip of your current branch is behind"
+nonff_check "an fsck false positive is not a rejection" 1 \
+    "Error: dangling chunk reference: aborting push to prevent propagating corrupt chunks: "
+nonff_check "an auth failure is not a rejection" 1 \
+    "Error: permission denied (publickey)"
+nonff_check "fetch-first is a retryable history race" 0 \
+    "! [rejected] main -> main (fetch first)"
+nonff_check "an oversized pack is not a history race" 1 \
+    "remote: fatal: pack exceeds maximum allowed size (2.00 GiB)
+error: remote unpack failed: index-pack failed
+! refs/dolt/blobstore/origin/dolt/data/fixture:refs/dolt/data [remote rejected] (failed)"
+nonff_check "a hook refusal is not a history race" 1 \
+    "! [remote rejected] main -> main (pre-receive hook declined)"
+nonff_check "an unexplained rejection is not a history race" 1 \
+    "Error: remote rejected the request"
+
+# --- Dolt's history on the git remote (acme-w94uqb) -------------------------
+echo "dolt versions:"
+version_check() { # version_check <label> <want> <output of dolt version>
+    dolt_has_history_settings "$3"
+    got=$?
+    if [ "$got" = "$2" ]; then pass "$1"; else fail "$1 (want $2, got $got)"; fi
+}
+version_check "the CI pin before this change" 1 'dolt version 2.2.2'
+version_check "the last version without the settings" 1 'dolt version 2.4.9'
+version_check "the first version with them" 0 'dolt version 2.5.0'
+version_check "the version this was proved on" 0 'dolt version 2.6.2'
+version_check "a later minor, compared as a number" 0 'dolt version 2.10.0'
+version_check "a later major" 0 'dolt version 3.0.0'
+version_check "an old major with a large minor" 1 'dolt version 1.99.0'
+version_check "dolt's upgrade nag around the version" 0 'Warning: you are on an old version of Dolt
+dolt version 2.6.2
+database storage format: NEW ( __DOLT__ )'
+version_check "nothing to read is not the same as too old" 2 ''
+version_check "something else entirely" 2 'bash: dolt: command not found'
+
+echo "git remote history verdict:"
+HD="$TMP/hist/db"
+mkdir -p "$HD/.dolt"
+HP="$TMP/hist/dolt-server.pid"
+hist_max=0 hist_reset=false hist_version='dolt version 2.6.2'
+dolt() {
+    case "$1" in
+        version) echo "$hist_version" ;;
+        config) case "$4" in
+                    git-remote.max-history-commits) [ -n "$hist_max" ] || return 1; echo "$hist_max" ;;
+                    git-remote.reset-history-on-prune) [ -n "$hist_reset" ] || return 1; echo "$hist_reset" ;;
+                esac ;;
+    esac
+}
+hist_check() {
+    got=$(git_remote_history_verdict "$HD" "$HP")
+    if [ "$got" = "$2" ]; then pass "$1"; else fail "$1 (want $2, got $got)"; fi
+}
+: >"$HD/.dolt/config.json"
+rm -f "$HP"
+hist_check "both set, no server recorded" ok
+hist_max=''; hist_check "max-history-commits missing" unset; hist_max=64; hist_check "max-history-commits holding another value" unset; hist_max=0
+hist_reset=''; hist_check "reset-history-on-prune missing" unset; hist_reset=true; hist_check "reset-history-on-prune holding another value" unset; hist_reset=false
+hist_version='dolt version 2.2.2'; hist_check "too old wins over everything else" old-dolt; hist_version=''; hist_check "an unreadable version is not called old" ok; hist_version='dolt version 2.6.2'
+echo "$live_pid" >"$HP"
+touch -t 202601010000 "$HP"; touch -t 202601020000 "$HD/.dolt/config.json"
+hist_check "a live server older than the config" stale-server
+touch -t 202601030000 "$HP"
+hist_check "a live server newer than the config" ok
+touch -t 202601010000 "$HP"
+echo 999999 >"$HP"
+hist_check "an old pid file with nothing running" ok
+unset -f dolt
+
+# --- git convergence: what may a reset of the shared checkout throw away? ----
+# These run against real scratch git history (a bare "origin", a clone playing
+# the shared checkout, a second clone playing everyone else), because the
+# questions are git facts: which commits are the hook's own, which ones are
+# already upstream, and which interaction records exist only here. Isolated
+# from the operator's git config so a global hooksPath or signing rule cannot
+# change the answer.
+echo
+echo "git convergence helpers:"
+
+G="$TMP/git"
+mkdir -p "$G"
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+export GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.com
+export GIT_COMMITTER_NAME=test GIT_COMMITTER_EMAIL=test@example.com
+g() { git -c init.defaultBranch=main -c commit.gpgsign=false "$@"; }
+
+# ledger.txt is long enough that an edit at the top and one at the bottom are
+# separate hunks - the shape of a squash that carried our change plus another.
+seq_lines() { i=1; while [ "$i" -le 20 ]; do echo "line $i"; i=$((i + 1)); done; }
+g init -q --bare "$G/origin.git"
+g clone -q "$G/origin.git" "$G/up" 2>/dev/null
+(
+    cd "$G/up" || exit 1
+    g checkout -q -b main 2>/dev/null
+    mkdir -p .beads
+    seq_lines >ledger.txt
+    printf '{"id":"int-a","kind":"field_change"}\n{"id":"int-b","kind":"field_change"}\n' >.beads/interactions.jsonl
+    echo '{"id":"acme-1"}' >.beads/issues.jsonl
+    g add -A && g commit -qm seed && g push -q origin main
+) || fail "scratch origin could not be seeded"
+
+# fresh_clone <dir>: a new "shared checkout" at origin/main.
+fresh_clone() { rm -rf "$1"; g clone -q "$G/origin.git" "$1" 2>/dev/null; }
+# upstream <cmd>: run <cmd> in the other machine's clone, then push.
+upstream() { ( cd "$G/up" && g pull -q --rebase origin main && eval "$1" && g push -q origin main ); }
+blocking_in() { ( cd "$1" && g fetch -q origin && blocking_commits origin/main ); }
+bcheck() {
+    # bcheck <label> <want-substring-or-EMPTY> <repo>
+    got=$(blocking_in "$3")
+    # Guard the test itself: an "upstream" commit byte-identical to the local
+    # one (same parent, same second) would make every case pass trivially.
+    if [ -z "$(git -C "$3" rev-list origin/main..HEAD)" ]; then
+        fail "$1 (fixture: HEAD is already on origin/main, nothing is being tested)"
+        return
+    fi
+    if [ "$2" = EMPTY ]; then
+        if [ -z "$got" ]; then pass "$1"; else fail "$1 (want nothing blocking, got: $got)"; fi
+    else
+        case "$got" in *"$2"*) pass "$1" ;; *) fail "$1 (want '$2' blocking, got: '$got')" ;; esac
+    fi
+}
+
+# 1. The hook's own commits never block: they are regenerated on the next run.
+fresh_clone "$G/b1"
+(
+    cd "$G/b1" || exit 1
+    echo '{"id":"acme-2"}' >>.beads/issues.jsonl
+    g commit -qam "chore: sync issue export"
+    mkdir -p .beads-setup/heartbeats && echo '{}' >.beads-setup/heartbeats/m.json
+    g add -A && g commit -qm "chore: setup heartbeat"
+)
+upstream 'echo "{\"id\":\"acme-3\"}" >>.beads/issues.jsonl && g commit -qam "chore: sync issue export"'
+bcheck "export and heartbeat commits never block" EMPTY "$G/b1"
+
+# 2. THE REGRESSION: a hand commit on main that origin does not have blocks,
+# and is NAMED - short sha and subject - so the log line says what to land.
+fresh_clone "$G/b2"
+( cd "$G/b2" && echo "acme-x acme-y   # distinct" >>ledger.txt && g commit -qam "dup-check: record x~y" )
+h2=$(git -C "$G/b2" rev-parse --short HEAD)
+upstream 'echo "acme-p acme-q   # other" >>ledger.txt && g commit -qam "dup-check: record p~q"'
+bcheck "a hand commit origin lacks blocks, named by sha and subject" "$h2 dup-check: record x~y" "$G/b2"
+
+# 3. The same change landed upstream through a PR as a cherry-pick of that
+# commit: identical patch, so it no longer blocks and the next sync converges.
+fresh_clone "$G/b3"
+( cd "$G/b3" && sed 's/^line 5$/line 5 edited/' ledger.txt >l.tmp && mv l.tmp ledger.txt && g commit -qam "hand: edit line 5" )
+h3=$(git -C "$G/b3" rev-parse HEAD)
+g -C "$G/up" fetch -q "$G/b3" "$h3" 2>/dev/null
+upstream "g cherry-pick -x $h3 >/dev/null && echo '{\"id\":\"acme-4\"}' >>.beads/issues.jsonl && g commit -qam 'chore: sync issue export'"
+bcheck "a hand commit whose patch is upstream no longer blocks" EMPTY "$G/b3"
+
+# 4. The change reached origin inside a squash that also edited the same file
+# elsewhere: a different patch-id, but re-applying ours changes nothing. That
+# is what commit_is_upstream's merge-tree test is for (git >= 2.40).
+if git merge-tree -h 2>&1 | grep -q 'merge-base'; then
+    fresh_clone "$G/b4"
+    ( cd "$G/b4" && sed 's/^line 2$/line 2 ours/' ledger.txt >l.tmp && mv l.tmp ledger.txt && g commit -qam "hand: edit line 2" )
+    upstream "sed -e 's/^line 2\$/line 2 ours/' -e 's/^line 19\$/line 19 review fix/' ledger.txt >l.tmp && mv l.tmp ledger.txt && g commit -qam 'squash: line 2 plus a review fix'"
+    bcheck "a hand commit carried by a larger squash no longer blocks" EMPTY "$G/b4"
+else
+    pass "a hand commit carried by a larger squash (skipped: git merge-tree lacks --merge-base)"
+fi
+
+# 5. Upstream took the patch and has since moved the same line on: re-applying
+# would conflict, but git cherry's rule (same patch-id upstream) still says it
+# landed. Dropping it loses nothing upstream has not deliberately changed.
+fresh_clone "$G/b5"
+( cd "$G/b5" && sed 's/^line 8$/line 8 v1/' ledger.txt >l.tmp && mv l.tmp ledger.txt && g commit -qam "hand: line 8 v1" )
+h5=$(git -C "$G/b5" rev-parse HEAD)
+g -C "$G/up" fetch -q "$G/b5" "$h5" 2>/dev/null
+upstream "g cherry-pick -x $h5 >/dev/null && sed 's/^line 8 v1\$/line 8 v2/' ledger.txt >l.tmp && mv l.tmp ledger.txt && g commit -qam 'line 8 v2'"
+bcheck "a hand commit whose patch landed and was superseded no longer blocks" EMPTY "$G/b5"
+
+# 6. THE LIMIT, pinned so nobody mistakes it for a bug: the same ledger line
+# appended upstream AFTER other lines is a different place in the file. Git
+# cannot call that "already applied", and the hook must not guess - this case
+# (acme-n0unr's allowlist lines) keeps the SETUP.md runbook.
+fresh_clone "$G/b6"
+( cd "$G/b6" && echo "acme-m acme-n   # distinct" >>ledger.txt && g commit -qam "dup-check: record m~n" )
+h6=$(git -C "$G/b6" rev-parse --short HEAD)
+upstream 'echo "acme-r acme-s   # other" >>ledger.txt && echo "acme-m acme-n   # distinct" >>ledger.txt && g commit -qam "record r~s and m~n"'
+bcheck "the same line appended elsewhere upstream still blocks (judgement, not a git fact)" "$h6" "$G/b6"
+
+# 7. A merge commit always blocks: it can carry anybody's conflict resolution.
+fresh_clone "$G/b7"
+(
+    cd "$G/b7" || exit 1
+    g checkout -q -b side && echo side >side.txt && g add side.txt && g commit -qm "side work"
+    g checkout -q main && echo '{"id":"acme-5"}' >>.beads/issues.jsonl && g commit -qam "chore: sync issue export"
+    g merge -q --no-ff -m "Merge branch 'side'" side
+)
+upstream 'echo "{\"id\":\"acme-6\"}" >>.beads/issues.jsonl && g commit -qam "chore: sync issue export"'
+bcheck "a merge commit on main blocks" "Merge branch 'side'" "$G/b7"
+# ...whatever its subject says: the export whitelist is a statement about
+# commits the hook writes, and the hook never writes a merge.
+fresh_clone "$G/b7b"
+(
+    cd "$G/b7b" || exit 1
+    g checkout -q -b side && echo side2 >side2.txt && g add side2.txt && g commit -qm "side work 2"
+    g checkout -q main && echo '{"id":"acme-8"}' >>.beads/issues.jsonl && g commit -qam "chore: sync issue export"
+    g merge -q --no-ff -m "chore: sync issue export" side
+)
+m7b=$(git -C "$G/b7b" rev-parse --short HEAD)
+upstream 'echo "{\"id\":\"acme-9\"}" >>.beads/issues.jsonl && g commit -qam "chore: sync issue export"'
+bcheck "a merge blocks even under the export's subject" "$m7b chore: sync issue export" "$G/b7b"
+
+# 8. A non-export commit that also carries the jsonl is someone's `git commit
+# -a` in the shared tree: never judged upstream, even when its change is.
+fresh_clone "$G/b8"
+( cd "$G/b8" && echo "acme-t acme-u   # distinct" >>ledger.txt && echo '{"id":"acme-7"}' >>.beads/issues.jsonl && g commit -qam "hand: ledger and export together" )
+h8=$(git -C "$G/b8" rev-parse HEAD)
+g -C "$G/up" fetch -q "$G/b8" "$h8" 2>/dev/null
+upstream "g cherry-pick -x $h8 >/dev/null"
+bcheck "a hand commit that also carries the export always blocks" "hand: ledger and export together" "$G/b8"
+
+echo
+echo "unacknowledged_commits / name_commits:"
+full2=$(git -C "$G/b2" rev-parse HEAD)
+got=$(cd "$G/b2" && printf '%s\n' "$h2 dup-check: record x~y" | unacknowledged_commits "$(printf '%s' "$full2" | cut -c1-9)")
+if [ -z "$got" ]; then pass "an acknowledged prefix drops the commit from the blocking list"; else fail "acknowledged prefix (got: $got)"; fi
+got=$(cd "$G/b2" && printf '%s\n' "$h2 dup-check: record x~y" | unacknowledged_commits "deadbeefdeadbeef")
+case "$got" in "$h2 "*) pass "a name that does not resolve acknowledges nothing" ;; *) fail "unresolvable ack (got: $got)" ;; esac
+got=$(cd "$G/b2" && printf '%s\n' "$h2 dup-check: record x~y" | unacknowledged_commits "")
+case "$got" in "$h2 "*) pass "an empty acknowledgement list acknowledges nothing" ;; *) fail "empty ack (got: $got)" ;; esac
+got=$(printf 'a1 one\na2 two\na3 three\na4 four\na5 five\na6 six\na7 seven\n' | name_commits)
+if [ "$got" = "a1 one; a2 two; a3 three; a4 four; a5 five; and 2 more" ]; then pass "name_commits caps the list at five"; else fail "name_commits (got: $got)"; fi
+
+echo
+echo "interactions_local_only:"
+# The records bd appended here since the last push. issues.jsonl comes back
+# from the database after a reset; these do not, so the reset must carry them.
+fresh_clone "$G/i1"
+(
+    cd "$G/i1" || exit 1
+    printf '{"id":"int-local-1","kind":"field_change"}\n\n{"id":"int-local-2","kind":"field_change"}\n' >>.beads/interactions.jsonl
+)
+upstream 'printf "{\"id\":\"int-up-1\",\"kind\":\"field_change\"}\n" >>.beads/interactions.jsonl && g commit -qam "chore: sync issue export"'
+got=$(cd "$G/i1" && g fetch -q origin && interactions_local_only origin/main | tr '\n' ' ')
+if [ "$got" = '{"id":"int-local-1","kind":"field_change"} {"id":"int-local-2","kind":"field_change"} ' ]; then
+    pass "only records origin lacks are carried, in file order, blank lines dropped"
+else
+    fail "interactions_local_only (got: $got)"
+fi
+got=$(cd "$G/i1" && interactions_local_only no-such-ref | grep -c .)
+if [ "$got" = 4 ]; then pass "an upstream without the file keeps every local record"; else fail "no upstream file (got $got lines)"; fi
+fresh_clone "$G/i2"
+got=$(cd "$G/i2" && interactions_local_only origin/main)
+if [ -z "$got" ]; then pass "nothing local means nothing carried"; else fail "clean clone carried: $got"; fi
+
+echo
+if [ "$failures" -eq 0 ]; then
+    echo "all tests passed"
+    exit 0
+fi
+echo "$failures test(s) failed"
+exit 1

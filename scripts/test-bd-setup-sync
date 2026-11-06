@@ -94,6 +94,19 @@ is "a hand-merged templated artifact recorded at this template is current" \
 is "a hand-merged templated artifact with no record is unverifiable, not drift" \
    unverifiable "$(verify_artifact "$TMP/tmpl.json" "$TMP/inst.json" templated "$WS" "" "$SHA_J")"
 
+# The real settings template carries a hooks block. A hand-merged installed
+# file that matches it on hooks and env.BEADS_DIR after reverse substitution is
+# CURRENT even with extra keys (permissions, more env) and no install record -
+# byte comparison alone kept every real machine at "unverifiable" for weeks.
+printf '{"env":{"BEADS_DIR":"/ABSOLUTE/PATH/TO/WORKSPACE/beads/.beads"},"hooks":{"SessionStart":[{"matcher":"","hooks":[{"type":"command","command":"cd /ABSOLUTE/PATH/TO/WORKSPACE/beads && bd prime"}]}]}}\n' > "$TMP/tmpl2.json"
+printf '{"permissions":{"allow":["Bash(ls)"]},"env":{"OTHER":"x","BEADS_DIR":"%s/beads/.beads"},"hooks":{"SessionStart":[{"hooks":[{"command":"cd %s/beads && bd prime","type":"command"}],"matcher":""}]}}\n' "$WS" "$WS" > "$TMP/inst2.json"
+SHA_J2=$(_sha256 "$TMP/tmpl2.json")
+is "a hand-merged settings file whose hooks and BEADS_DIR match the template is current without a record" \
+   current "$(verify_artifact "$TMP/tmpl2.json" "$TMP/inst2.json" templated "$WS" "" "$SHA_J2")"
+printf '{"env":{"BEADS_DIR":"%s/beads/.beads"},"hooks":{"SessionStart":[{"matcher":"","hooks":[{"type":"command","command":"cd %s/beads && bd prime --old-flag"}]}]}}\n' "$WS" "$WS" > "$TMP/inst2.json"
+is "a settings file whose hooks block differs from the template is not called current" \
+   unverifiable "$(verify_artifact "$TMP/tmpl2.json" "$TMP/inst2.json" templated "$WS" "" "$SHA_J2")"
+
 # --- setup_version ----------------------------------------------------------
 mkdir -p "$TMP/repo/templates" "$TMP/ws"
 printf 'hook\n'     > "$TMP/repo/templates/beads-sync.sh"
@@ -140,7 +153,7 @@ cat > "$TMP/hb.json" <<'JSON'
 JSON
 is "a string field reads back"            laptop-a "$(read_json_field "$TMP/hb.json" machine)"
 is "a true boolean reads back as true"    true     "$(read_json_field "$TMP/hb.json" cron_installed)"
-# The bug: jq's `//` treats false as empty, so this returned "" and the fleet
+# The bug: jq's `//` treats false as empty, so this returned "" and the team
 # report printed "unknown" for every machine whose cron was NOT installed —
 # the exact machines it exists to find.
 is "a FALSE boolean reads back as false, not empty" \
@@ -175,7 +188,13 @@ printf 'hook\n'     > "$SMOKE/repo/templates/beads-sync.sh"
 printf 'rules\n'    > "$SMOKE/repo/templates/workspace-CLAUDE.md"
 printf 'settings\n' > "$SMOKE/repo/templates/workspace-settings.json"
 
-smoke_run() { HOME="$SMOKE/home" "$HERE/bd-setup-sync" "$SMOKE/repo" --no-publish "$@" 2>&1; }
+# BEADS_DIR is pinned to the throwaway repo: bd-setup-sync derives the
+# workspace from it, and an inherited real BEADS_DIR would point the manifest
+# at the REAL workspace CLAUDE.md, which --apply below would then be asked to
+# write. Only the redirected HOME (no install record) stood between this
+# suite and that file before this line existed.
+mkdir -p "$SMOKE/repo/.beads"
+smoke_run() { HOME="$SMOKE/home" BEADS_DIR="$SMOKE/repo/.beads" "$HERE/bd-setup-sync" "$SMOKE/repo" --no-publish "$@" 2>&1; }
 
 out=$(smoke_run); rc=$?
 case "$out" in
@@ -199,10 +218,10 @@ case "$out" in
     *"unbound variable"*) bad "an --apply run has no unbound variables" "$out" ;;
     *) ok "an --apply run has no unbound variables" ;;
 esac
-if [ -f "$SMOKE/home/.claude/hooks/beads-sync.sh" ]; then
+if [ -f "$SMOKE/CLAUDE.md" ]; then
     ok "--apply installs a missing exact artifact"
 else
-    bad "--apply installs a missing exact artifact" "hook was not written"
+    bad "--apply installs a missing exact artifact" "workspace CLAUDE.md was not written"
 fi
 if [ -f "$(HOME="$SMOKE/home"; state_path ws)" ] || [ -n "$(ls "$SMOKE/home/.claude"/beads-setup-state-* 2>/dev/null)" ]; then
     ok "a run records local state"
@@ -213,9 +232,9 @@ fi
 # The one --apply must never do: overwrite an installed copy that may be the
 # NEWER side. Install cleanly, then edit the installed file so it differs while
 # the record still points at this template — that is `local-edits`.
-printf 'hook, with a local fix\n' > "$SMOKE/home/.claude/hooks/beads-sync.sh"
+printf 'rules, with a local fix\n' > "$SMOKE/CLAUDE.md"
 out=$(smoke_run --apply)
-if grep -q 'local fix' "$SMOKE/home/.claude/hooks/beads-sync.sh"; then
+if grep -q 'local fix' "$SMOKE/CLAUDE.md"; then
     ok "--apply refuses to overwrite a locally-edited artifact"
 else
     bad "--apply refuses to overwrite a locally-edited artifact" \
@@ -233,7 +252,7 @@ esac
 # nothing, publishing nothing, and reporting nothing. Under `set -u` a message
 # is executable code, so an unreachable branch is an unexploded one.
 smoke_run --apply >/dev/null 2>&1          # back to a clean, recorded install
-printf 'hook, revised upstream\n' > "$SMOKE/repo/templates/beads-sync.sh"
+printf 'rules, revised upstream\n' > "$SMOKE/repo/templates/workspace-CLAUDE.md"
 out=$(smoke_run); rc=$?
 case "$out" in
     *"unbound variable"*|*"command not found"*)
@@ -249,10 +268,10 @@ is "a stale machine exits 3" 3 "$rc"
 # And --apply resolves it, which is the difference between STALE and the two
 # verdicts --apply refuses.
 smoke_run --apply >/dev/null 2>&1
-if grep -q 'revised upstream' "$SMOKE/home/.claude/hooks/beads-sync.sh"; then
+if grep -q 'revised upstream' "$SMOKE/CLAUDE.md"; then
     ok "--apply updates a stale artifact"
 else
-    bad "--apply updates a stale artifact" "the hook was not updated"
+    bad "--apply updates a stale artifact" "the workspace CLAUDE.md was not updated"
 fi
 
 # --- machine_id -------------------------------------------------------------

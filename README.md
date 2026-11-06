@@ -6,6 +6,9 @@ Beads gives you the tracker. This repo is everything we had to build *around* it
 
 It is a **GitHub template**. Click *Use this template*, work through [SETUP.md](SETUP.md), and you have a working shared tracker.
 
+**→ [QUICKSTART.md](QUICKSTART.md)** — one page from zero to `bd ready` with agents wired.
+**→ [SETUP.md](SETUP.md)** — the long form: install, wiring, agent rules, daily workflow, health, security, runbooks.
+
 ---
 
 ## Why this exists
@@ -32,17 +35,20 @@ The through-line: **an instrument that cannot observe must never report as thoug
 
 | Path | Purpose |
 |---|---|
-| [SETUP.md](SETUP.md) | The setup and operations guide. Install, wiring, agent rules, daily workflow, health, security, troubleshooting. |
+| [QUICKSTART.md](QUICKSTART.md) | One page: install, clone, wire, verify. Start here. |
+| [SETUP.md](SETUP.md) | The setup and operations guide, with the runbooks. The one document to keep current. |
 | `templates/workspace-CLAUDE.md` | Agent rules, copied to your workspace root as `CLAUDE.md`. **Edit the rules here**, not only in your local copy. |
 | `templates/workspace-settings.json` | Workspace `.claude/settings.json`: `BEADS_DIR` plus the session hooks. |
-| `templates/beads-sync.sh` | The session-hook sync script, copied to `~/.claude/hooks/`. Commit, pull, reconcile, sweep, push. |
-| `scripts/bd-health` | Reports tracker automation that has quietly died. Report-only, always exits 0. |
-| `scripts/bd-dup-check` | Reports likely-duplicate beads. Report-only. |
+| `templates/beads-sync.sh` | The session-hook sync script, referenced in place by the settings (it relocates itself to a temp copy at start). |
+| `scripts/bd-health` | Reports tracker automation that has quietly died. Report-only. |
+| `scripts/bd-dup-check` | Reports likely-duplicate beads. Report-only. Run hourly by `bd-hygiene`, no longer at session start. |
+| `scripts/bd-dolt-server` | Shared-server kit: run `dolt sql-server` as a supervised launchd agent, optionally network-bound, and point bd at it. |
+| `scripts/bd-hygiene` | Hourly hygiene from one host: duplicates, stale beads, oldest in_progress/in_review. Findings go to a log file. |
+| `templates/PRIME.md` | Copied to `.beads/PRIME.md`: what `bd prime` injects at session start, the team's rules in ~2 KB instead of bd's 111 KB default. |
 | `scripts/bd-sweep-merged` | Closes beads whose delivering PRs have all merged. Dry-run by default. |
 | `scripts/bd-reconcile-fork` | Heals an export fork: imports JSONL-only beads into the local Dolt store. Dry-run by default. |
 | `scripts/bd-setup-sync` | Is *this* machine running the current setup? Installs what is stale; refuses to overwrite what may be newer. |
 | `scripts/bd-setup-report` | Which machines are behind, not-applied, or silent. |
-| `scripts/bd-review-gate` | Has a bot review looked at this PR's **current** head? Three-valued, never a bare boolean. |
 | `scripts/test-bd-*` | Offline test suites — no network, no token, no database. They pin every judgement call above. |
 | `.github/workflows/nightly-review-sweep.yml` | Nightly sweep with GitHub-side PR discovery. |
 | `.agents/`, `.codex/`, `.claude/` | Agent integration for Claude Code, Codex, and the `beads` skill. |
@@ -68,7 +74,6 @@ scripts/test-bd-health                # offline
 scripts/test-bd-sweep-merged          # offline
 scripts/test-bd-sweep-merged-e2e      # offline: fake bd + fake gh, ~30 scenarios
 scripts/test-bd-setup-sync            # offline
-scripts/test-bd-review-gate           # offline
 ```
 
 All six suites run in a few seconds with no network, no GitHub token and no bd database.
@@ -82,7 +87,7 @@ without them it degrades to a loud no-op.
 
 ## Two rules worth knowing before you touch anything
 
-1. **Cite the bead id in every PR** — in the title, the branch name, or a `Bead: <id>` line in the body. That citation is the only thing that lets automation close the bead when the PR merges. A mention in body prose does not count, deliberately.
+1. **Cite the bead id in every PR** — on a `Bead: <id>` line in the body (`Beads: <a>, <b>` for several). That citation is the only thing that lets automation close the bead when the PR merges. A mention in body prose does not count. The title and the branch name are fallbacks: a `Bead:` line, when present, is the whole list; without one the title's ids count; with neither, only the id the branch name starts with.
 2. **Don't hand-run `bd dolt push` / `bd dolt pull`** if you have the session hooks installed. Concurrent manual syncs forked one tracker into two divergent lineages for five days.
 
 ---
@@ -100,10 +105,9 @@ Silent when clean. It is the thing that tells you when the nightly sweep has sto
 ## Notes and caveats
 
 - **macOS-first.** The scripts run on bash 3.2 and BSD `stat`/`date`, and fall back to the GNU spellings, so they also work on a Linux CI runner. The `--install-cron` path uses launchd on macOS and crontab elsewhere.
-- **`bd-review-gate` needs configuring** for whatever review bot your org uses — see the `configure me` block at the top of the script. Out of the box it looks for a bot that upserts one comment per PR with a `Reviewed commit <sha>` footer.
 - **The `bd` version pin in the workflow is an example.** Pick a version, pin it everywhere, and bump the laptops and CI together — the Dolt schema is tied to it.
 - **Comments are long on purpose.** Each one records the incident that motivated the code, because the next person to "simplify" a check needs to know what it was buying. If you fork this, keep them.
 
 ---
 
-Built at [Ankra](https://ankra.io) and shared as-is under the [MIT license](LICENSE). Upstream beads: https://github.com/gastownhall/beads
+Last refreshed from the production setup on 2026-11-06. Built at [Ankra](https://ankra.io) and shared as-is under the [MIT license](LICENSE). Upstream beads: https://github.com/gastownhall/beads

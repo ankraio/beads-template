@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# Refresh .beads/issues.jsonl from the Dolt store, once.
+#
+# The sync hook calls this inside its lock, directly before it commits the file.
+# On a machine it is the only writer of the file; the nightly sweep writes its
+# own copy in CI.
+#
+# Why this replaced bd's `export.auto`. With that setting every
+# non-read-only bd command ran a full export in its post-run step once the 60 s
+# interval had passed, and in bd 1.1.0 (cmd/bd/export_auto.go) that export:
+#   - scans the whole tracker three times, then bulk-loads labels, dependencies,
+#     comments and two sets of counts in batches of 200 ids;
+#   - has no single-flight, because export-state.json is only written at the
+#     end, so every process finishing a command in that window runs its own copy;
+#   - does not prime the throttle when it fails, so the next eligible command on
+#     the machine retries the whole thing, and on a loaded machine the 10 s read
+#     timeout on bd's connection pool makes it fail.
+# Measured on 2026-11-04: a write took 0.17 s without an export and 9.97 s with
+# one on a healthy machine; under memory pressure a `bd create` returned 11
+# minutes after its row had landed.
+#
+# Writing to a temporary file first also makes the guard cheaper. bd's auto-export
+# refused to overwrite records the database does not have, because they can be the
+# only local copy (see scripts/bd-reconcile-fork), and it needed two more full
+# scans to find out. The fresh export already holds every id the database would
+# export, so one comparison answers both of its guards.
+#
+# Usage: bd-export-jsonl [--jsonl <path>]
+#   --jsonl  the file to refresh, default <bd where>/issues.jsonl
+#
+# Exit codes:
+#   0  the file now matches the database
+#   1  could not tell: bd or jq failed. The file is untouched.
+#   3  refused: overwriting would lose records. The file is untouched.
+set -u
+
+jsonl=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --jsonl) jsonl=${2:-}; shift 2 || exit 1 ;;
+        *) printf 'bd-export-jsonl: unknown argument: %s\n' "$1" >&2; exit 1 ;;
+    esac
+done
+
+SAMPLES=${BD_EXPORT_SAMPLES:-5}
+
+fail() { printf 'bd-export-jsonl: %s\n' "$*" >&2; exit 1; }
+refuse() { printf 'bd-export-jsonl: refused: %s\n' "$*" >&2; exit 3; }
+
+for tool in bd jq; do
+    command -v "$tool" >/dev/null 2>&1 || fail "$tool not found"
+done
+
+if [ -z "$jsonl" ]; then
+    beads_db=$(bd where 2>/dev/null | head -1 | tr -d '[:space:]')
+    if [ -z "$beads_db" ] || [ ! -e "$beads_db" ]; then
+        fail "BEADS_DIR does not resolve to a database (SETUP.md step 4)"
+    fi
+    jsonl="$beads_db/issues.jsonl"
+fi
+
+# The temporary name is the one the sync hook already sweeps away after a day,
+# so a run killed by the hook's timeout leaves nothing behind for long.
+tmp=$(mktemp "$(dirname "$jsonl")/.~issues.jsonl.XXXXXX") || fail "cannot create a temporary file next to $jsonl"
+trap 'rm -f "$tmp"' EXIT
+
+export_err=$(bd export -o "$tmp" 2>&1 >/dev/null)
+export_rc=$?
+if [ "$export_rc" -ne 0 ]; then
+    fail "bd export failed (rc=$export_rc): $(printf '%s' "$export_err" | tail -1)"
+fi
+
+# jq failing is an unknown answer, never an empty one: treating an unreadable
+# file as "has no records" is how a truncated export would replace the tracker's
+# only readable copy.
+new_ids=$(jq -r 'select(._type == "issue") | .id' "$tmp" 2>/dev/null) || fail "the new export is not readable JSONL"
+new_ids=$(printf '%s\n' "$new_ids" | grep . | sort -u)
+
+if [ -s "$jsonl" ]; then
+    old_records=$(jq -r '[._type // "", .id // ""] | @tsv' "$jsonl" 2>/dev/null) || fail "$jsonl is not readable JSONL"
+
+    n_other=$(printf '%s\n' "$old_records" | awk -F'\t' 'NF && $1 != "issue" { n++ } END { print n + 0 }')
+    if [ "$n_other" -gt 0 ]; then
+        refuse "$jsonl holds $n_other record(s) that are not issues, and this export would drop them"
+    fi
+
+    old_ids=$(printf '%s\n' "$old_records" | cut -f2 | grep . | sort -u)
+    if [ -z "$new_ids" ]; then
+        refuse "the database would export 0 issues, but $jsonl holds $(printf '%s\n' "$old_ids" | grep -c .)"
+    fi
+
+    jsonl_only=$(comm -23 <(printf '%s\n' "$old_ids") <(printf '%s\n' "$new_ids"))
+    if [ -n "$jsonl_only" ]; then
+        n_only=$(printf '%s\n' "$jsonl_only" | grep -c .)
+        sample=$(printf '%s\n' "$jsonl_only" | head -"$SAMPLES" | tr '\n' ' ')
+        refuse "$n_only issue(s) in $jsonl are absent from the database (e.g. ${sample% }); run scripts/bd-reconcile-fork --apply"
+    fi
+fi
+
+chmod 644 "$tmp" 2>/dev/null
+mv -f "$tmp" "$jsonl" || fail "cannot replace $jsonl"
+trap - EXIT
+exit 0

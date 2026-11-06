@@ -20,10 +20,10 @@
 #                         Dolt schema is tied to the version, so a stray
 #                         `brew upgrade` is a data hazard
 #   3. sync failures    — recent WARNING lines in the sync log
-#   4. hook drift       — the installed ~/.claude/hooks/beads-sync.sh is not
-#                         the copy this repo ships; nothing versions the
-#                         installed file, so an old one is invisible
-#                         (2026-08-19)
+#   4. hook drift       — only for machines still running a COPY of the sync
+#                         hook under ~/.claude/hooks: it is not the file this
+#                         repo ships. Settings that reference the template in
+#                         place (2026-09-01) pass this check by construction.
 #   5. sync liveness    — no successful sync on this machine for days; the
 #                         hook is fail-soft, so "never ran" and "ran fine"
 #                         used to look identical from the outside
@@ -40,6 +40,20 @@
 #                         to notice when they stop being. Check 4
 #                         covers only the sync hook; a machine could run last
 #                         month's agent rules with every other check green.
+#  10. checkout         — the shared tracker checkout is not converging on
+#                         origin/main: hand-written commits the sync hook will
+#                         not reset over, held for a day (named, with the
+#                         runbook), or simply far behind. The Dolt side syncs
+#                         regardless, so this is the check that notices a
+#                         machine running month-old tracker scripts
+#                         (one sat 25 days and 429 commits behind, all green)
+#  11. open backlog     — the open pile grows faster than it drains, or too
+#                         much of it has gone untouched. Beads that ever get
+#                         done are done within about a week, so an old untouched bead is either
+#                         debt nobody picks up or dead weight, and nothing
+#                         else tells the two apart. Reading the oldest ones
+#                         against origin/main and closing, deferring or
+#                         stamping them is the drain for this.
 #
 # Report-only. Never closes, never mutates, always exits 0 — like
 # bd-dup-check, this runs from SessionStart and must never block a session.
@@ -75,10 +89,29 @@ REVIEW_BACKLOG_MAX=${BD_HEALTH_REVIEW_MAX:-150}
 STALE_SYNC_DAYS=${BD_HEALTH_SYNC_DAYS:-7}
 # Sample ids to quote per side of an export fork.
 FORK_SAMPLES=${BD_HEALTH_FORK_SAMPLES:-4}
-# How long a Dolt-only fork may be the auto-export simply lagging the newest
-# write. bd re-exports on every mutating command, so an untouched jsonl older
-# than this while the database has ids it lacks is a frozen export, not lag.
-FORK_EXPORT_GRACE=${BD_HEALTH_FORK_GRACE:-3600}
+# How long a Dolt-only fork may be the export simply lagging the newest write.
+# The sync hook rewrites the file once per full sync, which is once per session
+# start, and writes between two of those are normal: a session can run for hours
+#. So only a jsonl untouched for a day while the database has ids
+# it lacks is a frozen export. A failed export says so sooner, in the sync log and
+# on the session's stdout.
+FORK_EXPORT_GRACE=${BD_HEALTH_FORK_GRACE:-86400}
+# Commits the shared tracker checkout may trail origin/main by before it counts
+# as not converging. Every full sync converges it, so the only lag a healthy
+# machine shows is what other machines pushed since its last session: about a
+# week of team traffic before this fires. Same default as checkout-staleness.
+CHECKOUT_BEHIND_MAX=${BD_HEALTH_CHECKOUT_BEHIND:-100}
+# Hours a commit the sync hook will not reset over may block its convergence
+# before it is reported. A day covers a PR that lands the change the same day.
+CHECKOUT_BLOCK_HOURS=${BD_HEALTH_CHECKOUT_BLOCK_HOURS:-24}
+
+# Open-backlog growth over 7 days that means filing outruns the drain, and the
+# share of open beads untouched for OPEN_STALE_DAYS that means the pile has
+# stopped being a work queue. History is one line per day in OPEN_HISTORY.
+OPEN_GROWTH_MAX=${BD_HEALTH_OPEN_GROWTH_MAX:-150}
+OPEN_STALE_DAYS=${BD_HEALTH_OPEN_STALE_DAYS:-30}
+OPEN_STALE_SHARE_MAX=${BD_HEALTH_OPEN_STALE_SHARE_MAX:-25}
+OPEN_HISTORY=${BD_HEALTH_OPEN_HISTORY:-$HOME/.claude/logs/beads-open-history.tsv}
 
 findings=()   # human lines
 jfind=()      # json objects
@@ -174,6 +207,170 @@ fork_verdict() {
     else
         echo "self-healing"
     fi
+}
+
+# Answers "which Dolt engine is this machine's tracker running?".
+#
+# Embedded mode takes an EXCLUSIVE lock on the whole database for the lifetime
+# of every bd invocation, so a machine running many agent sessions serialises
+# all of them on one file lock. On 2026-08-30 that produced 14 bd processes
+# convoying on .dolt/noms/LOCK with the oldest waiting 1h33m - and among the
+# blocked were a `bd close` and a `bd comment`, which is how finished work
+# stays open: the write outlives its caller's timeout, so the agent never
+# learns whether it landed.
+#
+# It is worth a standing check rather than a one-time migration note because
+# nothing else can see it, and bd doctor - which would say so - REFUSES TO RUN
+# in embedded mode, so the one tool that would report the condition is the one
+# the condition disables.
+#
+# THE VERDICT IS TAKEN FROM DISK, NOT FROM THE DECLARED MODE. `dolt_mode` in
+# .beads/metadata.json looks like the obvious source and is the wrong one:
+# that file is TRACKED IN GIT (only the database directories are ignored), so
+# it is a shared declaration of intent, not a per-machine fact. The moment one
+# machine commits "server", every other machine's checkout says "server" too -
+# while its data is still sitting in .beads/embeddeddolt and it has not
+# migrated at all. A check reading the declaration would go silent on exactly
+# the machines that still need the work.
+#
+# The database directory is the per-machine fact: it is gitignored, so it can
+# only ever describe the machine it is on, and it is also what bd itself opens.
+#   0 = embedded data present (this machine has NOT migrated; report it)
+#   1 = server layout         (migrated; nothing to say)
+#   2 = unknown               (neither directory present - a fresh or broken
+#                              checkout; "could not tell" is not "fine")
+dolt_engine_verdict() {
+    _bd="$1"
+    [ -d "$_bd/embeddeddolt" ] && return 0
+    [ -d "$_bd/dolt" ] && return 1
+    return 2
+}
+
+# What .beads/metadata.json DECLARES, which is only used to sharpen the
+# message: a machine whose declaration already says "server" while embedded
+# data is still on disk has pulled someone else's migration without doing its
+# own, and that mismatch is worth naming because bd will try to open a data
+# directory that is not there.
+dolt_declared_mode() {
+    _meta="$1"
+    [ -f "$_meta" ] || { echo unknown; return; }
+    _mode=$(jq -r '.dolt_mode // empty' "$_meta" 2>/dev/null)
+    case "$_mode" in
+        embedded|server) echo "$_mode" ;;
+        *)               echo unknown ;;
+    esac
+}
+
+# checkout_verdict <repo> <hook> <now> <max_behind> <block_hours>
+#
+# Answers "is the shared tracker checkout converging?" - whether the sync
+# hook's git convergence is keeping <repo>'s main on origin/main. Sets
+# CV_VERDICT and the facts a message quotes, instead of printing, so the
+# caller keeps them:
+#
+#   ok        converging, or behind by less than <max_behind> with nothing
+#             blocking for <block_hours> yet (the next full sync catches up)
+#   blocked   main carries commits the hook will not reset over (CV_BLOCKING,
+#             the hook's own blocking_commits list; CV_NAMED is its one-line
+#             form from the hook's name_commits), main has diverged from
+#             origin so they cannot simply be pushed, and the oldest of them
+#             is at least <block_hours> old (CV_AGE_H)
+#   behind    more than <max_behind> commits behind origin/main (CV_BEHIND),
+#             whatever the reason - CV_BLOCKING and CV_DIRTY say what is
+#             holding it when they know
+#   off-main  HEAD is not main (CV_BRANCH; empty = detached): the hook only
+#             exports and converges on main, so nothing publishes
+#   unknown   no origin/main ref to compare against - "could not tell"
+#
+# Local refs only, no fetch: the hook fetches on every rejected push and the
+# worktrees fetch constantly, so origin/main is fresh on any machine doing work.
+#
+# The blocking list comes from sourcing the hook itself (<hook>, normally
+# templates/beads-sync.sh next to this script), so "what does the hook refuse
+# to reset over?" has one answer, not a second copy here that drifts from it.
+#
+# Why this is a check at all: three hand-written commits on the
+# shared checkout's main made the hook log "not resetting" 73 times over 25
+# days. The Dolt side kept syncing, so every other check here stayed green,
+# while the checkout fell 429 commits behind - month-old tracker scripts, an
+# installed hook that differed from origin's, an export and a heartbeat that
+# never published. The log line was the only signal, and nobody reads the log.
+checkout_verdict() {
+    local repo=$1 hook=$2 now=$3 max_behind=$4 block_hours=$5 sha ct oldest=0
+    CV_VERDICT=unknown CV_BRANCH="" CV_BEHIND=0 CV_BLOCKING="" CV_NAMED="" CV_AGE_H=0 CV_OLDEST=0 CV_DIRTY=""
+    git -C "$repo" rev-parse -q --verify refs/remotes/origin/main >/dev/null 2>&1 || return 0
+    CV_BRANCH=$(git -C "$repo" symbolic-ref -q --short HEAD 2>/dev/null) || CV_BRANCH=""
+    if [ "$CV_BRANCH" != main ]; then
+        CV_VERDICT=off-main
+        return 0
+    fi
+    CV_BEHIND=$(git -C "$repo" rev-list --count HEAD..origin/main 2>/dev/null) || CV_BEHIND=0
+    case "$CV_BEHIND" in ''|*[!0-9]*) CV_BEHIND=0 ;; esac
+    # Absolute before the subshell below cds into the repo.
+    case "$hook" in /*) ;; *) hook="$PWD/$hook" ;; esac
+    if [ -r "$hook" ]; then
+        # A subshell: the hook is POSIX sh written for its own process, so it
+        # gets no -u/pipefail from here (pipefail would read a `grep -q` that
+        # stopped reading early as a failure) and no positional arguments.
+        CV_BLOCKING=$(cd "$repo" && set +u +o pipefail && set -- &&
+            BEADS_SYNC_LIB=1 . "$hook" >/dev/null 2>&1 && blocking_commits origin/main 2>/dev/null)
+        [ -n "$CV_BLOCKING" ] && CV_NAMED=$(printf '%s\n' "$CV_BLOCKING" | (set +u +o pipefail && set -- &&
+            BEADS_SYNC_LIB=1 . "$hook" >/dev/null 2>&1 && name_commits))
+    fi
+    CV_DIRTY=$(git -C "$repo" diff --name-only -- . \
+        ':(exclude).beads/issues.jsonl' ':(exclude).beads/interactions.jsonl' \
+        ':(exclude).beads-setup/heartbeats' 2>/dev/null | tr '\n' ' ')
+    CV_DIRTY=${CV_DIRTY% }
+    # Blocking only matters once main has diverged: until origin moves, the
+    # hook's push publishes a hand commit as it always did.
+    if [ -n "$CV_BLOCKING" ] && [ "$CV_BEHIND" -gt 0 ]; then
+        while read -r sha _; do
+            [ -n "$sha" ] || continue
+            ct=$(git -C "$repo" log -1 --format=%ct "$sha" 2>/dev/null) || continue
+            case "$ct" in ''|*[!0-9]*) continue ;; esac
+            if [ "$oldest" -eq 0 ] || [ "$ct" -lt "$oldest" ]; then oldest=$ct; fi
+        done <<<"$CV_BLOCKING"
+        CV_OLDEST=$oldest
+        [ "$oldest" -gt 0 ] && CV_AGE_H=$(( (now - oldest) / 3600 ))
+        if [ "$CV_AGE_H" -ge "$block_hours" ]; then
+            CV_VERDICT=blocked
+            return 0
+        fi
+    fi
+    if [ "$CV_BEHIND" -gt "$max_behind" ]; then
+        CV_VERDICT=behind
+        return 0
+    fi
+    CV_VERDICT=ok
+}
+
+# open_backlog_baseline <history.tsv> <now-epoch>
+# Prints "date<TAB>count" for the NEWEST history line between 14 and 7 days
+# before now, or nothing. Newest in that window so a missing day widens the
+# span a little instead of comparing against a month-old count; nothing at all
+# when the history is younger than a week, so a fresh machine stays quiet
+# instead of reporting growth from zero.
+open_backlog_baseline() {
+    local hist=$1 at=$2 hi lo
+    [ -f "$hist" ] || return 0
+    hi=$(date -u -r $(( at - 7 * 86400 )) +%Y-%m-%d 2>/dev/null \
+        || date -u -d "@$(( at - 7 * 86400 ))" +%Y-%m-%d 2>/dev/null) || return 0
+    lo=$(date -u -r $(( at - 14 * 86400 )) +%Y-%m-%d 2>/dev/null \
+        || date -u -d "@$(( at - 14 * 86400 ))" +%Y-%m-%d 2>/dev/null) || return 0
+    awk -F'\t' -v hi="$hi" -v lo="$lo" \
+        '$1 <= hi && $1 >= lo && $2 ~ /^[0-9]+$/ { if ($1 > d) { d = $1; n = $2 } }
+         END { if (d != "") print d "\t" n }' "$hist"
+}
+
+# What to say about git_remote_history_verdict's answer (templates/beads-sync.sh),
+# nothing when there is nothing to say. Check 12.
+history_finding() {
+    case "$1" in
+        old-dolt) printf '%s' "This machine's dolt is older than 2.5.0, so it cannot keep the tracker's history on the git remote: about every 32nd publish re-uploads the whole store and fails or takes over 15 minutes. Run: brew upgrade dolt. See SETUP.md \"Dolt's history on the git remote\"." ;;
+        unset) printf '%s' "The git remote history settings are not in place on this machine, so publishes keep re-uploading the whole store. The sync hook writes them on its next run; if this is still reported after that, see SETUP.md \"Dolt's history on the git remote\"." ;;
+        stale-server) printf '%s' "The running dolt server started before the git remote history settings were written, so it still cuts history. The sync hook restarts it once no remote work is running; if this is still reported after that, run scripts/bd-dolt-server restart." ;;
+    esac
+    return 0
 }
 
 # Sourced with BD_HEALTH_LIB=1, the script stops here: the helpers above are
@@ -284,7 +481,14 @@ hook_installed="${BD_HEALTH_SYNC_HOOK:-$HOME/.claude/hooks/beads-sync.sh}"
 hook_template="$beads_repo/templates/beads-sync.sh"
 if [ -n "$beads_repo" ] && [ -f "$hook_template" ]; then
     reinstall="cp '$hook_template' '$hook_installed' && chmod +x '$hook_installed'"
-    if [ ! -f "$hook_installed" ]; then
+    ws_settings="$(dirname "$beads_repo")/.claude/settings.json"
+    if grep -q 'beads/templates/beads-sync.sh' "$ws_settings" 2>/dev/null; then
+        # Referenced in place (SETUP.md step 8): the session hooks
+        # run the template itself, which relocates to a temp copy at start, so
+        # there is no installed copy that can drift. A leftover copy under
+        # ~/.claude/hooks is inert and not a finding.
+        hook_current=1
+    elif [ ! -f "$hook_installed" ]; then
         add "No beads sync hook installed at $hook_installed — this machine's bead changes never reach the team, and its Dolt lineage drifts from everyone else's. Install it: $reinstall (then wire SessionStart/SessionEnd per SETUP.md step 8)." error hook
     elif [ ! -x "$hook_installed" ]; then
         add "The beads sync hook at $hook_installed is not executable, so the session hooks silently do nothing. Fix: chmod +x '$hook_installed'." error hook
@@ -308,19 +512,33 @@ if [ -f "$synclog" ]; then
         # tracker's lines, or a second workspace's failures read as ours
         # (2026-08-24: the other workspace's first bd-health run reported the first workspace's pushes).
         if [ -n "$beads_repo" ]; then
-            recent_warn=$(awk -v cutoff="$cutoff_day" -v repo=" in $beads_repo:" \
-                '/FAILED \(rc=/ && index($0, repo) && substr($0, 2, 10) >= cutoff { n++ } END { print n+0 }' \
+            # Count RUNS that ended without OK (one 'sync FAILED' line per run,
+            # written by the hook since 2026-09-01), not the per-step 'FAILED
+            # (rc=' lines: those include retries the same run then recovered
+            # from, and counting them reported 79 failures in a window where
+            # 158 runs ended OK and about 13 did not.
+            recent_warn=$(awk -v cutoff="$cutoff_day" -v repo=" in $beads_repo" \
+                '/\] sync FAILED \(/ && index($0, repo) && substr($0, 2, 10) >= cutoff { n++ } END { print n+0 }' \
                 "$synclog" 2>/dev/null)
         else
             recent_warn=$(awk -v cutoff="$cutoff_day" \
-                '/FAILED \(rc=/ && substr($0, 2, 10) >= cutoff { n++ } END { print n+0 }' \
+                '/\] sync FAILED \(/ && substr($0, 2, 10) >= cutoff { n++ } END { print n+0 }' \
                 "$synclog" 2>/dev/null)
         fi
         if [ "${recent_warn:-0}" -gt 0 ]; then
-            add "Dolt sync reported failures in the last 2 days ($recent_warn in $synclog). A swallowed pull conflict forked this tracker for 5 days in July 2026 — read the log before trusting the tracker state." error sync
+            add "Dolt sync: $recent_warn run(s) ended without 'sync OK' in the last 2 days ($synclog). Step-level FAILED lines in the same log are retries and recoveries, not this count. A swallowed pull conflict forked this tracker for 5 days in July 2026 — read the log before trusting the tracker state." error sync
         fi
     fi
 
+fi
+
+# Connectivity outages still make duplicate checks stale, but do not imply a
+# lineage conflict or call for an operator merge. Do not count them as FAILED.
+if [ -n "$beads_repo" ]; then
+    offline_marker="$HOME/.claude/logs/beads-tracker-offline-$(basename "$(dirname "$beads_repo")")"
+    if [ -f "$offline_marker" ]; then
+        add "Dolt sync is offline on this machine; local duplicate checks are stale until the next clean sync. Restore connectivity and let the session hook retry; inspect $synclog if it persists." warn offline
+    fi
 fi
 
 # Sync liveness. The hook only ever spoke up on failure, so a hook that had
@@ -401,10 +619,10 @@ if [ -n "$beads_db" ] && [ -f "$beads_db/issues.jsonl" ] && command -v jq >/dev/
                     add "Tracker fork that survived a clean reconcile — $detail. scripts/bd-reconcile-fork finished successfully at $ts, after this jsonl was last written, and the two sides still disagree: the union merge is not covering this fork, so it will not heal on the next sync either. Read $synclog. $repair" error fork
                     ;;
                 export-lag)
-                    add "Tracker fork, self-healing — no action, and not worth a bead: $detail. There is no JSONL-only side, so nothing blocks the auto-export; bd re-exports on the next mutating command and the sync hook commits it. Escalate only if it is still reported an hour from now, which would mean the export is frozen rather than trailing." warn fork
+                    add "Tracker fork, self-healing — no action, and not worth a bead: $detail. There is no JSONL-only side, so nothing blocks the export; the sync hook rewrites and commits it on the next full sync, at the next session start. Escalate only if it is still reported a day from now, which would mean the export is frozen rather than trailing." warn fork
                     ;;
                 export-frozen)
-                    add "Tracker fork: the export is frozen, not merely trailing — $detail. Nothing is blocking it from the jsonl side, yet .beads/issues.jsonl has not been rewritten in over $((FORK_EXPORT_GRACE / 60))m while the database has issues it lacks, so the committed jsonl and the GitHub issue view are stale. Check that bd can write it (permissions, disk) and read $synclog." error fork
+                    add "Tracker fork: the export is frozen, not merely trailing — $detail. Nothing is blocking it from the jsonl side, yet .beads/issues.jsonl has not been rewritten in over $((FORK_EXPORT_GRACE / 3600))h while the database has issues it lacks, so the committed jsonl and the GitHub issue view are stale. Look for 'jsonl export (rc=' lines in $synclog, and check that the installed sync hook is current and that scripts/bd-export-jsonl can write the file (permissions, disk)." error fork
                     ;;
                 *)
                     add "Tracker fork: .beads/issues.jsonl and the local Dolt store hold different issues — $detail. Nothing will repair this automatically: the installed sync hook is not the copy templates/ ships, so it does not run scripts/bd-reconcile-fork (see the hook finding above, which has the reinstall command). $repair" error fork
@@ -428,6 +646,38 @@ if [ -n "$beads_repo" ]; then
             add "$stale_n in_review beads have been untouched for over $STALE_REVIEW_DAYS days — their PRs likely merged without delivery-citing the bead id. Run scripts/bd-sweep-merged --search-citing." warn backlog
         fi
     fi
+fi
+
+# --- 11. open backlog: growth and stale share --------------------------------
+# One count query (sub-second warm) plus a local one-line-per-day history, so
+# growth needs no second tracker read. The history is this machine's view; it
+# is a trend, not an audit, and a missing day just widens the window.
+if [ -n "$beads_repo" ]; then
+    counts=$(bd sql --json "select count(*) n, coalesce(sum(updated_at < now() - interval $OPEN_STALE_DAYS day), 0) s from issues where status='open'" 2>/dev/null || true)
+    open_n=$(printf '%s' "$counts" | jq -r '.[0].n // empty' 2>/dev/null || true)
+    stale_open=$(printf '%s' "$counts" | jq -r '.[0].s // empty' 2>/dev/null || true)
+    case "$open_n$stale_open" in
+        ''|*[!0-9]*) ;;  # unreadable: skip, never a finding about nothing
+        *)
+            today=$(date -u +%Y-%m-%d)
+            mkdir -p "$(dirname "$OPEN_HISTORY")" 2>/dev/null || true
+            if ! grep -q "^$today	" "$OPEN_HISTORY" 2>/dev/null; then
+                printf '%s\t%s\n' "$today" "$open_n" >> "$OPEN_HISTORY" 2>/dev/null || true
+            fi
+            base=$(open_backlog_baseline "$OPEN_HISTORY" "$now")
+            share=$(( open_n > 0 ? stale_open * 100 / open_n : 0 ))
+            if [ -n "$base" ]; then
+                base_d=${base%%	*}; base_n=${base##*	}
+                grew=$(( open_n - base_n ))
+                if [ "$grew" -gt "$OPEN_GROWTH_MAX" ]; then
+                    add "Open backlog grew by $grew beads since $base_d ($base_n -> $open_n; soft cap $OPEN_GROWTH_MAX a week): filing is outrunning the drain. $share% of open beads are untouched for $OPEN_STALE_DAYS+ days." warn open-backlog
+                fi
+            fi
+            if [ "$share" -gt "$OPEN_STALE_SHARE_MAX" ]; then
+                add "$stale_open of $open_n open beads ($share%, soft cap $OPEN_STALE_SHARE_MAX%) are untouched for $OPEN_STALE_DAYS+ days: debt nobody picks up and dead weight look the same until someone checks. Read the oldest against origin/main, then close, defer or stamp them." warn open-backlog
+            fi
+            ;;
+    esac
 fi
 
 # --- 8. setup distribution: the rest of what we copy out -------------------
@@ -497,6 +747,75 @@ SETUP_EOF
             fi
         fi
     fi
+fi
+
+# --- 9. Dolt engine: embedded is single-writer -----------------------------
+# Only reported when we know where the database is; without that, silence
+# here is "we did not look", and check 1 has already said so.
+if [ -n "$beads_db" ] && [ -e "$beads_db" ]; then
+    dolt_engine_verdict "$beads_db"
+    engine_rc=$?
+    declared=$(dolt_declared_mode "$beads_db/metadata.json")
+    case "$engine_rc" in
+        0)  mismatch=""
+            [ "$declared" = server ] && mismatch=" NOTE: .beads/metadata.json already declares \"server\" — that declaration is tracked in git, so this machine pulled another machine's migration without doing its own. bd will try to open .beads/dolt, which is not there; migrate now or set it back to \"embedded\" until you do."
+            add "This machine has NOT migrated off embedded Dolt — .beads/embeddeddolt still holds the database. Embedded is single-writer: every bd invocation takes an exclusive lock on the whole database, so concurrent agent sessions serialise on it and one wedged holder blocks all of them (2026-08-30: 14 bd processes convoying, oldest waiting 1h33m, a bd close and a bd comment among them — that is how finished work stays open). bd doctor and bd sql do not run in this mode either. Migrate with no bd running: 'mv .beads/embeddeddolt .beads/dolt', set \"dolt_mode\": \"server\" in .beads/metadata.json, 'bd dolt start' — the embedded directory is already a normal Dolt database in the layout the server expects, so no re-fetch from the remote is needed (procedure and verification: SETUP.md 'Dolt engine').$mismatch" warn dolt-mode ;;
+        2)  add "Cannot tell which Dolt engine this machine runs — neither $beads_db/embeddeddolt nor $beads_db/dolt exists. Embedded mode is single-writer and deadlocks concurrent agent sessions, so an unreadable answer here is not a clean one: check the database location by hand ('bd where', 'bd dolt status') before trusting the tracker (see SETUP.md 'Dolt engine')." warn dolt-mode ;;
+    esac
+fi
+
+# --- 12. Dolt's history on the git remote -----------------------------------
+# A machine without these settings still works, it just re-uploads the whole
+# store every so often, and that reads as a slow link or a flaky sync rather than
+# as a setting nobody picked up. Runs before the hook in the same session start,
+# so a machine that is about to pick them up can report once.
+if [ -n "$beads_db" ] && [ -d "$beads_db/dolt" ] && command -v dolt >/dev/null 2>&1; then
+    hist_hook="$(dirname "$(cd "$(dirname "$0")" && pwd)")/templates/beads-sync.sh"
+    for hist_db in "$beads_db"/dolt/*/; do
+        [ -d "$hist_db/.dolt" ] || continue
+        hist_v=$(set +u +o pipefail && set -- && BEADS_SYNC_LIB=1 . "$hist_hook" >/dev/null 2>&1 &&
+            git_remote_history_verdict "$hist_db" "$beads_db/dolt-server.pid" 2>/dev/null)
+        hist_msg=$(history_finding "$hist_v")
+        [ -z "$hist_msg" ] || add "$hist_msg" warn dolt-history
+    done
+fi
+
+# --- 10. shared checkout convergence ---------------------------------------
+# See checkout_verdict. Asked of the checkout `bd where` names (the tracker this
+# machine runs), using the hook that ships next to this script.
+if [ -n "$beads_repo" ] && [ -d "$beads_repo/.git" ]; then
+    cv_hook="$(dirname "$(cd "$(dirname "$0")" && pwd)")/templates/beads-sync.sh"
+    checkout_verdict "$beads_repo" "$cv_hook" "$now" "$CHECKOUT_BEHIND_MAX" "$CHECKOUT_BLOCK_HOURS"
+    cv_runbook='SETUP.md "Sync hook will not converge: hand-written commits on main"'
+    cv_named=$CV_NAMED
+    cv_n=$(printf '%s' "$CV_BLOCKING" | grep -c . || true)
+    # How long the hook has been saying so, from its own refusal lines - only
+    # those since the oldest blocking commit existed, so an earlier episode
+    # that was resolved is not counted into this one.
+    cv_refused=""
+    if [ -f "$synclog" ] && [ "${CV_OLDEST:-0}" -gt 0 ]; then
+        cv_since=$(date -r "$CV_OLDEST" '+%Y-%m-%d %H:%M:%S' 2>/dev/null ||
+                   date -d "@$CV_OLDEST" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "")
+        cv_refused=$(grep -F "non-export commit(s) on main in $beads_repo; not resetting" "$synclog" 2>/dev/null |
+            awk -v since="$cv_since" 'substr($0, 2, 19) >= since { n++; if (n == 1) first = substr($0, 2, 19) }
+                END { if (n) printf " The sync hook has refused to converge it %d time(s) since %s.", n, first }')
+    fi
+    case "$CV_VERDICT" in
+        blocked)
+            add "Shared tracker checkout is not converging: $beads_repo main carries $cv_n commit(s) the sync hook will not reset over ($cv_named; oldest ${CV_AGE_H}h old) and is $CV_BEHIND commit(s) behind origin/main.$cv_refused Until it converges this machine runs the tracker scripts from before those $CV_BEHIND commits and its jsonl export and setup heartbeat do not publish; the Dolt data syncs regardless, so nothing else here turns red. Land each commit through a PR from a worktree, or confirm origin already has it, then follow $cv_runbook." error checkout
+            ;;
+        behind)
+            cv_why=""
+            [ -n "$cv_named" ] && cv_why=" Holding it: $cv_n commit(s) the hook will not reset over ($cv_named)."
+            [ -n "$CV_DIRTY" ] && cv_why="$cv_why Holding it: uncommitted changes outside the export ($CV_DIRTY), which the hook will not reset over either."
+            add "Shared tracker checkout $beads_repo is $CV_BEHIND commits behind origin/main (threshold $CHECKOUT_BEHIND_MAX).$cv_why Every full sync converges it, so lag this large means it is not converging - or this machine has been idle, in which case this session's sync clears it. Read the last 'not resetting' line in $synclog and $cv_runbook." warn checkout
+            ;;
+        off-main)
+            cv_where="a detached HEAD"
+            [ -n "$CV_BRANCH" ] && cv_where="branch '$CV_BRANCH'"
+            add "Shared tracker checkout $beads_repo is on $cv_where, not main. The sync hook only commits the jsonl export and converges on main, so this machine's export does not publish and its tracker scripts do not update. Switch it back ('git -C $beads_repo switch main'); branch work belongs in a worktree under .mr-worktrees/." warn checkout
+            ;;
+    esac
 fi
 
 # --- report ----------------------------------------------------------------

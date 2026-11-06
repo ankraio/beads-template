@@ -1,0 +1,200 @@
+#!/usr/bin/env python3
+"""Inspect/TERM expired tracker-owned remote children; never stop a SQL server.
+
+Report-only unless --apply. The tracker's server is the one dolt sql-server
+whose cwd is the data directory, launched by bd or by the launchd agent alike;
+a --socket that names another path, or a second such server, is unknown
+ownership. A live remote CLI anywhere conservatively blocks termination.
+Only direct server children doing Git's refs/dolt/data push and their direct
+receive-pack SSH children qualify. Inspection failures never authorize signals.
+"""
+import argparse
+from dataclasses import dataclass
+import os
+from pathlib import Path
+import shlex
+import signal
+import subprocess
+
+
+@dataclass(frozen=True)
+class Process:
+    pid: int
+    parent: int
+    age: int
+    started: str
+    argv: tuple
+
+    @property
+    def name(self):
+        return Path(self.argv[0]).name if self.argv else ""
+
+    def identity(self):
+        return self.pid, self.parent, self.started, self.argv
+
+
+def seconds(value):
+    days, _, clock = value.rpartition("-")
+    parts = [int(part) for part in clock.split(":")]
+    if len(parts) not in (2, 3):
+        raise ValueError("unrecognized process age")
+    total = int(days or 0) * 86400
+    for index, part in enumerate(reversed(parts)):
+        total += part * 60 ** index
+    return total
+
+
+def run(*args):
+    return subprocess.run(args, check=True, capture_output=True, text=True,
+                          timeout=5).stdout
+
+
+def snapshot():
+    result = {}
+    # lstart is five fields; it guards against PID reuse while etime advances.
+    for line in run("ps", "-axo", "pid=,ppid=,etime=,lstart=,args=").splitlines():
+        fields = line.split(None, 8)
+        if len(fields) != 9:
+            raise ValueError("incomplete process snapshot")
+        pid, parent = map(int, fields[:2])
+        try:
+            name = Path(fields[8].split(None, 1)[0]).name
+            argv = (tuple(shlex.split(fields[8])) if name in ("bd", "dolt", "git", "ssh")
+                    else (name,))
+        except ValueError:
+            # Ambiguous argv must not make the snapshot look client-free.
+            raise ValueError("ambiguous process argv") from None
+        result[pid] = Process(pid, parent, seconds(fields[2]),
+                              " ".join(fields[3:8]), argv)
+    return result
+
+
+def sockets(argv):
+    found = set()
+    for i, word in enumerate(argv):
+        if word == "--socket" and i + 1 < len(argv):
+            found.add(argv[i + 1])
+        elif word.startswith("--socket="):
+            found.add(word[len("--socket="):])
+    return found
+
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    return True
+
+
+def server(repo, processes):
+    # The tracker's server is the one dolt sql-server whose cwd is the data
+    # directory: that is what it serves, and the rule bd-dolt-server's
+    # server_pids uses. The socket cannot be required. Only the launchd agent
+    # passes one; bd starts its own server without, so on every machine
+    # without the agent this answered "ownership is unknown" on every run and
+    # the git-remote-history restart deferred all day.
+    data = "n" + str(repo / ".beads/dolt")
+    sock = str(repo / ".beads/dolt.sock")
+    matches = []
+    for proc in processes.values():
+        if proc.name != "dolt" or proc.argv[1:2] != ("sql-server",):
+            continue
+        try:
+            cwd = run("lsof", "-a", "-p", str(proc.pid), "-d", "cwd", "-Fn")
+        except subprocess.CalledProcessError:
+            if alive(proc.pid):
+                raise
+            continue  # exited since the snapshot
+        if data not in cwd.splitlines():
+            continue
+        named = sockets(proc.argv)
+        if named and named != {sock}:
+            raise ValueError("tracker server names another socket")
+        matches.append(proc)
+    # Two servers on one data directory is the 2026-09-01 failure, not a
+    # choice between them.
+    if len(matches) != 1:
+        raise ValueError("tracker server ownership is unknown")
+    return matches[0]
+
+
+def remote_client(proc):
+    words = proc.argv[1:]
+    return (proc.name in ("bd", "dolt") and
+            any(word in ("push", "pull", "fetch", "sql") for word in words) and
+            "sql-server" not in words)
+
+
+def push(proc, owner):
+    return (proc.parent == owner.pid and proc.name == "git" and
+            proc.argv[1:2] == ("push",) and
+            any(word.startswith("--force-with-lease=refs/dolt/data:") for word in proc.argv) and
+            any(word == "refs/dolt/data" or word.endswith(":refs/dolt/data") for word in proc.argv))
+
+
+def receive(proc, parent):
+    return (proc.parent == parent.pid and proc.name == "ssh" and
+            any(word == "git-receive-pack" or word.startswith("git-receive-pack ")
+                for word in proc.argv[1:]))
+
+
+def inspect(repo, minimum_age, apply=False, *, read=snapshot, identify=server,
+            send=os.kill, emit=print):
+    processes = read()
+    owner = identify(repo, processes)
+    children = [proc for proc in processes.values() if push(proc, owner)]
+    clients = any(remote_client(proc) for proc in processes.values())
+    emit(f"server-side remote status: server={owner.pid} pushes={len(children)} "
+         f"live_remote_client={'yes' if clients else 'no'}")
+    for child in children:
+        eligible = child.age > minimum_age and not clients
+        emit(f"server-side git-push pid={child.pid} age={child.age}s "
+             f"state={'expired' if eligible else 'retained'}")
+        if not apply or not eligible:
+            continue
+        targets = [proc for proc in processes.values() if receive(proc, child)] + [child]
+        for target in targets:
+            # Recheck the server, parent and target identity before every signal.
+            fresh = read()
+            current_owner = identify(repo, fresh)
+            current = fresh.get(target.pid)
+            parent = fresh.get(child.pid)
+            if (current_owner.identity() != owner.identity() or not current or not parent or
+                    current.identity() != target.identity() or parent.identity() != child.identity() or
+                    any(remote_client(proc) for proc in fresh.values())):
+                emit(f"server-side remote pid={target.pid} retained: ownership or client state changed")
+                continue
+            try:
+                send(target.pid, signal.SIGTERM)
+                emit(f"server-side remote pid={target.pid} age={target.age}s command={target.name} TERM sent")
+            except ProcessLookupError:
+                emit(f"server-side remote pid={target.pid} already exited")
+        # A sent signal is not proof that the process exited or the remote is idle.
+        fresh = read()
+        survivors = sum(1 for target in targets if target.pid in fresh and
+                        fresh[target.pid].identity() == target.identity())
+        emit(f"server-side remote after TERM: surviving_children={survivors}; SQL server untouched")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("repo", type=Path)
+    parser.add_argument("--minimum-age", type=int, default=920)
+    parser.add_argument("--apply", action="store_true")
+    args = parser.parse_args()
+    if args.minimum_age < 1:
+        parser.error("minimum age must be positive")
+    try:
+        inspect(args.repo.resolve(), args.minimum_age, args.apply)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        # Never print subprocess argv/stderr: remote URLs may contain credentials.
+        print("server-side remote status: unknown; inspection failed, no further signals sent")
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -53,13 +53,7 @@ fi
 if [ -z "$BEADS_REPO" ] && [ -n "${BEADS_DIR:-}" ]; then
     BEADS_REPO=$(dirname "$BEADS_DIR")
 fi
-if [ -z "$BEADS_REPO" ]; then
-    # No hardcoded fallback: on a machine running two trackers a default path
-    # silently answers about the wrong one, and "which tracker did you mean?"
-    # is the one question this tool must never guess at.
-    echo "$(basename "$0"): pass the path to your beads repo (or set BEADS_SETUP_REPO / BEADS_DIR)" >&2
-    exit 1
-fi
+[ -n "$BEADS_REPO" ] || { echo "bd-setup-report: pass the beads repo path, or set BEADS_DIR or BEADS_SETUP_REPO - there is no default, because a guessed tracker is the wrong tracker on a machine with two workspaces" >&2; exit 1; }
 [ -d "$BEADS_REPO/templates" ] || {
     echo "bd-setup-report: no templates/ under $BEADS_REPO" >&2; exit 1; }
 BEADS_REPO=$(cd "$BEADS_REPO" && pwd)

@@ -22,21 +22,28 @@
 #                    appears anywhere in the bead text; otherwise skipped
 #
 # With --search-citing, each swept bead is also looked up on GitHub itself
-# (gh search prs --owner <owner> "<bead-id>"), so a merged PR that cites the
-# bead id is found even when nobody pasted the PR number back into the bead.
+# (the issue search `gh search prs --owner <owner> "<bead-id>"` runs), so a
+# merged PR that cites the bead id is found even when nobody pasted the PR
+# number back into the bead.
 # Search hits join the candidate set and pass through the same delivery-
 # citation check below. Searches are rate-limited (~30/min), so this path
 # sleeps between beads and is meant for the nightly sweep, not session hooks.
 #
 # Harvested references are only CANDIDATES. A candidate counts as "this
-# bead's PR" solely when it DELIVERY-CITES the bead: the bead id appears in
-# the PR title, in the branch name, or on a `Bead:` / `Beads:` line in the
-# body. A mention anywhere else in the body is context — PR bodies routinely
-# name beads they FILED as follow-ups ("Follow-up beads: acme-x ..."), cite
-# parent features, or reference sibling branches, and any of those would
-# close unfinished work if body prose counted: a parent feature's merged PR
-# once listed its follow-up beads in prose and the sweep closed them while
-# their real PRs were still open.
+# bead's PR" solely when it DELIVERY-CITES the bead, and the three places a
+# citation can sit are RANKED: a `Bead:` / `Beads:` line in the body, when
+# there is one, is the whole list (plus any title id that is a listed bead's
+# child or epic); without one, the ids in the PR title; with neither, the id the
+# branch name starts with. A mention anywhere else is context — PR bodies
+# routinely name beads they FILED as follow-ups ("Follow-up beads: acme-x
+# ..."), cite parent features, or reference sibling branches, and any of those
+# would close unfinished work if body prose counted: a parent feature's merged
+# PR once listed its follow-up beads in prose and the sweep closed them while
+# their real PRs were still open. A title beside a Bead: line, and a branch
+# beside either, are context in the same way: a PR that lists one bead on its
+# Bead: line and names another in its title, as the subject of the record it
+# adds, is not a delivery of the second, and pooling the sites nearly closed
+# an open bead that way. See CITATION_JQ below.
 # The citation match is boundary-aware: bead acme-xvt does not match a PR
 # that cites only acme-xvt.9.
 #
@@ -79,9 +86,16 @@
 # the same fallback surface pr_lookup uses for state) and run through the same
 # delivery-citation check. An open PR that cites the bead blocks the close and
 # is reported as one the search did not return; an index that could not be
-# completed is DEGRADED, never "nothing found".
+# completed is DEGRADED, never "nothing found". The listing is made once per
+# run, and as conditional requests, so a repo whose open PRs have not changed
+# since the last sweep costs nothing.
+#
+# Every sweep on a machine spends the same token's GitHub budget as every
+# other session there, so it reads that budget off each response and stops
+# before the last slice of it rather than draining it and then failing bead by
+# bead: see "the shared GitHub budget" below.
 # Caveat: a delivering PR that never cites the bead id back is invisible —
-# put the bead id in the title, branch name, or a `Bead:` line of every PR.
+# put every bead a PR delivers on a `Bead:`/`Beads:` line of its body.
 # The cross-check only enumerates the candidate repos (sibling checkouts, or
 # BD_SWEEP_REPOS), so the org-wide search stays the wider net of the two.
 #
@@ -94,13 +108,25 @@
 # incident made every `gh pr view` fail, the errors were discarded, and the
 # run reported "citing PRs not all merged — …(UNKNOWN)" for beads whose PRs
 # had in fact merged. That is indistinguishable from a healthy run over
-# genuinely open PRs, so a whole sweep did nothing and looked correct
-#. Now a failed lookup falls back to the REST API (a separate
+# genuinely open PRs, so a whole sweep did nothing and looked correct. Now a failed lookup falls back to the REST API (a separate
 # GitHub surface, healthy throughout that incident), retries once, and if it
 # still cannot answer, the bead is reported as DEGRADED and the run exits 3.
 # A definitive 404 is an answer, not a failure: the ref is reported MISSING
 # and the run stays clean, so a bead citing a deleted PR does not paint every
-# nightly run red.
+# nightly run red. And MISSING neither blocks nor authorizes a close: a
+# number that is not a pull request in the repo it was attributed to cannot
+# be the delivery, so it cannot be "not yet merged" either. It used to land
+# in the unmerged list, where it parked the bead forever - the harvester
+# attributes a bare "#N" in prose to the bead's one mentioned repo, and
+# "mitigated platform-side by #1231" (a web PR, read as worker#1231) held
+# one bead in in_review for 24 days beside a merged, citing worker#68,
+# while "upstream #4822" (a gastownhall/beads ISSUE, read as beads#4822)
+# would have held another beside its merged beads#51. A
+# phantom is permanent, so "blocks until it merges" meant "never closes".
+# The same boundary applies to `bd close` refusing a bead
+# that is blocked by an open dependency: bd answered, the state is known, so
+# it is reported like "children still open" and does not degrade the run.
+# Only a call that could not be answered at all is DEGRADED.
 #
 # Usage: bd-sweep-merged [--apply] [--quiet] [--search-citing]
 #   default          dry run: print what would happen
@@ -109,8 +135,9 @@
 #   --search-citing  also discover PRs via GitHub search (slow; nightly CI)
 #
 # Exit: 0 clean, 1 no workspace/owner, 2 usage, 3 ran but degraded (at least
-# one GitHub lookup could not be resolved; those beads were left open),
-# 5 ran cleanly but found MISRECORDED beads (see below).
+# one GitHub lookup could not be resolved, or the sweep stopped early to spare
+# the token's budget; those beads were left open), 5 ran cleanly but found
+# MISRECORDED beads (see below).
 #
 # 3 and 5 both mean the sweep RAN and its closes are real: a caller must
 # still push/commit whatever it did, and must not treat either as "the sweep
@@ -123,26 +150,70 @@
 
 set -uo pipefail
 
-# Does the PR JSON on stdin DELIVERY-CITE bead $1? The bead id, boundary-aware,
-# in the PR title, in the branch name, or on a `Bead:`/`Beads:` line of the
-# body; a mention anywhere else in the body is context (see the header).
+# The bead ids a PR DELIVERS, as jq definitions shared by cites_bead (the close
+# path) and delivery_cited_ids (the reverse audit), so the two can never
+# disagree about what "this PR delivers that bead" means. The three citation
+# sites are ranked, not pooled:
 #
-# The dot of a dotted child id must reach the regex engine as `\.` — ONE
-# backslash. jq's replacement string is literal, so the obvious-looking
-# gsub("\\."; "\\\\.") emits `\\.`, which asks for a literal backslash followed
-# by any character and therefore matches nothing a human would ever write: every
-# dotted child bead reported "no PR cites this bead" and parked in in_review
-# forever, however correctly both directions were cited (seen on
-# acme-qtdma.{1,4,5,8}). Escaping is still required — an unescaped dot is a
-# wildcard, so acme-qtdma.1 would match a PR citing acme-qtdmaX1.
-# scripts/test-bd-sweep-merged pins both halves of that.
+#   1. `Bead:` / `Beads:` lines of the body. When they name any bead, they ARE
+#      the list, and the title and branch only add to it in one case: a title id
+#      in the FAMILY of a listed bead — its child (`Bead: acme-u3js` over a
+#      title ending `(acme-u3js.14)`) or the epic it belongs to (a title ending
+#      `(acme-us96)` over `Bead: acme-us96.1, acme-us96.2, acme-us96.3`). An
+#      epic cited that way still closes only once its children have.
+#   2. Otherwise, the ids in the title.
+#   3. Otherwise, the branch — and only the id it STARTS with, after optional
+#      `fix/`-style path segments.
+#
+# Pooling them is how a PR delivers beads it only talks about. Take a PR
+# carrying `**Bead: acme-ouxc**` whose title reads "dup-check: record
+# acme-eyrq / acme-h34r as distinct (acme-ouxc)": eyrq and h34r are what the
+# allowlist line it adds is ABOUT. Read as a pool, the title makes it a
+# delivery of both, and an open bead being worked gets closed. Branches fail
+# the same way: they carry the bead the work was first filed under, a child
+# spelled with a hyphen that reads as its parent (`fix/acme-0xsd-28-…` is
+# acme-0xsd.28, not acme-0xsd), or a second bead after the first
+# (`acme-ouxc-2-h34r`). So the branch speaks only when nothing else does.
+#
+# Ids are extracted whole — the prefix, a hyphen, the hash, any `.N` child
+# steps — and compared for equality, so the match is boundary-aware by
+# construction: acme-qtdm is not cited by acme-qtdm.1, acme-qtdm.1 is not
+# cited by acme-qtdm.12 or acme-qtdmX1. (It used to be a regex built from
+# the id, and a double-escaped dot in it made every dotted child id match
+# nothing at all: four dotted children parked in in_review with four merged,
+# correctly citing PRs.) $p must already be regex-safe.
+CITATION_JQ='
+def bead_ids($p): [ match($p + "-[a-z0-9]+(\\.[0-9]+)*"; "g").string ] | unique;
+def delivered_ids($p):
+    ((.body // "") | split("\n")
+        | map(select(test("^[\\s*_>#-]*beads?\\s*[:=]"; "i")))
+        | join(" ") | ascii_downcase | bead_ids($p)) as $lines
+    | ((.title // "") | ascii_downcase | bead_ids($p)) as $title
+    | if ($lines | length) > 0 then
+          ($lines + [ $title[] | . as $t
+                      | select(any($lines[]; . as $l
+                          | ($t | startswith($l + ".")) or ($l | startswith($t + ".")))) ])
+          | unique
+      elif ($title | length) > 0 then $title
+      else (.headRefName // "") | ascii_downcase
+          | [ capture("^(?:[^/]*/)*?(?<id>" + $p + "-[a-z0-9]+(\\.[0-9]+)*)") | .id ]
+      end;
+'
+
+# Does the PR JSON on stdin DELIVERY-CITE bead $1? True when $1 is one of the
+# ids delivered_ids reads off it (see above); a mention anywhere else — body
+# prose, a title beside a Bead: line that lists other beads, a branch beside a
+# title — is context. One line of output per JSON object read, which
+# filter_citing_prs depends on.
+#
+# The prefix comes from the id itself (everything before its hash), so this
+# needs no knowledge of the tracker.
 cites_bead() {
-    jq -r --arg id "$1" '($id | ascii_downcase | gsub("\\."; "\\.")) as $re
-        | (([.title, .headRefName] | join(" ")) + " "
-           + ((.body // "") | split("\n")
-              | map(select(test("^[\\s*_>#-]*beads?\\s*[:=]"; "i"))) | join(" "))
-           | ascii_downcase) as $t
-        | $t | test($re + "(?![a-z0-9.])")'
+    jq -r --arg id "$1" "$CITATION_JQ"'
+        ($id | ascii_downcase) as $want
+        | ($want | sub("(\\.[0-9]+)+$"; "") | sub("-[a-z0-9]+$"; "")
+                 | gsub("[^a-z0-9-]"; "")) as $p
+        | [ delivered_ids($p)[] | select(. == $want) ] | length > 0'
 }
 
 # The still-open children of bead $1, as " id(status)" entries, or empty
@@ -179,24 +250,34 @@ children_still_open() {
 # already-delivered children pile up behind the ones still open.
 # Empty output (and success) for a bead with no children.
 #
-# Called once per swept bead, so the listing is fetched once and reused:
-# this reads only the id→parent mapping, which the sweep never writes (it
-# only ever changes a status), so a cached answer cannot go stale the way
+# Called once per swept bead from inside $(...), so the listing is indexed into
+# the run's scratch directory: a shell variable set here dies with the subshell.
+# It used to be one, under a comment saying it was "fetched once and reused",
+# while every swept bead dumped the whole tracker and parsed it with jq: 34 MB,
+# 280 times a sweep on 2026-11-04, the bulk of a full sync's time on a healthy
+# machine and `could not be listed` lines on a loaded one.
+#
+# This reads only the id→parent mapping, which the sweep never writes (it only
+# ever changes a status), so a cached answer cannot go stale the way
 # children_still_open's would. That one deliberately keeps reading live.
-children_listing_cache=""
-children_listing_failed=0
+#
+# A listing that failed writes no index, so the next bead asks again: one bad
+# moment must not read as "no children" for the rest of the run.
 children_of() {
-    if [ -z "$children_listing_cache" ] && [ "$children_listing_failed" = 0 ]; then
+    local index="$run_dir/children-index.tsv" listing
+    if [ ! -f "$index" ]; then
         # --all is load-bearing: bd hides closed issues by default, and the
         # children that matter most here are exactly the delivered (closed)
         # ones a parent is parked behind. Without it every child that had
         # already shipped was invisible and the parent read as MISRECORDED.
-        children_listing_cache=$(bd list --all --limit 0 --json 2>/dev/null) || children_listing_cache=""
-        [ -n "$children_listing_cache" ] || children_listing_failed=1
+        listing=$(bd list --all --limit 0 --json 2>/dev/null) || return 1
+        [ -n "$listing" ] || return 1
+        printf '%s' "$listing" | jq -r '
+            .[] | select((.parent // "") != "") | "\(.parent)\t\(.id)"' \
+            > "$index.tmp" 2>/dev/null || { rm -f "$index.tmp"; return 1; }
+        mv -f "$index.tmp" "$index" || return 1
     fi
-    [ "$children_listing_failed" = 0 ] || return 1
-    printf '%s' "$children_listing_cache" | jq -r --arg parent "$1" '
-        .[] | select((.parent // "") == $parent) | .id' 2>/dev/null || return 1
+    awk -F'\t' -v parent="$1" '$1 == parent { print $2 }' "$index"
 }
 
 # Did a PR that merged at $1 merge before bead work started at $2 (see the
@@ -236,11 +317,11 @@ filter_citing_prs() {
 # Every bead id DELIVERY-CITED by the PR JSON on stdin, one per line,
 # deduplicated. $1 is the tracker's id prefix (e.g. "acme").
 #
-# The citation surface is identical to cites_bead's - title, branch name,
-# and `Bead:`/`Beads:` lines - because the reverse audit must agree with the
-# close path about what "this PR delivers that bead" means. Body prose is
-# excluded for the same reason it is there: PR bodies routinely list beads
-# they FILED as follow-ups, and those are legitimately open.
+# The citation rule is cites_bead's own (delivered_ids in CITATION_JQ),
+# because the reverse audit must agree with the close path about what "this
+# PR delivers that bead" means. Body prose is excluded for the same reason it
+# is there: PR bodies routinely list beads they FILED as follow-ups, and those
+# are legitimately open.
 #
 # The prefix is REQUIRED rather than inferred from the id shape. A generic
 # "<word>-<word>" pattern reads ordinary branch names as bead ids -
@@ -248,14 +329,8 @@ filter_citing_prs() {
 # a first run - and an audit that reports a dozen phantoms per PR is an
 # audit nobody reads, which is the same silence it was written to fix.
 delivery_cited_ids() {
-    jq -r --arg prefix "${1:-}" '
-        ($prefix | gsub("[^a-zA-Z0-9]"; "")) as $safe
-        | (([.title, .headRefName] | join(" ")) + " "
-           + ((.body // "") | split("\n")
-              | map(select(test("^[\\s*_>#-]*beads?\\s*[:=]"; "i"))) | join(" ")))
-        | ascii_downcase
-        | [ match($safe + "-[a-z0-9]+(\\.[0-9]+)*"; "g").string ]
-        | unique | .[]' 2>/dev/null
+    jq -r --arg prefix "${1:-}" "$CITATION_JQ"'
+        delivered_ids($prefix | ascii_downcase | gsub("[^a-z0-9-]"; "")) | .[]' 2>/dev/null
 }
 
 # The tracker's id prefix, from the ids bd actually carries: the text before
@@ -265,6 +340,70 @@ delivery_cited_ids() {
 tracker_id_prefix() {
     printf '%s\n' "$1" | awk -F'\t' '{ split($1, part, "-"); if (part[1] != "") print part[1] }' |
         sort | uniq -c | sort -rn | head -1 | awk '{print $2}'
+}
+
+# --- the shared GitHub budget --------------------------------
+#
+# Every sweep on a machine spends ONE token's budget, shared with every other
+# session's sweep, CI watcher and interactive `gh` on that machine. On
+# 2026-09-29 the core budget ran dry twice in twenty minutes (5000/5000 used)
+# and the GraphQL one fell by ~230 points in two minutes, and every sweep that
+# reached its open-PR cross-check after that printed a DEGRADED line per bead
+# for the rest of its run. So the sweep reads the budget off
+# every response it gets (`gh api -i`) and treats the last slice of it as
+# someone else's:
+#
+#   BD_SWEEP_RATE_RESERVE_PCT (default 10) — once a budget's remaining count
+#       falls to this share of its limit, the sweep stops spending it.
+#   BD_SWEEP_RATE_WAIT (default 20 seconds) — the longest it will sleep for
+#       that budget to reset before giving up. The search budget resets every
+#       minute, so a short wait usually rescues the run; the core and GraphQL
+#       budgets reset hourly, so it stops instead. The session hooks run the
+#       sweep under a 90s cap, which is why the default is short.
+#
+# "Stops" means: no further GitHub calls this run, every bead that still needed
+# one is named as not evaluated in ONE loud line, and the run exits 3 — the
+# same "incomplete, clears on a re-run" exit as any degraded run. Closes it made
+# before stopping are real.
+
+# The value of HTTP header $1 (lower-case name) from the header block on stdin,
+# or nothing. Header names are case-insensitive and gh prints them as GitHub
+# sent them (HTTP/2: `X-Ratelimit-Remaining`), so the match lowercases.
+header_value() {
+    awk -v k="$1" '{
+        sub(/\r$/, "")
+        n = index($0, ":")
+        if (n && tolower(substr($0, 1, n - 1)) == k) {
+            v = substr($0, n + 1); sub(/^[ \t]+/, "", v); print v; exit
+        }
+    }'
+}
+
+# May the sweep keep spending a budget with <remaining> of <limit> left, which
+# resets at epoch <reset>, when it is now <now>? Prints one of
+#   ok        — above the reserve, carry on
+#   wait <s>  — at the reserve, but it resets within BD_SWEEP_RATE_WAIT: sleep
+#   stop      — at the reserve and not resetting soon: stop spending it
+# A response with no readable budget is "ok": the absence of a header is not
+# evidence of exhaustion, and inventing a stop would silence a healthy sweep.
+rate_decision() {
+    local remaining=$1 limit=$2 reset=$3 now=$4 reserve wait
+    case "$remaining" in ''|*[!0-9]*) echo ok; return 0 ;; esac
+    case "$limit" in ''|*[!0-9]*) limit=0 ;; esac
+    reserve=$(( limit * ${BD_SWEEP_RATE_RESERVE_PCT:-10} / 100 ))
+    if [ "$remaining" -gt "$reserve" ]; then
+        echo ok
+        return 0
+    fi
+    case "$reset" in ''|*[!0-9]*) echo stop; return 0 ;; esac
+    case "$now" in ''|*[!0-9]*) echo stop; return 0 ;; esac
+    wait=$(( reset - now + 1 ))
+    [ "$wait" -ge 1 ] || wait=1
+    if [ "$wait" -le "${BD_SWEEP_RATE_WAIT:-20}" ]; then
+        echo "wait $wait"
+    else
+        echo stop
+    fi
 }
 
 # Sourced with BD_SWEEP_MERGED_LIB=1, the script stops here: the helpers above
@@ -318,11 +457,200 @@ else
     done
 fi
 
+# --- talking to GitHub ------------------------------------------------------
+#
+# Every GitHub call goes through gh_api, which is `gh api -i`: the response
+# headers carry the budget the call was billed against, and gh_api acts on them
+# before the next call (see "the shared GitHub budget" above). That is also why
+# nothing here uses `gh pr view` or `gh search prs` any more: neither shows its
+# headers, and `gh search prs` quietly spends a GraphQL introspection query on
+# top of every search.
+#
+# Scratch space for one run: the per-run PR cache, the budget stop, response
+# bodies. Files rather than shell variables, because most callers run inside
+# $(...), a subshell whose variables die with it. That is exactly how the
+# open-PR index came to be rebuilt for every close candidate: it was built
+# inside `open_hits=$(open_prs_citing ...)`, so its "built" state never reached
+# the main loop and its own EXIT trap deleted the file as the subshell ended.
+# A run with 13 close candidates over 32 sibling repos made ~420 REST calls
+# instead of ~32.
+run_dir=$(mktemp -d "${TMPDIR:-/tmp}/bd-sweep-merged.XXXXXX") || {
+    echo "bd-sweep-merged: cannot create a scratch directory" >&2
+    exit 1
+}
+trap 'rm -rf "$run_dir"' EXIT
+
+# Across runs: the ETag and body of every open-PR listing page, so a listing
+# that has not changed since the last sweep costs a 304, which GitHub does not
+# bill against the token. Most of the sibling repos are quiet, and every
+# session start and end sweeps. No usable directory means every listing is a
+# plain GET, as before. It holds PR titles and bodies from private repos, so it
+# is private to the user.
+sweep_cache_dir=${BD_SWEEP_CACHE_DIR:-${XDG_CACHE_HOME:-${HOME:-/nonexistent}/.cache}/bd-sweep-merged}
+if ! { mkdir -p "$sweep_cache_dir" && chmod 700 "$sweep_cache_dir" && [ -w "$sweep_cache_dir" ]; } 2>/dev/null; then
+    sweep_cache_dir=""
+fi
+
+# The budget stop, as a file so that a stop decided inside $(...) is seen by
+# the main loop. Its content is the one line that explains it.
+rate_stop() {
+    [ -e "$run_dir/rate-stop" ] || printf '%s\n' "$1" > "$run_dir/rate-stop"
+}
+rate_stopped() { [ -e "$run_dir/rate-stop" ]; }
+
+# "GitHub core budget at 412/5000, resets 12:58:02Z" for the stop message.
+budget_line() {
+    local when
+    when=$(date -u -r "${4:-x}" +%H:%M:%SZ 2>/dev/null ||
+           date -u -d "@${4:-x}" +%H:%M:%SZ 2>/dev/null) || when="at an unknown time"
+    printf 'GitHub %s budget at %s/%s, resets %s' "${1:-API}" "${2:-?}" "${3:-?}" "$when"
+}
+
+# gh_api <body-file> <gh api args...> — one GitHub call, budget-aware. The body
+# lands in <body-file> and the response headers in <body-file>.headers.
+#   0  2xx
+#   1  no usable answer (transport failure, 5xx, a refusal that is not a 404)
+#   2  404, a definitive "no such thing"
+#   3  304, unchanged since the ETag that was sent; the body is empty
+#   4  not asked: the sweep has stopped spending the token's budget
+# gh's own exit status is not consulted: `gh api` exits 1 on a 304 and on a
+# GraphQL reply that resolved some aliases and not others, both of which are
+# answers. The status line is the answer.
+# A refusal FOR budget (403/429 with the budget at 0 or a Retry-After, or
+# GraphQL's RATE_LIMITED) is retried once after a wait no longer than
+# BD_SWEEP_RATE_WAIT; past that it stops the sweep. A success that leaves a
+# budget at its reserve waits or stops the same way, before the next call.
+gh_api() {
+    local out=$1 raw status remaining limit reset resource retry_after limited decision attempt
+    shift
+    for attempt in 1 2; do
+        rate_stopped && return 4
+        raw=$(mktemp "$run_dir/gh.XXXXXX") || return 1
+        gh api -i "$@" > "$raw" 2>/dev/null
+        status=$(head -1 "$raw" | awk '{ print $2 }')
+        awk 'NR > 1 { sub(/\r$/, ""); if ($0 == "") exit; print }' "$raw" > "$out.headers"
+        awk 'body { print; next } NR > 1 { sub(/\r$/, ""); if ($0 == "") body = 1 }' "$raw" > "$out"
+        rm -f "$raw"
+        remaining=$(header_value x-ratelimit-remaining < "$out.headers")
+        limit=$(header_value x-ratelimit-limit < "$out.headers")
+        reset=$(header_value x-ratelimit-reset < "$out.headers")
+        resource=$(header_value x-ratelimit-resource < "$out.headers")
+        retry_after=$(header_value retry-after < "$out.headers")
+        printf '%s\t%s\n' "${resource:-unknown}" "${status:-none}" >> "$run_dir/calls"
+
+        limited=0
+        case "$status" in
+            403|429)
+                if [ "$remaining" = 0 ] || [ -n "$retry_after" ] || grep -qi 'rate limit' "$out"; then
+                    limited=1
+                fi ;;
+            200)
+                if [ "${1:-}" = graphql ] &&
+                   jq -e 'any(.errors[]?; .type == "RATE_LIMITED")' "$out" >/dev/null 2>&1; then
+                    limited=1
+                fi ;;
+        esac
+        if [ "$limited" = 1 ]; then
+            case "$retry_after" in
+                ''|*[!0-9]*) decision=$(rate_decision 0 "$limit" "$reset" "$(date +%s)") ;;
+                *) if [ "$retry_after" -le "${BD_SWEEP_RATE_WAIT:-20}" ]; then
+                       decision="wait $retry_after"
+                   else
+                       decision=stop
+                   fi ;;
+            esac
+            if [ "$attempt" = 1 ] && [ "${decision%% *}" = wait ]; then
+                sleep "${decision#wait }"
+                continue
+            fi
+            rate_stop "$(budget_line "$resource" "${remaining:-0}" "$limit" "$reset"); GitHub refused a call for budget (HTTP $status)"
+            return 4
+        fi
+
+        decision=$(rate_decision "$remaining" "$limit" "$reset" "$(date +%s)")
+        case "$decision" in
+            wait\ *) sleep "${decision#wait }" ;;
+            stop) rate_stop "$(budget_line "$resource" "$remaining" "$limit" "$reset"), inside the ${BD_SWEEP_RATE_RESERVE_PCT:-10}% the sweep leaves for everything else on this token" ;;
+        esac
+        case "$status" in
+            2??) return 0 ;;
+            304) return 3 ;;
+            404) return 2 ;;
+            *) return 1 ;;
+        esac
+    done
+    return 1
+}
+
+# conditional_get <cache-key> <body-file> <api-path> — a GET that sends the
+# ETag remembered under <cache-key> and, on a 304, answers from the body
+# remembered with it. Same exit codes as gh_api, minus 3.
+conditional_get() {
+    local key=$1 out=$2 path=$3 cached="" etag="" rc tmp
+    if [ -n "$sweep_cache_dir" ]; then
+        cached="$sweep_cache_dir/$key"
+        [ -s "$cached" ] && etag=$(head -1 "$cached")
+    fi
+    if [ -n "$etag" ]; then
+        gh_api "$out" -H "If-None-Match: $etag" "$path"
+    else
+        gh_api "$out" "$path"
+    fi
+    rc=$?
+    if [ "$rc" = 3 ]; then
+        # Unchanged: the remembered body IS the answer. One that will not
+        # parse is not, so it is forgotten and the page asked for in full.
+        if tail -n +2 "$cached" > "$out" 2>/dev/null && jq -e . "$out" >/dev/null 2>&1; then
+            return 0
+        fi
+        rm -f "$cached"
+        gh_api "$out" "$path"
+        rc=$?
+    fi
+    [ "$rc" = 0 ] || return "$rc"
+    etag=$(header_value etag < "$out.headers")
+    if [ -n "$cached" ] && [ -n "$etag" ] &&
+       tmp=$(mktemp "$sweep_cache_dir/.tmp.XXXXXX" 2>/dev/null); then
+        # Written aside and renamed, so a concurrent sweep never reads an ETag
+        # beside a half-written body.
+        if { printf '%s\n' "$etag" && cat "$out"; } > "$tmp"; then
+            mv -f "$tmp" "$cached"
+        else
+            rm -f "$tmp"
+        fi
+    fi
+    return 0
+}
+
 # All PRs in the owner org that mention the bead id, as "owner/repo<TAB>num".
-# Exit status is gh's own, so callers can tell "no hits" from "search broke".
+# 0 = the search answered (with or without hits), non-zero = it could not, so
+# callers can tell "no hits" from "search broke". This is the endpoint and query
+# `gh search prs --owner` sends, called directly (see gh_api for why).
 search_citing() {
-    gh search prs --owner "$owner" "$1" --json number,repository \
-        --jq '.[] | "\(.repository.nameWithOwner)\t\(.number)"' 2>/dev/null
+    local out="$run_dir/search" q
+    q=$(jq -rn --arg q "( $1 ) type:pr user:$owner" '$q | @uri') || return 1
+    gh_api "$out" "search/issues?advanced_search=true&per_page=100&q=$q" || return 1
+    jq -r '.items[]? | "\(.repository_url | sub("^.*/repos/"; ""))\t\(.number)"' "$out"
+}
+
+# Every open PR of $owner/<repo>, as "owner/repo<TAB>number<TAB><PR JSON>"
+# lines. 0 = listed, 2 = no such repo (404), 1 = could not list, 4 = stopped.
+# Paged by hand rather than with --paginate so that every page is a
+# conditional request of its own.
+list_open_prs() {
+    local repo=$1 page=1 body="$run_dir/open-page" n rc
+    while :; do
+        conditional_get "open,$owner,$repo,$page" "$body" \
+            "repos/$owner/$repo/pulls?state=open&per_page=100&page=$page"
+        rc=$?
+        [ "$rc" = 0 ] || return "$rc"
+        jq -r --arg or "$owner/$repo" \
+            '.[] | "\($or)\t\(.number)\t" + ({title, body, headRefName: .head.ref} | tostring)' \
+            "$body" || return 1
+        n=$(jq 'length' "$body") || return 1
+        [ "$n" -ge 100 ] || return 0
+        page=$((page + 1))
+    done
 }
 
 # Every open PR in the candidate repos, as an index of
@@ -333,10 +661,14 @@ search_citing() {
 # GraphQL, and no issue-search index that a PR opened minutes ago has not
 # reached yet. Built at most once per run, lazily, so a sweep that closes
 # nothing pays nothing; 0 = usable index, 1 = could not be completed.
-open_pr_index_file=""
+#
+# It MUST be called in the main loop's own shell, never inside $(...): its
+# state lives in shell variables (see above run_dir).
+open_pr_index_file="$run_dir/open-prs"
 open_pr_index_state=""      # "" not built yet | ok | failed
 
 open_pr_index() {
+    local repo rc
     case "$open_pr_index_state" in
         ok) return 0 ;;
         failed) return 1 ;;
@@ -345,70 +677,120 @@ open_pr_index() {
     # and a half-built index never answers "nothing cites this bead".
     open_pr_index_state=failed
     [ "${#sibling_repos[@]}" -gt 0 ] || return 1
-    open_pr_index_file=$(mktemp "${TMPDIR:-/tmp}/bd-sweep-open-prs.XXXXXX") || return 1
-    gh_err_file=$(mktemp "${TMPDIR:-/tmp}/bd-sweep-gh-err.XXXXXX") || return 1
-    trap 'rm -f "$open_pr_index_file" "$gh_err_file"' EXIT
+    : > "$open_pr_index_file" || return 1
     for repo in "${sibling_repos[@]}"; do
-        if out=$(gh api --paginate "repos/$owner/$repo/pulls?state=open&per_page=100" \
-                    --jq '.[] | "\(.number)\t" + ({title, body, headRefName: .head.ref} | tostring)' \
-                    2>"$gh_err_file" |
-                 awk -v prefix="$owner/$repo" '{ print prefix "\t" $0 }'); then
-            [ -n "$out" ] && printf '%s\n' "$out" >> "$open_pr_index_file"
-        elif grep -q 'HTTP 404' "$gh_err_file"; then
+        list_open_prs "$repo" >> "$open_pr_index_file"
+        rc=$?
+        case "$rc" in
+            0) ;;
             # No such repo under this owner — a sibling checkout from somewhere
             # else. It hosts none of our PRs, so a definitive 404 is an answer
             # and the rest of the index still stands (same rule as pr_lookup).
-            continue
-        else
-            return 1
-        fi
+            2) continue ;;
+            *) return 1 ;;
+        esac
     done
     open_pr_index_state=ok
 }
 
-# Which open PRs delivery-cite bead $1, as "owner/repo<TAB>number" lines?
-# 1 = the question could not be answered, which is not the same as "none".
-open_prs_citing() {
-    open_pr_index || return 1
-    filter_citing_prs "$1" < "$open_pr_index_file"
+# The per-run PR cache: one file per PR in gh-pr-view shape
+# ({state,title,body,headRefName,mergedAt}), or a .missing marker for a
+# definitive 404. A PR is looked up at most once per run however many beads
+# name it, and evaluate_refs' second pass over a bead costs nothing.
+pr_cache_file() { printf '%s/pr,%s,%s' "$run_dir" "${1//\//,}" "$2"; }
+
+# Look up every "owner/repo<TAB>number" ref on stdin that the cache does not
+# hold yet, in batched GraphQL queries: one request, and one point of the
+# GraphQL budget, per PR_BATCH refs, where every ref used to be a `gh pr view`
+# of its own (~150 per sweep over this tracker's backlog, at every session
+# start AND end). Purely an optimisation: a ref it cannot answer — the batch
+# failed, or GraphQL has no such PR — is left for pr_lookup to ask about alone.
+PR_BATCH=40
+prefetch_prs() {
+    local todo batch q i or num alias json ref f out="$run_dir/prefetch"
+    todo=$(grep -E '.' | sort -u | while IFS=$'\t' read -r or num; do
+        case "$num" in ''|*[!0-9]*) continue ;; esac
+        [[ $or =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || continue
+        f=$(pr_cache_file "$or" "$num")
+        [ -e "$f" ] || [ -e "$f.missing" ] || [ -e "$f.nographql" ] || printf '%s\t%s\n' "$or" "$num"
+    done)
+    while [ -n "$todo" ]; do
+        batch=$(printf '%s\n' "$todo" | head -n "$PR_BATCH")
+        todo=$(printf '%s\n' "$todo" | tail -n +"$((PR_BATCH + 1))")
+        q="query {"
+        i=0
+        while IFS=$'\t' read -r or num; do
+            q="$q p$i: repository(owner: \"${or%%/*}\", name: \"${or#*/}\") { pullRequest(number: $num) { state title body headRefName mergedAt } }"
+            i=$((i + 1))
+        done <<<"$batch"
+        q="$q }"
+        gh_api "$out" graphql -f query="$q" || { rate_stopped && return 1; continue; }
+        # A null alias is GraphQL's NOT_FOUND — usually an issue number the
+        # harvester read as a PR. It is marked so that pr_lookup takes it
+        # straight to REST for the definitive 404, as it always has, instead of
+        # asking GraphQL again once per bead that names it.
+        jq -r '(.data // {}) | to_entries[]
+               | if .value.pullRequest? != null
+                 then "\(.key)\t\(.value.pullRequest | tojson)"
+                 else "\(.key)\t" end' "$out" 2>/dev/null |
+        while IFS=$'\t' read -r alias json; do
+            case "${alias#p}" in ''|*[!0-9]*) continue ;; esac
+            ref=$(printf '%s\n' "$batch" | sed -n "$(( ${alias#p} + 1 ))p")
+            [ -n "$ref" ] || continue
+            f=$(pr_cache_file "${ref%%$'\t'*}" "${ref#*$'\t'}")
+            if [ -n "$json" ]; then printf '%s' "$json" > "$f"; else : > "$f.nographql"; fi
+        done
+    done
+    return 0
 }
 
 # One PR's state as gh-pr-view-shaped JSON on stdout.
 # 0 = answered, 2 = definitively no such PR (404), 1 = could not tell.
-# GraphQL (`gh pr view`) first, then REST, which is a separate GitHub surface
-# and stayed up through the GraphQL incident that motivated this. One retry
-# on top of that — a sweep that retry-loops through an outage is no more
-# useful than one that reports it honestly.
+# The per-run cache first (filled in bulk by prefetch_prs), then GraphQL for
+# this ref alone, then REST, which is a separate GitHub surface and stayed up
+# through the GraphQL incident that motivated this. One retry on top of that —
+# a sweep that retry-loops through an outage is no more useful than one that
+# reports it honestly.
 pr_lookup() {
-    or=$1
-    num=$2
-    if out=$(gh pr view "$num" --repo "$or" --json state,title,body,headRefName,mergedAt 2>/dev/null); then
-        printf '%s' "$out"
+    local or=$1 num=$2 f body="$run_dir/pr-rest" mapped attempt rc
+    f=$(pr_cache_file "$or" "$num")
+    [ -e "$f.missing" ] && return 2
+    [ -e "$f" ] || [ -e "$f.nographql" ] || printf '%s\t%s\n' "$or" "$num" | prefetch_prs
+    if [ -e "$f" ]; then
+        cat "$f"
         return 0
     fi
     for attempt in 1 2; do
-        if out=$(gh api "repos/$or/pulls/$num" 2>&1); then
-            # REST reports merged separately from state; gh pr view folds the
-            # two into MERGED/OPEN/CLOSED, which is what the caller expects.
-            mapped=$(printf '%s' "$out" | jq -c '{
-                state: (if .merged then "MERGED" else (.state | ascii_upcase) end),
-                title, body, headRefName: .head.ref, mergedAt: .merged_at }' 2>/dev/null) || mapped=""
-            [ -n "$mapped" ] || return 1
-            printf '%s' "$mapped"
-            return 0
-        fi
-        case "$out" in *"HTTP 404"*) return 2 ;; esac
+        gh_api "$body" "repos/$or/pulls/$num"
+        rc=$?
+        case "$rc" in
+            0)
+                # REST reports merged separately from state; GraphQL folds the
+                # two into MERGED/OPEN/CLOSED, which is what the caller expects.
+                mapped=$(jq -c '{
+                    state: (if .merged then "MERGED" else (.state | ascii_upcase) end),
+                    title, body, headRefName: .head.ref, mergedAt: .merged_at }' "$body" 2>/dev/null) || mapped=""
+                [ -n "$mapped" ] || return 1
+                printf '%s' "$mapped" > "$f"
+                printf '%s' "$mapped"
+                return 0 ;;
+            2) : > "$f.missing"; return 2 ;;
+            4) return 1 ;;
+        esac
         [ "$attempt" = 1 ] && sleep 2
     done
     return 1
 }
 
 # Evaluate $refs for bead $id into merged_list / unmerged_list /
-# abandoned_list / predates_list / context_list, plus error_list for refs
-# GitHub would not resolve.
-# Delivery citation = bead id (boundary-aware) in the PR title, branch name,
-# or a `Bead:`/`Beads:` line of the body; anything else is context. A citing
-# PR that merged before $bead_started is discounted into predates_list.
+# abandoned_list / predates_list / context_list / missing_list, plus
+# error_list for refs GitHub would not resolve.
+# Delivery citation = bead id among the ids cites_bead reads off the PR: its
+# `Bead:`/`Beads:` lines, else its title, else the id its branch starts with;
+# anything else is context. A citing PR that merged before $bead_started is
+# discounted into predates_list. A
+# ref GitHub definitively 404s goes to missing_list: not a PR in that repo,
+# so neither a delivery nor something still to merge (see the header).
 evaluate_refs() {
     merged_list=""
     unmerged_list=""
@@ -416,13 +798,14 @@ evaluate_refs() {
     predates_list=""
     context_list=""
     child_delivery_list=""
+    missing_list=""
     error_list=""
     while IFS=$'\t' read -r or num; do
         [ -n "$num" ] || continue
         pr=$(pr_lookup "$or" "$num")
         rc=$?
         if [ "$rc" = 2 ]; then
-            unmerged_list="$unmerged_list $or#$num(MISSING)"
+            missing_list="$missing_list $or#$num"
             continue
         fi
         if [ "$rc" != 0 ] || [ -z "$pr" ]; then
@@ -491,6 +874,12 @@ report_no_delivery() {
         say "$id: parent parked on its children — the PRs it names deliver$child_delivery_list; it closes when its children do, not on these"
     elif [ "$bead_status" = "in_review" ] && [ -n "$context_list" ]; then
         misrecord "$id: MISRECORDED — in_review, but every PR it names is merged and delivery-cites some OTHER bead:$context_list. The delivering PR was never recorded, so no sweep can close this and --search-citing will not find it either. Add it: bd comment $id \"PR: https://github.com/<owner>/<repo>/pull/<n>\""
+    elif [ -n "$missing_list" ] && [ -z "$context_list" ] && [ -z "$child_delivery_list" ]; then
+        # Every reference it has is a number that is not a PR where it was
+        # attributed - an issue number, or a bare "#N" in prose that the
+        # harvester pinned to the wrong repo. Nothing here can ever merge, so
+        # this is "no PR recorded", said precisely enough to be fixed.
+        say "$id: no PR cites this bead — its only references are not pull requests in the repo they were attributed to (MISSING:$missing_list); record the delivering PR as a full URL — manual check"
     else
         say "$id: no PR cites this bead (context only:$context_list) — manual check"
     fi
@@ -520,29 +909,23 @@ degrade() { degraded=1; echo "$@"; }
 misrecorded=0
 misrecord() { misrecorded=1; echo "$@"; }
 
-for id in $ids; do
-    bead=$(bd show "$id" --json --include-comments 2>/dev/null)
-    text=$(printf '%s' "$bead" |
-        jq -r '.[0] | ([.title, .description] + [(.comments // [])[].text]) | join("\n")')
-    [ -n "$text" ] || continue
-    # When work began, for the predating-merge discount above. "" for a bead bd
-    # never recorded a start for, which leaves that check inert.
-    bead_started=$(printf '%s' "$bead" | jq -r '.[0].started_at // ""')
-    # in_review asserts "the work is delivered and waiting to merge". That
-    # claim is what makes a non-citing reference a fault rather than a
-    # work-in-progress note, so the misrecord report below is scoped to it.
-    bead_status=$(printf '%s' "$bead" | jq -r '.[0].status // ""')
-    # The children a PR could be delivering on this bead's behalf, so
-    # evaluate_refs can tell a parked parent from a misrecord. An unreadable
-    # listing yields "" — the same answer as "no children", which only ever
-    # costs the parked-parent wording and can never authorize a close.
-    bead_children=$(children_of "$id" 2>/dev/null) || bead_children=""
+# Beads that still needed GitHub when the sweep stopped spending its budget.
+# They are named once, in the stop line at the end, instead of one DEGRADED
+# line each: "could not be completed" repeated for every remaining bead read
+# like a GitHub outage, when it was one budget running out.
+not_evaluated=""
+stopped_on() {
+    rate_stopped || return 1
+    not_evaluated="$not_evaluated $1"
+}
 
-    # Collect refs as "owner/repo<TAB>number" lines.
+# The references bead text $1 makes, as "owner/repo<TAB>number" lines.
+harvest_refs() {
+    local text=$1 refs repo qualified bare
+    local -a mentioned=()
     refs=$(printf '%s\n' "$text" |
         grep -oE 'github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[0-9]+' |
         sed -E 's#github\.com/([^/]+)/([^/]+)/pull/([0-9]+)#\1/\2\t\3#' || true)
-    mentioned=()
     for repo in "${sibling_repos[@]}"; do
         if printf '%s\n' "$text" | grep -qiE "(^|[^A-Za-z0-9_-])$repo([^A-Za-z0-9_-]|$)"; then
             mentioned+=("$repo")
@@ -559,6 +942,41 @@ for id in $ids; do
             grep -oE '[0-9]+' | sed "s#^#$owner/${mentioned[0]}\t#" || true)
         [ -n "$bare" ] && refs=$(printf '%s\n%s' "$refs" "$bare")
     fi
+    printf '%s\n' "$refs" | grep -E '.' || true
+}
+
+# Pass 1: read every bead once and harvest its references, then look up every
+# PR any of them names in a few batched GraphQL queries. Pass 2 below is the
+# sweep itself, and its per-PR lookups are then answered from the run's cache.
+# A bead with no text gets no refs file, and pass 2 skips it as it always has.
+for id in $ids; do
+    bead_file="$run_dir/bead-$id.json"
+    bd show "$id" --json --include-comments > "$bead_file" 2>/dev/null || : > "$bead_file"
+    text=$(jq -r '.[0] | ([.title, .description] + [(.comments // [])[].text]) | join("\n")' \
+        "$bead_file" 2>/dev/null)
+    [ -n "$text" ] || continue
+    harvest_refs "$text" > "$run_dir/refs-$id"
+done
+cat "$run_dir"/refs-* 2>/dev/null | prefetch_prs
+
+for id in $ids; do
+    bead_file="$run_dir/bead-$id.json"
+    [ -e "$run_dir/refs-$id" ] || continue
+    # When work began, for the predating-merge discount above. "" for a bead bd
+    # never recorded a start for, which leaves that check inert.
+    bead_started=$(jq -r '.[0].started_at // ""' "$bead_file")
+    # in_review asserts "the work is delivered and waiting to merge". That
+    # claim is what makes a non-citing reference a fault rather than a
+    # work-in-progress note, so the misrecord report below is scoped to it.
+    bead_status=$(jq -r '.[0].status // ""' "$bead_file")
+    # The children a PR could be delivering on this bead's behalf, so
+    # evaluate_refs can tell a parked parent from a misrecord. An unreadable
+    # listing yields "" — the same answer as "no children", which only ever
+    # costs the parked-parent wording and can never authorize a close.
+    bead_children=$(children_of "$id" 2>/dev/null) || bead_children=""
+
+    # Refs as "owner/repo<TAB>number" lines, harvested in pass 1.
+    refs=$(cat "$run_dir/refs-$id")
     # GitHub-side discovery: PRs that cite the bead id even though the bead
     # never references them back. Hits pass the same delivery-citation check.
     search_ok=0
@@ -567,6 +985,7 @@ for id in $ids; do
             search_ok=1
             [ -n "$hits" ] && refs=$(printf '%s\n%s' "$refs" "$hits")
         else
+            stopped_on "$id" && continue
             # Not fatal on its own — the close path below retries the search
             # and refuses to close without it — but a sweep that silently
             # stopped discovering PRs is exactly the invisible failure.
@@ -581,10 +1000,13 @@ for id in $ids; do
         continue
     fi
 
+    # Search hits pass 1 could not know about, looked up in one batch.
+    printf '%s\n' "$refs" | prefetch_prs
     evaluate_refs
 
     # Unresolved state is not "not merged" — say so, and leave the bead open.
     if [ -n "$error_list" ]; then
+        stopped_on "$id" && continue
         degrade "$id: DEGRADED — GitHub would not resolve:$error_list — state unknown, leaving open"
         continue
     fi
@@ -597,12 +1019,36 @@ for id in $ids; do
         continue
     fi
 
+    # An epic is the unit people plan and report against, so a closed
+    # parent says the initiative shipped. Closing one over open children
+    # stops those children being weighed as outstanding work while they
+    # still surface individually in `bd ready` — one epic was closed on
+    # its own PR citations with EIGHT children open, six of them P1, and a
+    # full scan found five closed parents holding eighteen open children. The parent's own PRs merging is evidence about the
+    # parent's PRs, not about its children.
+    #
+    # Asked BEFORE the GitHub confirmation below, not after: it is a local bd
+    # read, and no answer GitHub gives can turn "children still open" into a
+    # close. A parent parks on its children for days, and while this check came
+    # last every sweep re-ran the search, its sleep and the open-PR listing for
+    # each one — 24 of the 40 pre-close searches in one live dry run on
+    # 2026-09-29, repeated at every session start and end.
+    open_children=$(children_still_open "$id") || {
+        degrade "$id: DEGRADED — would close, but its children could not be listed — leaving open"
+        continue
+    }
+    if [ -n "$open_children" ]; then
+        say "$id: PRs merged ($merged_list) but children still open —$open_children — a closed parent reads as a shipped initiative; close or reparent them first"
+        continue
+    fi
+
     # About to close — bead-text refs alone never authorize it. Confirm on
     # GitHub that no unmerged PR delivery-cites this bead (the delivering PR
     # is often never pasted back into the bead). Skipped only when the
     # --search-citing pass above already ran this exact search successfully.
     if [ "$search_ok" = 0 ]; then
         if ! vhits=$(search_citing "$id"); then
+            stopped_on "$id" && continue
             degrade "$id: DEGRADED — would close, but the GitHub citing-PR search failed — leaving open (check gh auth/rate limit)"
             continue
         fi
@@ -611,10 +1057,12 @@ for id in $ids; do
             merged_refs=$(printf '%s\n%s' "$refs" "$vhits" | grep -E '.' | sort -u)
             if [ "$merged_refs" != "$refs" ]; then
                 refs=$merged_refs
+                printf '%s\n' "$refs" | prefetch_prs
                 evaluate_refs
             fi
         fi
         if [ -n "$error_list" ]; then
+            stopped_on "$id" && continue
             degrade "$id: DEGRADED — GitHub would not resolve:$error_list — state unknown, leaving open"
             continue
         fi
@@ -632,18 +1080,24 @@ for id in $ids; do
     # the same way whether it looked and found nothing or looked through a lagging
     # index (or a failing GraphQL) and returned early — see the header. So the
     # open PRs of the candidate repos are listed over REST and put through the
-    # same delivery-citation check before anything closes.
-    if ! open_hits=$(open_prs_citing "$id"); then
+    # same delivery-citation check before anything closes. The index is built
+    # here, in the loop's own shell, and never inside the $(...) below: that is
+    # what makes it once per run rather than once per close candidate.
+    if ! open_pr_index || ! open_hits=$(filter_citing_prs "$id" < "$open_pr_index_file"); then
+        stopped_on "$id" && continue
         degrade "$id: DEGRADED — would close, but the open-PR cross-check could not be completed — leaving open (check gh auth/rate limit, and BD_SWEEP_REPOS where there are no sibling checkouts)"
         continue
     fi
     blocking=""
     while IFS=$'\t' read -r hit_or hit_num; do
         [ -n "$hit_num" ] || continue
-        # The index is a snapshot taken at the first close candidate of the run.
-        # A PR that has merged since then already got a fresh per-PR lookup
-        # above, and that answer is the newer one.
-        case " $merged_list $abandoned_list " in *" $hit_or#$hit_num "*) continue ;; esac
+        # The index is a snapshot taken at the first close candidate of the run,
+        # and the per-PR answers come from the run's cache, so either one can be
+        # the older. A PR the lookup found MERGED is merged whichever is newer —
+        # merging is final — so an index entry for it is stale. CLOSED is not
+        # final (a PR can be reopened), so for one the lookup saw CLOSED the
+        # index still speaks: an open PR blocks, and the next run settles it.
+        case " $merged_list " in *" $hit_or#$hit_num "*) continue ;; esac
         blocking="$blocking $hit_or#$hit_num(OPEN)"
     done <<EOF
 $open_hits
@@ -653,35 +1107,52 @@ EOF
         continue
     fi
 
-    # An epic is the unit people plan and report against, so a closed
-    # parent says the initiative shipped. Closing one over open children
-    # stops those children being weighed as outstanding work while they
-    # still surface individually in `bd ready` — acme-2gtn was closed on
-    # its own PR citations with EIGHT children open, six of them P1, and a
-    # full scan found five closed parents holding eighteen open children
-    #. The parent's own PRs merging is evidence about the
-    # parent's PRs, not about its children.
-    open_children=$(children_still_open "$id") || {
-        degrade "$id: DEGRADED — would close, but its children could not be listed — leaving open"
-        continue
-    }
-    if [ -n "$open_children" ]; then
-        say "$id: PRs merged ($merged_list) but children still open —$open_children — a closed parent reads as a shipped initiative; close or reparent them first"
-        continue
-    fi
-
     close_notes=""
     [ -n "$abandoned_list" ] && close_notes=" (superseded, closed unmerged:$abandoned_list)"
     [ -n "$predates_list" ] && close_notes="$close_notes (discounted, merged before this bead started:$predates_list)"
+    [ -n "$missing_list" ] && close_notes="$close_notes (ignored, not a PR in the repo it was attributed to:$missing_list)"
     if [ "$APPLY" = 1 ]; then
-        bd close "$id" --reason="all referenced PRs merged:$merged_list$close_notes (bd-sweep-merged)" &&
+        close_out=$(bd close "$id" --reason="all referenced PRs merged:$merged_list$close_notes (bd-sweep-merged)" 2>&1)
+        close_rc=$?
+        if [ "$close_rc" = 0 ]; then
+            [ -n "$close_out" ] && say "$close_out"
             echo "$id: CLOSED —$merged_list$close_notes"
-        closed_any=1
+            closed_any=1
+        elif printf '%s' "$close_out" | grep -q 'blocked by open issues'; then
+            # bd ANSWERED. A dependency block is a known state, not an unknown
+            # one, so it must not degrade the run: the beads' PRs are all
+            # merged, and the only thing standing in the way is a dependency
+            # the tracker can name. Treated like the "children still open"
+            # case above, which is the same shape one level up.
+            #
+            # This distinction is why the nightly went red on 09-03 and 09-04:
+            # two beads blocked on open dependencies, both reported as "DEGRADED -
+            # re-run when bd answers". bd had answered. A dependency block is
+            # PERMANENT until someone acts, so "re-run" could never clear it
+            # and every subsequent nightly failed on the same two beads while
+            # --search-citing, the only direction-1 rescue lane, stayed dark.
+            blockers=$(printf '%s' "$close_out" | sed -n 's/.*blocked by open issues \[\([^]]*\)\].*/\1/p' | head -1)
+            say "$id: PRs merged ($merged_list) but blocked by open dependencies — ${blockers:-see bd} — close or drop the dependency first"
+        else
+            # A close that did not land is not a close. On 2026-08-30 `bd close`
+            # calls sat behind a wedged pull for over an hour and failed; the old
+            # `&&` form printed nothing and exited 0, so the sweep read clean
+            # while the bead stayed open - the exact "done but still open" class
+            # this script exists to end. Report it and degrade the run.
+            [ -n "$close_out" ] && echo "$close_out"
+            degrade "$id: DEGRADED — bd close failed (rc=$close_rc); the bead stays open, re-run when bd answers"
+        fi
     else
         echo "$id: would close —$merged_list$close_notes (dry run; pass --apply)"
         closed_any=1
     fi
 done
+
+if rate_stopped; then
+    degraded=1
+    set -- $not_evaluated
+    echo "bd-sweep-merged: DEGRADED — stopped early to spare the shared GitHub token: $(cat "$run_dir/rate-stop"). $# bead(s) that still needed GitHub were not evaluated and are left as they were:${not_evaluated:- none}. A sweep after the reset picks them up; nothing was closed on a half-asked question."
+fi
 
 # --- reverse audit over recently merged PRs -----------------------------
 #
@@ -730,6 +1201,11 @@ run_merged_audit() {
     audited=0
     findings=0
     for repo in "${sibling_repos[@]}"; do
+        if rate_stopped; then
+            echo "AUDIT DEGRADED — not audited from $owner/$repo on: the sweep stopped spending the GitHub budget (see above)"
+            findings=1
+            break
+        fi
         merged_prs=$(gh pr list --repo "$owner/$repo" --state merged --limit 200 \
             --search "merged:>=$since" --json number,title,body,headRefName 2>/dev/null) || {
             echo "AUDIT DEGRADED — could not list merged PRs for $owner/$repo"
@@ -737,6 +1213,14 @@ run_merged_audit() {
             continue
         }
         count=$(printf '%s' "$merged_prs" | jq 'length' 2>/dev/null || echo 0)
+        if [ "$count" -ge 200 ] 2>/dev/null; then
+            # The listing is capped, and a capped list reads exactly like a
+            # complete one: "Audited 200" while the repo merged 650 in ten
+            # days (cluster, late August). Say so rather than report a clean
+            # audit over PRs that were never looked at.
+            echo "AUDIT DEGRADED — $owner/$repo hit the 200-PR listing cap for this window; merged PRs beyond it were NOT audited (narrow --audit-merged or raise the cap)"
+            findings=1
+        fi
         [ "$count" -gt 0 ] 2>/dev/null || continue
         index=0
         while [ "$index" -lt "$count" ]; do
@@ -768,6 +1252,12 @@ run_merged_audit() {
 audit_findings=0
 if [ "$AUDIT" = 1 ]; then
     run_merged_audit || audit_findings=1
+fi
+
+# What this run cost the shared token: requests made, and how many of them were
+# 304s that GitHub did not bill. Report-only, for whoever is chasing the budget.
+if [ -s "$run_dir/calls" ]; then
+    say "GitHub: $(grep -c . "$run_dir/calls") request(s) this run, $(grep -c $'\t304$' "$run_dir/calls") of them unbilled 304s."
 fi
 
 if [ "$degraded" = 1 ]; then

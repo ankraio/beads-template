@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+# test-bd-precreate-check — pins the create-time duplicate check and its hook.
+#
+# The case that matters is modeled on a real one: a bead was filed for a defect
+# two open beads already tracked, during a live incident, because the author's
+# `bd list` grep used their own framing ('export', 'scope', 'owned') and the
+# existing beads said 'overwrites' and 'ownership'. Test 1 is that shape. If it
+# ever stops matching, the check has stopped doing the one job it was written
+# for.
+#
+# Scores are relative to the corpus (IDF is computed from it), so every scoring
+# test runs against scripts/testdata/dup-corpus.json rather than a live
+# tracker, which would drift on every `bd create`. The corpus is synthetic: a
+# fictional company's beads, safe to publish. Replace it with an export of your
+# own tracker only if that repo stays private.
+#
+# The hook tests exist because a sibling lint hook shipped the opposite bug: a
+# whole-string match denied commands that merely NAMED a tool inside a quoted
+# argument. Test 5 is that trap.
+
+set -uo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+CHECK="$SCRIPT_DIR/bd-precreate-check"
+HOOK="$SCRIPT_DIR/beads-precreate-guard.py"
+export BD_PRECREATE_CORPUS="$SCRIPT_DIR/testdata/dup-corpus.json"
+
+PASS=0
+FAIL=0
+
+ok()   { printf '  ok    %s\n' "$1"; PASS=$((PASS+1)); }
+bad()  { printf '  FAIL  %s\n     %s\n' "$1" "$2"; FAIL=$((FAIL+1)); }
+
+# The proposal, using the author's framing rather than the existing beads'.
+DUP_TITLE="[bug] Config state export is tenant-wide, not job-scoped: a billing worker run rewrites UNRELATED modules' settings.yaml from stale stored state"
+DUP_BODY="P1 - northwind/eu-west (a1b2c3d4), ticket 7e6f5d4c, 2026-08-27.
+A billing worker job (step billing_rollup_invoices, scheduler nightly_job_scheduler_org) emits a git commit titled 'Refresh billing rollup config'. It does not confine itself to the billing module: it re-exports the platform's stored values for modules the job does not own, overwriting git with a STALE snapshot. On northwind this deleted a rate-limit pin from the gateway module five times, including the platform's own update_module_settings write 14 seconds later. Scope the export to owned resources and do not overwrite with a snapshot older than the newest committed write. Related: .owned-paths.json ownership manifest."
+
+echo "bd-precreate-check"
+
+# 1. The real duplicate must be reported, and the known twins must be in it.
+output=$("$CHECK" --title "$DUP_TITLE" --description "$DUP_BODY" 2>&1)
+status=$?
+if [ "$status" -ne 1 ]; then
+    bad "reports the 2026-08-27 duplicate" "expected exit 1, got $status"
+elif ! printf '%s' "$output" | grep -q "acme-qtqrn" || ! printf '%s' "$output" | grep -q "acme-9ejqm"; then
+    bad "reports the 2026-08-27 duplicate" "expected acme-qtqrn and acme-9ejqm in: $output"
+else
+    ok "reports the 2026-08-27 duplicate (acme-qtqrn, acme-9ejqm)"
+fi
+
+# 2. Unrelated proposals must stay silent. A check that fires on everything is
+#    a check that gets scrolled past, which is how the next real twin is missed.
+while IFS='|' read -r label title; do
+    [ -n "$label" ] || continue
+    output=$("$CHECK" --title "$title" 2>&1)
+    status=$?
+    if [ "$status" -ne 0 ]; then
+        bad "silent on unrelated: $label" "expected exit 0, got $status: $output"
+    else
+        ok "silent on unrelated: $label"
+    fi
+done <<'CONTROLS'
+web/mobile|Web dashboard hero shows the wrong project count on mobile Safari
+email/archive|Campaign email to an archived contact should be refused
+queue/upgrade|Queue upgrade scheduler should skip worker pools already at target version
+CONTROLS
+
+# 3. The min-shared floor must be load-bearing, not decorative.
+#
+#    Two DIFFERENT support sweeps clear the score threshold on only 3 shared
+#    tokens ('epic', 'support', 'sweep'). Dice divides by the summed weight of
+#    both sides, so two short titles in the same genre clear it without
+#    describing the same work at all. This is the exact false-positive class
+#    bd-dup-check's own header warns turns a check into eight lines everyone
+#    scrolls past. The floor removes them. Both directions are pinned so a
+#    future tidy-up cannot drop it silently. The probe is a NEW sweep title
+#    rather than one already in the corpus: any existing bead's own title
+#    self-matches at ~100%, which would pass the test for the wrong reason.
+SWEEP_TITLE="[epic] Initech support sweep 2026-09-01: SUP-900/901/902/903"
+"$CHECK" --min-shared 1 --title "$SWEEP_TITLE" >/dev/null 2>&1
+without_floor=$?   # 1 = the genre false positive is reported
+"$CHECK" --title "$SWEEP_TITLE" >/dev/null 2>&1
+with_floor=$?      # 0 = the floor suppressed it
+if [ "$without_floor" -eq 1 ] && [ "$with_floor" -eq 0 ]; then
+    ok "min-shared floor is load-bearing (suppresses the same-genre false positive)"
+else
+    bad "min-shared floor is load-bearing" \
+        "expected exit 1 without the floor and 0 with it, got $without_floor and $with_floor"
+fi
+
+# 4. An unreadable corpus must not manufacture a verdict.
+output=$(BD_PRECREATE_CORPUS=/nonexistent/corpus.json "$CHECK" --title "$DUP_TITLE" --description "$DUP_BODY" 2>&1)
+if [ $? -eq 0 ]; then
+    ok "fails open when the corpus cannot be read"
+else
+    bad "fails open when the corpus cannot be read" "expected exit 0, got: $output"
+fi
+
+echo
+echo "beads-precreate-guard hook"
+
+if [ ! -x "$HOOK" ]; then
+    bad "hook is installed and executable" "not found or not executable: $HOOK"
+else
+    # decision <command> -> prints "deny" or "allow". The hook finds its checker
+    # through BEADS_DIR, so pin it to THIS repo: an inherited BEADS_DIR tests
+    # some other tracker's checker, and none (tests.yml) makes the hook fail
+    # open, which failed the first deny case in CI.
+    decision() {
+        printf '%s' "$1" \
+          | python3 -c 'import json,sys; print(json.dumps({"tool_input":{"command":sys.stdin.read()}}))' \
+          | BEADS_DIR="$SCRIPT_DIR/../.beads" BD_PRECREATE_CORPUS="$BD_PRECREATE_CORPUS" python3 "$HOOK" 2>/dev/null \
+          | grep -q '"deny"' && echo deny || echo allow
+    }
+
+    expect() { # expect <expected> <label> <command>
+        got=$(decision "$3")
+        if [ "$got" = "$1" ]; then ok "$2"; else bad "$2" "expected $1, got $got"; fi
+    }
+
+    expect deny "denies a bd create that duplicates an open bead" \
+        "bd create \"$DUP_TITLE\" -p 1 -t bug -d \"$DUP_BODY\""
+
+    expect allow "allows an unrelated bd create" \
+        'bd create "Web dashboard hero shows the wrong project count on mobile Safari" -p 3'
+
+    # The trap: a tool named inside a quoted argument is DATA.
+    expect allow "allows bd comment that merely mentions bd create" \
+        "bd comment acme-qtqrn \"we should bd create a follow-up for the export scoping: $DUP_TITLE\""
+
+    expect allow "allows git commit whose message mentions bd create" \
+        'git commit -m "bd create was not run for this; see acme-qtqrn"'
+
+    expect allow "allows the BD_DUP_ACK escape hatch" \
+        "BD_DUP_ACK=1 bd create \"$DUP_TITLE\" -d \"$DUP_BODY\""
+
+    expect allow "allows an unrelated command entirely" \
+        'ls -la && echo done'
+
+    expect allow "allows bd subcommands other than create" \
+        "bd update acme-qtqrn --status=in_progress"
+
+    # Fail-open on input the hook cannot parse.
+    got=$(printf 'not json at all' | python3 "$HOOK" 2>/dev/null | grep -q '"deny"' && echo deny || echo allow)
+    if [ "$got" = "allow" ]; then ok "fails open on malformed hook input"; else bad "fails open on malformed hook input" "got $got"; fi
+
+    got=$(decision 'bd create "unterminated quote')
+    if [ "$got" = "allow" ]; then ok "fails open on an unbalanced quote"; else bad "fails open on an unbalanced quote" "got $got"; fi
+fi
+
+echo
+printf '%d passed, %d failed\n' "$PASS" "$FAIL"
+[ "$FAIL" -eq 0 ]

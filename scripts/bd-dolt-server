@@ -1,0 +1,205 @@
+#!/usr/bin/env bash
+# bd-dolt-server — run the tracker's dolt sql-server as a supervised launchd
+# agent that OTHER machines can use, without fighting bd's own server logic.
+#
+# The shared-server kit from the 2026-09-01 review. Per-laptop
+# Dolt replicas synced at session boundaries are why the resolver, the
+# reconcile, the fork detector, the stale marker and most of
+# templates/beads-sync.sh exist. One always-on server removes the need for all
+# of them: every bd points at it, a claim is visible everywhere the instant it
+# is written, and CI reads the same database instead of re-cloning it nightly.
+#
+# THE ONE DESIGN RULE, learned live on 2026-09-01: bd auto-starts a dolt
+# sql-server whenever it believes none is running, and it decides that from
+# .beads/dolt-server.pid. A server bd did not start looks dead to it after
+# every restart (stale pid), so bd launched its own on the same data directory,
+# both stalled on the directory lock, and bd was down for five minutes. bd
+# never auto-starts when it is told a UNIX SOCKET (BEADS_DOLT_SERVER_SOCKET;
+# verified: a bogus socket fails cleanly and starts nothing). So the server
+# here listens on BOTH a TCP address for remote clients AND a socket for local
+# ones, and this host's bd is pointed at the socket. The wrapper also rewrites
+# bd's pid and port files on every start so `bd dolt status` stays truthful.
+#
+# Usage:
+#   bd-dolt-server install [--host ADDR] [--port N] [--no-local-env]
+#       ADDR defaults to 0.0.0.0 (loopback plus the tailnet; root is
+#       localhost-only, remote clients authenticate as a named user).
+#       N defaults to the port bd already uses here (.beads/dolt-server.port).
+#       Writes BEADS_DOLT_SERVER_SOCKET into <ws>/.claude/settings.local.json
+#       (env block) and <ws>/.envrc unless --no-local-env.
+#   bd-dolt-server status
+#   bd-dolt-server restart       # stop the running server and wait for bd to
+#                                # answer again; a server reads its git remote
+#                                # settings once, so this is how they change
+#   bd-dolt-server uninstall     # removes the agent and the local socket env;
+#                                # bd auto-starts its own server again
+#
+# Remote user (once, on the running server; password in a 0600 file, never git):
+#   PW=$(cat ~/.claude/beads-dolt-password)
+#   bd sql "CREATE USER IF NOT EXISTS 'beads'@'%' IDENTIFIED BY '$PW'"
+#   bd sql "GRANT ALL ON *.* TO 'beads'@'%'"
+# Remote client (spike; environment only, `bd dolt set` writes tracked files):
+#   BEADS_DOLT_SERVER_HOST=<tailnet addr> BEADS_DOLT_SERVER_PORT=<port>
+#   BEADS_DOLT_SERVER_USER=beads BEADS_DOLT_PASSWORD=...   (settings.local.json env + .envrc)
+# Exit: 0 ok, 1 environment error.
+
+set -uo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+REPO=$(cd "$SCRIPT_DIR/.." && pwd)
+WS=$(dirname "$REPO")
+WS_NAME=$(basename "$WS")
+DATA_DIR="$REPO/.beads/dolt"
+SOCK="$REPO/.beads/dolt.sock"
+PIDF="$REPO/.beads/dolt-server.pid"
+PORTF="$REPO/.beads/dolt-server.port"
+LABEL="io.beads.dolt.$WS_NAME"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+LOG="$HOME/.claude/logs/beads-dolt-server-$WS_NAME.log"
+HOST=0.0.0.0
+PORT=$(tr -dc '0-9' < "$PORTF" 2>/dev/null); [ -n "$PORT" ] || PORT=3307
+LOCAL_ENV=1
+ACTION=${1:-status}; shift || true
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --host) HOST=$2; shift 2 ;;
+        --port) PORT=$2; shift 2 ;;
+        --no-local-env) LOCAL_ENV=0; shift ;;
+        -h|--help) sed -n '2,44p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *) echo "bd-dolt-server: unknown option $1" >&2; exit 1 ;;
+    esac
+done
+
+DOLT=$(command -v dolt || true)
+[ -n "$DOLT" ] || { echo "bd-dolt-server: dolt not on PATH" >&2; exit 1; }
+[ -d "$DATA_DIR" ] || { echo "bd-dolt-server: no Dolt data dir at $DATA_DIR (is this tracker in server mode?)" >&2; exit 1; }
+
+listening() { nc -z "$1" "$2" >/dev/null 2>&1; }
+# Only the servers on THIS tracker's data directory. A bare
+# `pgrep -f 'dolt sql-server'` matched every tracker's server on the machine,
+# so `install` for a second server-mode tracker would kill this workspace's
+# launchd server under its live sessions, then refuse to start because
+# KeepAlive had already restarted it. bd's own server and ours both run with
+# the data directory as their cwd, which is the one fact that names the
+# tracker.
+server_pids() {
+    for p in $(pgrep -f 'dolt sql-server' 2>/dev/null); do
+        [ "$(lsof -a -p "$p" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p')" = "$DATA_DIR" ] && echo "$p"
+    done
+    return 0
+}
+count() { server_pids | wc -l | tr -d ' '; }
+
+# Put BEADS_DOLT_SERVER_SOCKET where every bd on this machine will see it:
+# the workspace settings.local.json env block (agent sessions, and the
+# hooks they run) and .envrc (shells). Not settings.json: that file is
+# generated from the team template and must stay machine-independent.
+local_env_set() {
+    f="$WS/.claude/settings.local.json"
+    if command -v jq >/dev/null 2>&1; then
+        mkdir -p "$WS/.claude"
+        [ -s "$f" ] || echo '{}' > "$f"
+        jq --arg s "$SOCK" '.env = ((.env // {}) + {BEADS_DOLT_SERVER_SOCKET: $s})' "$f" > "$f.tmp" && mv "$f.tmp" "$f" && echo "local env: BEADS_DOLT_SERVER_SOCKET set in $f"
+    else
+        echo "bd-dolt-server: jq missing; add BEADS_DOLT_SERVER_SOCKET=$SOCK to $f env by hand" >&2
+    fi
+    if [ -f "$WS/.envrc" ] && ! grep -q 'BEADS_DOLT_SERVER_SOCKET' "$WS/.envrc"; then
+        printf 'export BEADS_DOLT_SERVER_SOCKET=%s\n' "$SOCK" >> "$WS/.envrc" && echo "local env: appended to $WS/.envrc (run: direnv allow $WS)"
+    fi
+}
+local_env_unset() {
+    f="$WS/.claude/settings.local.json"
+    [ -s "$f" ] && command -v jq >/dev/null 2>&1 && jq 'del(.env.BEADS_DOLT_SERVER_SOCKET)' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+    [ -f "$WS/.envrc" ] && sed -i '' '/^export BEADS_DOLT_SERVER_SOCKET=/d' "$WS/.envrc" 2>/dev/null
+    return 0
+}
+
+case "$ACTION" in
+    status)
+        if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then echo "agent: $LABEL loaded"; else echo "agent: not installed"; fi
+        echo "socket: $SOCK $([ -S "$SOCK" ] && echo present || echo absent)"
+        echo "tcp: $(cat "$PORTF" 2>/dev/null || echo '?') $(listening 127.0.0.1 "$(cat "$PORTF" 2>/dev/null || echo 0)" && echo listening || echo closed)"
+        for p in $(server_pids); do echo "process: $(ps -o pid=,etime=,args= -p "$p" | cut -c1-110)"; done
+        echo "local env: $(grep -c BEADS_DOLT_SERVER_SOCKET "$WS/.claude/settings.local.json" 2>/dev/null || echo 0) in settings.local.json, $(grep -c BEADS_DOLT_SERVER_SOCKET "$WS/.envrc" 2>/dev/null || echo 0) in .envrc"
+        cd "$REPO" && BEADS_DIR="$REPO/.beads" bd dolt status 2>/dev/null | sed 's/^/bd: /' | head -3
+        ;;
+    restart)
+        cd "$REPO" || exit 1
+        export BEADS_DIR="$REPO/.beads"
+        if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
+            export BEADS_DOLT_SERVER_SOCKET="$SOCK"
+            launchctl kickstart -k "gui/$(id -u)/$LABEL" || { echo "bd-dolt-server: launchctl kickstart failed" >&2; exit 1; }
+        else
+            # bd's own server: it starts it again on its next command. Nothing
+            # to wait out if it was not running.
+            bd dolt stop >/dev/null 2>&1 || true
+        fi
+        # bd's circuit breaker fails fast for 5 s after a refused connection, so
+        # the first tries can fail while the server is already up.
+        for _ in $(seq 1 30); do
+            if bd list --limit 1 >/dev/null 2>&1; then
+                echo "server restarted, bd answers"
+                exit 0
+            fi
+            sleep 1
+        done
+        echo "bd-dolt-server: bd has no answer 30 tries after the restart; see $LOG" >&2
+        exit 1
+        ;;
+    install)
+        mkdir -p "$(dirname "$LOG")" "$(dirname "$PLIST")"
+        cat > "$PLIST" <<PL
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>$LABEL</string>
+  <key>ProgramArguments</key><array>
+    <string>/bin/sh</string><string>-c</string>
+    <string>printf '%s\\n' \$\$ > '$PIDF'; printf '%s\\n' '$PORT' > '$PORTF'; rm -f '$SOCK'; exec '$DOLT' sql-server -H '$HOST' -P '$PORT' --socket '$SOCK' --loglevel=warning</string>
+  </array>
+  <key>EnvironmentVariables</key><dict>
+    <key>GIT_SSH_COMMAND</key><string>ssh -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=30 -o ServerAliveCountMax=3</string>
+  </dict>
+  <key>WorkingDirectory</key><string>$DATA_DIR</string>
+  <key>KeepAlive</key><true/>
+  <key>RunAtLoad</key><true/>
+  <key>ThrottleInterval</key><integer>5</integer>
+  <key>StandardOutPath</key><string>$LOG</string>
+  <key>StandardErrorPath</key><string>$LOG</string>
+</dict></plist>
+PL
+        cd "$REPO" || exit 1
+        export BEADS_DIR="$REPO/.beads"
+        # Local bd must stop auto-starting BEFORE the handover, or the first bd
+        # call during the gap starts a competing server on the data directory.
+        [ "$LOCAL_ENV" = 1 ] && local_env_set
+        export BEADS_DOLT_SERVER_SOCKET="$SOCK"
+        if pgrep -x bd >/dev/null 2>&1; then
+            echo "waiting up to 30 s for running bd processes"
+            for _ in $(seq 1 30); do pgrep -x bd >/dev/null 2>&1 || break; sleep 1; done
+        fi
+        launchctl bootout "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || true
+        # Stop every dolt sql-server on this tracker's data dir (bd's own one
+        # included): the directory lock allows exactly one.
+        for p in $(server_pids); do kill "$p" 2>/dev/null; done
+        for _ in $(seq 1 10); do [ "$(count)" = 0 ] && break; sleep 1; done
+        [ "$(count)" = 0 ] || { echo "bd-dolt-server: a dolt sql-server is still running; not starting a second one" >&2; exit 1; }
+        launchctl bootstrap "gui/$(id -u)" "$PLIST" || { echo "bd-dolt-server: launchctl bootstrap failed" >&2; exit 1; }
+        for _ in $(seq 1 20); do [ -S "$SOCK" ] && listening 127.0.0.1 "$PORT" && break; sleep 1; done
+        [ -S "$SOCK" ] || { echo "bd-dolt-server: no socket at $SOCK after 20 s; see $LOG" >&2; exit 1; }
+        if timeout 30 bd list --limit 1 >/dev/null 2>&1; then
+            echo "installed $LABEL: dolt sql-server on $HOST:$PORT + $SOCK for $DATA_DIR (log: $LOG)"
+            n=$(count); [ "$n" = 1 ] || echo "WARNING: $n dolt sql-server processes running; expected 1"
+            echo "this host's bd uses the socket (BEADS_DOLT_SERVER_SOCKET); sessions started before now still hold the old environment until they end"
+        else
+            echo "bd-dolt-server: server is up but bd cannot use it via $SOCK; see $LOG" >&2; exit 1
+        fi
+        ;;
+    uninstall)
+        launchctl bootout "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || true
+        rm -f "$PLIST" "$SOCK"
+        local_env_unset
+        echo "removed $LABEL and the local socket env; bd auto-starts its own server on the next command"
+        ;;
+    *) echo "bd-dolt-server: unknown action $ACTION" >&2; exit 1 ;;
+esac

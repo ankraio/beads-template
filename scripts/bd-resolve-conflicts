@@ -1,0 +1,484 @@
+#!/usr/bin/env bash
+# bd-resolve-conflicts — resolve a conflicted Dolt merge in the beads tracker
+# mechanically, with the policy derived from the 80-row case,
+# so an unattended sync can complete instead of parking the machine on
+# "merge conflicts require operator resolution".
+#
+# WHY THIS EXISTS
+#
+# Every pull that merges two lineages of this tracker produces row conflicts
+# in `issues`, because both lineages write the same rows — a laptop closing a
+# bead and the nightly CI sweep closing it again, or two machines touching the
+# same bead in one day. Until now the sync hook had no policy, so the pull
+# aborted, every later push was rejected non-fast-forward behind it, and the
+# machine was partitioned in both directions until a human ran the operator
+# merge (SETUP.md). That partition is the root of the twin-fix incidents
+# and was resolved by hand three times on 2026-08-30
+# alone (80 rows, then 1, then 5).
+#
+# THE POLICY, and why the obvious ones are wrong
+#
+# Neither wholesale option is safe: on the 80-row case, `--theirs` would have
+# REOPENED 2 beads this machine had closed, and `--ours` would have DISCARDED
+# 7 closes the other lineage made. Both are the exact bug the tracker exists
+# to prevent, in opposite directions. Timestamps are NOT a tiebreaker either:
+# bd-reconcile-fork imports records as `open` and updates them back
+#, so "our" updated_at is routinely a synthetic artifact of the
+# import while THEIR `closed` is the true state — newest-wins would have
+# silently discarded 4 real closes.
+#
+#   1. Take --ours as the base (57 of the 80 rows differed only in
+#      non-status fields and are safe either way).
+#   2. Re-apply THEIR close for every row where their_status='closed' and
+#      ours is not. A close is a fact someone established; losing it
+#      recreates the "finished work still open" symptom. Done via `bd close`
+#      so the audit trail is real, not by SQL.
+#   3. NEVER take theirs where ours is closed and theirs is not — that is
+#      the reopening direction and it is never right.
+#   4. Counter tables (child_counters, issue_counter) take the MAX of the
+#      two sides, never either side wholesale: ours said 6 and theirs said 8
+#      for one parent while .7 and .8 already existed, so either side alone
+#      risks reusing a child id.
+#   5. `dependencies` takes ours ONLY where both sides describe the same
+#      edge; any other difference still refuses. Child ids come
+#      from a local counter, so two machines filing a child of one parent
+#      before a sync both mint `<parent>.1`, and the dependency row's key is
+#      derived from the edge — so both lineages produce the SAME row, equal
+#      in every column that means anything and differing only in
+#      created_at/created_by. That is not a disagreement and ours is
+#      lossless. Refusing it anyway is what turned a two-row conflict into a
+#      14-hour team-wide freeze on 2026-09-03: `bd create --parent` always
+#      writes such a row, so this collision is routine and could never
+#      self-heal.
+#   6. An `issues` row whose two sides are two DIFFERENT beads under one id
+#      refuses. Clause 1 is right only while both sides are
+#      versions of ONE bead; when they are not, --ours does not merge them,
+#      it destroys the other lineage's bead. The check below carries the
+#      discriminator and why this only became reachable on 2026-09-04.
+#
+# WHAT IT REFUSES TO RESOLVE
+#
+# Schema conflicts, and row conflicts in any table this policy was not
+# derived for (whitelist below). Those exit 4 — operator merge, SETUP.md
+# "Dolt pull conflict: operator merge" — because a mechanical rule applied
+# to a table it was never reasoned about is how data gets quietly destroyed.
+#
+# CAPTURED CLOSES ARE JOURNALED BEFORE THE RESOLVE. Once
+# dolt_conflicts_resolve runs, the conflict tables are gone and the other
+# lineage's close exists nowhere else — the merge base advances, so a later
+# pull will never re-present it. A `bd close` that fails after that would
+# lose the close silently. So the ids are written to
+# .beads/auto-resolve-pending-closes first, entries are removed only as each
+# close lands, and leftovers are retried on the next run and reported loudly
+# (exit 3) until the file is empty.
+#
+# MECHANICS worth knowing (from the hand-resolves): dolt_conflicts_resolve
+# fails when each statement autocommits its own connection — the commit trips
+# on the conflicts still present. It works when the session settings and the
+# call share ONE dolt sql invocation, which is why the resolve below is a
+# single multi-statement -q. `dolt sql` in the data directory routes to the
+# running sql-server in server mode and opens the store directly in embedded
+# mode, so this script works under both engines (unlike `bd sql`, which is
+# server-only).
+#
+# Usage: bd-resolve-conflicts [--apply] [--quiet]
+#   default  dry run — report the conflict census and what would happen
+#   --apply  resolve, conclude the merge, re-apply the journaled closes
+#   --quiet  for session hooks: suppress "no conflicts". A resolve that
+#            happened and a close that could not be re-applied are ALWAYS
+#            printed — silently merging lineages is not something a hook
+#            may hide.
+#
+# Exit codes:
+#   0  no conflicts, or resolved cleanly
+#   3  degraded — resolved, but one or more journaled closes did not land
+#      (they stay in the journal and are retried next run)
+#   6  nothing to resolve — no row or schema conflicts and no journal; if a
+#      pull just reported a conflict, the merge was aborted and the lineages
+#      are still divergent (the hook treats this as NOT resolved)
+#   4  operator merge needed — schema conflicts, a conflicted table outside
+#      the whitelist, or a dependency conflict whose two sides describe
+#      different edges; nothing was changed
+#
+# The whitelist decision lives in resolve_tables_verdict below;
+# scripts/test-bd-resolve-conflicts pins it and drives the whole resolve
+# against a real scratch Dolt store (source with BD_RESOLVE_CONFLICTS_LIB=1
+# for the functions alone).
+
+set -uo pipefail
+
+# Tables the policy above was derived for. `issues` gets the full
+# ours-base-plus-their-closes treatment; the counter tables get MAX;
+# `dependencies` is taken as ours ONLY when both sides describe the same edge
+# (checked below). Anything else conflicting is an operator's call —
+# including comments/events, where --ours would silently drop the other
+# lineage's audit rows.
+ISSUE_TABLE=issues
+COUNTER_TABLES="child_counters issue_counter"
+DEPENDENCY_TABLE=dependencies
+
+# The columns that make a dependency row MEAN something. Hardcoded for the
+# same reason the counter columns are: the table is whitelisted BECAUSE its
+# shape is known, so drift must fail the resolve loudly rather than have a
+# guesser paper over it. created_at/created_by are deliberately absent —
+# they are provenance, not meaning, and they are exactly what differs when
+# two machines record the same edge.
+DEPENDENCY_IDENTITY_COLS="issue_id depends_on_issue_id type metadata thread_id"
+
+# Answers "may this set of conflicted tables be resolved mechanically?" — the
+# one rule, in one place, so the tests can pin it without a database.
+# Input: conflicted table names, one per line.
+#   0 = all tables covered by the policy
+#   1 = at least one table is not; caller must exit 4 and touch nothing
+resolve_tables_verdict() {
+    _tables="$1"
+    while IFS= read -r _t; do
+        [ -n "$_t" ] || continue
+        case " $ISSUE_TABLE $COUNTER_TABLES $DEPENDENCY_TABLE " in
+            *" $_t "*) ;;
+            *) return 1 ;;
+        esac
+    done <<EOF
+$_tables
+EOF
+    return 0
+}
+
+# A bead id as used in SQL and argv below. Conflict rows come from the other
+# lineage, so treat them as data: an id that does not match this shape is
+# skipped and reported, never interpolated.
+id_is_safe() {
+    case "$1" in
+        *[!A-Za-z0-9._-]*|'') return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+if [ "${BD_RESOLVE_CONFLICTS_LIB:-0}" = 1 ]; then
+    return 0 2>/dev/null || exit 0
+fi
+
+APPLY=0
+QUIET=0
+for arg in "$@"; do
+    case "$arg" in
+        --apply) APPLY=1 ;;
+        --quiet) QUIET=1 ;;
+        *) echo "usage: bd-resolve-conflicts [--apply] [--quiet]" >&2; exit 0 ;;
+    esac
+done
+
+say()  { [ "$QUIET" -eq 1 ] || printf '%s\n' "$*"; }
+warn() { printf '%s\n' "$*" >&2; }
+
+for tool in dolt jq; do
+    command -v "$tool" >/dev/null 2>&1 || { warn "bd-resolve-conflicts: $tool not found"; exit 0; }
+done
+
+# The .beads directory: BEADS_DIR when set (how the sync hook calls every
+# sibling script), else bd's own resolution.
+beads_db="${BEADS_DIR:-}"
+if [ -z "$beads_db" ] && command -v bd >/dev/null 2>&1; then
+    beads_db=$(bd where 2>/dev/null | head -1 | tr -d '[:space:]')
+fi
+if [ -z "$beads_db" ] || [ ! -d "$beads_db" ]; then
+    warn "bd-resolve-conflicts: BEADS_DIR does not resolve to a database (SETUP.md step 4)"
+    exit 0
+fi
+
+# The Dolt data directory — server mode first, embedded second, same order
+# the hook's push fallback probes. `dolt sql` from inside it reaches the
+# right engine in both modes.
+data_dir=""
+for d in "$beads_db"/dolt/*/ "$beads_db"/embeddeddolt/*/; do
+    [ -d "$d/.dolt" ] || continue
+    data_dir="${d%/}"
+    break
+done
+if [ -z "$data_dir" ]; then
+    warn "bd-resolve-conflicts: no Dolt data directory under $beads_db"
+    exit 0
+fi
+
+JOURNAL="$beads_db/auto-resolve-pending-closes"
+
+run_sql() { (cd "$data_dir" && dolt sql -q "$1" 2>&1); }
+# One value out of one-row-one-column queries; empty string on any failure.
+run_sql_scalar() {
+    _out=$( (cd "$data_dir" && dolt sql -r csv -q "$1" 2>/dev/null) | sed -n 2p )
+    printf '%s' "$_out"
+}
+
+n_conflicts=$(run_sql_scalar "SELECT COALESCE(SUM(num_conflicts),0) FROM dolt_conflicts")
+if [ -z "$n_conflicts" ]; then
+    warn "bd-resolve-conflicts: could not read dolt_conflicts — not resolving"
+    exit 0
+fi
+
+journal_pending=0
+[ -s "$JOURNAL" ] && journal_pending=$(grep -c . "$JOURNAL" || true)
+
+# A schema-only conflict has ZERO row conflicts, so it must be read before
+# the "nothing to do" gate or it reads as clean — the test's s4 caught
+# exactly that.
+n_schema=$(run_sql_scalar "SELECT COUNT(*) FROM dolt_schema_conflicts")
+
+if [ "$n_conflicts" -eq 0 ] && [ "${n_schema:-0}" = 0 ] && [ "${journal_pending:-0}" -eq 0 ]; then
+    # Distinct from 0 on purpose: the sync hook calls this only after bd
+    # printed "conflict", and bd in embedded non-interactive mode ABORTS a
+    # conflicted merge and restores the working set. A clean working set at
+    # that point means nothing was resolved and the lineages are still
+    # divergent; exiting 0 here let the hook log `sync OK` over a live
+    # partition (false-green, review 2026-09-01).
+    say "No conflicts: the working set is clean (nothing to resolve)."
+    exit 6
+fi
+
+# ---- refuse what the policy does not cover --------------------------------
+
+if [ -n "$n_schema" ] && [ "$n_schema" -gt 0 ]; then
+    warn "bd-resolve-conflicts: $n_schema SCHEMA conflict(s) — no mechanical policy covers schema; operator merge needed (SETUP.md 'Dolt pull conflict: operator merge'). Nothing was changed."
+    exit 4
+fi
+
+tables=$( (cd "$data_dir" && dolt sql -r csv -q "SELECT \`table\` FROM dolt_conflicts" 2>/dev/null) | sed 1d )
+if [ "$n_conflicts" -gt 0 ] && ! resolve_tables_verdict "$tables"; then
+    warn "bd-resolve-conflicts: conflicts in table(s) the policy was not derived for ($(printf '%s' "$tables" | tr '\n' ' ')) — operator merge needed (SETUP.md). Nothing was changed."
+    exit 4
+fi
+
+# `dependencies` is whitelisted only for the one shape that is provably
+# lossless. A dependency row's primary key is derived from the edge itself,
+# so two machines that each record the SAME link mint the same id with
+# identical identity columns, differing only in created_at/created_by.
+# Taking ours there discards nothing.
+#
+# Every other shape is a real disagreement the policy was never derived for:
+# a different edge or type under the same key, or one side having deleted the
+# row (its columns read NULL, and the NULL-safe <=> makes that a difference
+# rather than a match). Those still refuse, exactly as before.
+if printf '%s\n' "$tables" | grep -qx "$DEPENDENCY_TABLE"; then
+    dep_predicate=""
+    for c in $DEPENDENCY_IDENTITY_COLS; do
+        dep_predicate="${dep_predicate:+$dep_predicate AND }our_$c <=> their_$c"
+    done
+    dep_out=$( (cd "$data_dir" && dolt sql -r csv -q "SELECT COUNT(*) AS n FROM dolt_conflicts_$DEPENDENCY_TABLE WHERE NOT ($dep_predicate)" 2>&1) )
+    n_dep_differ=$(printf '%s' "$dep_out" | sed -n 2p | tr -d '[:space:]')
+    case "${n_dep_differ:-x}" in
+        ''|*[!0-9]*)
+            warn "bd-resolve-conflicts: could not compare dolt_conflicts_$DEPENDENCY_TABLE on ($DEPENDENCY_IDENTITY_COLS) (schema drift?) — operator merge needed (SETUP.md). Nothing was changed."
+            warn "$dep_out"
+            exit 4 ;;
+    esac
+    if [ "$n_dep_differ" -gt 0 ]; then
+        warn "bd-resolve-conflicts: $n_dep_differ dependency conflict(s) where the two sides describe DIFFERENT edges, not the same one recorded twice — operator merge needed (SETUP.md). Nothing was changed."
+        exit 4
+    fi
+fi
+
+# ---- refuse an id COLLISION: one id, two different beads ----
+#
+# Clause 1 takes `issues` as ours for the whole table, which is right while
+# the two sides are two versions of ONE bead and catastrophic when they are
+# two DIFFERENT beads that minted the same id. Child ids come from a
+# per-parent counter held in each machine's own Dolt store with nothing
+# reserving them globally, so two machines filing a child of one parent
+# between syncs both mint `<parent>.<n>`: on 2026-09-04 one child id was
+# filed twice, eighteen minutes apart, for entirely unrelated work. Taking
+# ours there merges nothing. It DESTROYS the other lineage's bead, silently,
+# and the merge base then advances so no later pull can bring it back.
+#
+# That collision refused at the time only because `dependencies` was not yet
+# whitelisted. It was whitelisted the same day,
+# and a collision pair's dependency rows describe the SAME parent edge, so
+# every gate in this policy now passes it through. This check is therefore
+# about data loss, not about unblocking a sync.
+#
+# THE DISCRIMINATOR IS created_at, not content_hash and not created_by.
+# A bead is created once, so both lineages of one bead carry the same
+# creation instant (bd's export carries created_at, so even a
+# bd-reconcile-fork import preserves it), while two independently minted
+# beads never do. content_hash cannot discriminate, because it differs
+# whenever either side edits, and created_by is routinely identical here
+# because the machines share one bd identity.
+#
+# A DIFFERING TITLE IS REQUIRED TOO, so the refusal is reserved for rows that
+# are genuinely different work. Two same-titled children of one parent filed
+# in the same window are duplicates of each other, which is what the dup
+# machinery folds anyway, so those resolve as before: reported, not refused,
+# because a refusal costs every machine its sync.
+if printf '%s\n' "$tables" | grep -qx "$ISSUE_TABLE"; then
+    minted_apart="our_id IS NOT NULL AND their_id IS NOT NULL AND NOT (our_created_at <=> their_created_at)"
+    collision_where="$minted_apart AND NOT (our_title <=> their_title)"
+    collision_out=$( (cd "$data_dir" && dolt sql -r csv -q "SELECT COUNT(*) AS n FROM dolt_conflicts_$ISSUE_TABLE WHERE $collision_where" 2>&1) )
+    n_collisions=$(printf '%s' "$collision_out" | sed -n 2p | tr -d '[:space:]')
+    case "${n_collisions:-x}" in
+        ''|*[!0-9]*)
+            warn "bd-resolve-conflicts: could not compare dolt_conflicts_$ISSUE_TABLE on (created_at, title) (schema drift?) - operator merge needed (SETUP.md). Nothing was changed."
+            warn "$collision_out"
+            exit 4 ;;
+    esac
+    if [ "$n_collisions" -gt 0 ]; then
+        warn "bd-resolve-conflicts: $n_collisions id COLLISION(s) - one id holding two DIFFERENT beads, minted at different times with different titles. Resolving --ours would destroy one of them permanently. Nothing was changed."
+        warn "$( (cd "$data_dir" && dolt sql -q "SELECT our_id AS id, our_created_at, their_created_at, our_title, their_title FROM dolt_conflicts_$ISSUE_TABLE WHERE $collision_where LIMIT 10" 2>&1) )"
+        warn "Operator merge (SETUP.md 'Dolt pull conflict: operator merge'). The EARLIER created_at keeps the id and the later bead is re-filed under a fresh one. READ BOTH SIDES FIRST: dolt_conflicts_resolve erases the other lineage's copy and the merge base advances past it, so this is the last moment it exists."
+        warn "  (cd $data_dir && dolt sql -r json -q \"SELECT * FROM dolt_conflicts_$ISSUE_TABLE WHERE $minted_apart\") > /tmp/bd-collision.json"
+        exit 4
+    fi
+
+    # Same id, minted apart, same title: duplicates of each other rather than
+    # different work (see above). Resolved as usual, but never silently: the
+    # sync log is the only place anyone would notice a bead folding away.
+    dup_out=$( (cd "$data_dir" && dolt sql -r csv -q "SELECT COUNT(*) AS n FROM dolt_conflicts_$ISSUE_TABLE WHERE $minted_apart" 2>&1) )
+    n_minted_apart=$(printf '%s' "$dup_out" | sed -n 2p | tr -d '[:space:]')
+    case "${n_minted_apart:-0}" in
+        ''|*[!0-9]*) n_minted_apart=0 ;;
+    esac
+    if [ "$n_minted_apart" -gt 0 ]; then
+        warn "bd-resolve-conflicts: $n_minted_apart id collision(s) carrying the SAME title on both sides, so two machines filed one child twice. Keeping ours, which is what folding a duplicate does; the other lineage's copy goes away with the resolve."
+    fi
+fi
+
+# ---- census ---------------------------------------------------------------
+
+n_their_closes=0
+n_protected=0
+n_same_edge=0
+if printf '%s\n' "$tables" | grep -qx "$DEPENDENCY_TABLE"; then
+    n_same_edge=$(run_sql_scalar "SELECT COUNT(*) FROM dolt_conflicts_$DEPENDENCY_TABLE")
+fi
+if printf '%s\n' "$tables" | grep -qx "$ISSUE_TABLE"; then
+    n_their_closes=$(run_sql_scalar "SELECT COUNT(*) FROM dolt_conflicts_issues WHERE their_status='closed' AND COALESCE(our_status,'')<>'closed' AND their_id IS NOT NULL")
+    n_protected=$(run_sql_scalar "SELECT COUNT(*) FROM dolt_conflicts_issues WHERE our_status='closed' AND COALESCE(their_status,'')<>'closed'")
+fi
+
+if [ "$APPLY" -eq 0 ]; then
+    # Dry run prints on --quiet too: an unresolved conflict is exactly the
+    # condition a hook is watching for.
+    printf 'Dolt merge conflicts: %s row(s) (%s). Policy would keep ours as base, re-apply %s close(s) from the other lineage, protect %s local close(s) from reopening, take MAX on counter rows, and keep ours on %s same-edge dependency row(s).\n' \
+        "$n_conflicts" "$(printf '%s' "$tables" | tr '\n' ' ' | sed 's/ $//')" "${n_their_closes:-0}" "${n_protected:-0}" "${n_same_edge:-0}"
+    [ "${journal_pending:-0}" -gt 0 ] && printf '%s close(s) from an earlier resolve are still journaled in %s.\n' "$journal_pending" "$JOURNAL"
+    printf 'Run bd-resolve-conflicts --apply to resolve.\n'
+    exit 0
+fi
+
+# ---- capture BEFORE resolving (see header: the conflict tables are the only
+# place the other lineage's close still exists) ------------------------------
+
+if [ "${n_their_closes:-0}" -gt 0 ]; then
+    (cd "$data_dir" && dolt sql -r json -q "SELECT their_id AS id, COALESCE(their_close_reason,'') AS reason FROM dolt_conflicts_issues WHERE their_status='closed' AND COALESCE(our_status,'')<>'closed' AND their_id IS NOT NULL" 2>/dev/null) |
+        jq -r '.rows[] | [.id, (.reason | gsub("[\\t\\n\\r]"; " ") | .[0:200])] | @tsv' >>"$JOURNAL" 2>/dev/null
+    if [ ! -s "$JOURNAL" ]; then
+        warn "bd-resolve-conflicts: found $n_their_closes close(s) to preserve but could not journal them — not resolving (their closes would be lost)."
+        exit 4
+    fi
+fi
+
+# Counter maxes, captured for the same reason. The column names are hardcoded
+# per table rather than introspected: these tables are whitelisted BECAUSE
+# their shape is known, and a schema that no longer matches must fail the
+# resolve loudly, not have a guesser paper over it.
+counter_cols() {
+    case "$1" in
+        child_counters) printf 'parent_id last_child' ;;
+        issue_counter)  printf 'prefix last_id' ;;
+        *) return 1 ;;
+    esac
+}
+counter_fixes=$(mktemp "${TMPDIR:-/tmp}/bd-resolve-counters.XXXXXX") || exit 0
+trap 'rm -f "$counter_fixes"' EXIT
+for ct in $COUNTER_TABLES; do
+    printf '%s\n' "$tables" | grep -qx "$ct" || continue
+    read -r pkcol valcol <<<"$(counter_cols "$ct")"
+    capture_out=$( (cd "$data_dir" && dolt sql -r json -q "SELECT COALESCE(our_$pkcol, their_$pkcol) AS pk, GREATEST(COALESCE(our_$valcol,0), COALESCE(their_$valcol,0)) AS mx FROM dolt_conflicts_$ct" 2>&1) )
+    if ! printf '%s' "$capture_out" | jq -e '.rows' >/dev/null 2>&1; then
+        warn "bd-resolve-conflicts: could not read dolt_conflicts_$ct (schema drift?) — operator merge needed. Nothing was changed."
+        warn "$capture_out"
+        exit 4
+    fi
+    printf '%s' "$capture_out" |
+        jq -r --arg t "$ct" '.rows[] | [$t, .pk, (.mx|tostring)] | @tsv' >>"$counter_fixes"
+done
+
+# ---- resolve --------------------------------------------------------------
+
+resolve_stmts="SET @@dolt_allow_commit_conflicts = 1;"
+while IFS= read -r t; do
+    [ -n "$t" ] || continue
+    resolve_stmts="$resolve_stmts CALL dolt_conflicts_resolve('--ours', '$t');"
+done <<EOF
+$tables
+EOF
+if [ "$n_conflicts" -gt 0 ]; then
+    resolve_out=$(run_sql "$resolve_stmts")
+    left=$(run_sql_scalar "SELECT COALESCE(SUM(num_conflicts),0) FROM dolt_conflicts")
+    if [ -z "$left" ] || [ "$left" -ne 0 ]; then
+        warn "bd-resolve-conflicts: resolve did not clear the conflicts (${left:-unreadable} left) — operator merge needed."
+        warn "$resolve_out"
+        exit 4
+    fi
+fi
+
+# Counter maxes back on top of the ours-base.
+while IFS=$'\t' read -r t key mx; do
+    [ -n "$t" ] || continue
+    id_is_safe "$key" || { warn "bd-resolve-conflicts: skipping $t row with unsafe key ($key)"; continue; }
+    case "$mx" in *[!0-9]*|'') warn "bd-resolve-conflicts: skipping $t row with non-numeric max ($mx)"; continue ;; esac
+    read -r pkcol valcol <<<"$(counter_cols "$t")"
+    run_sql "INSERT INTO \`$t\` (\`$pkcol\`, \`$valcol\`) VALUES ('$key', $mx) ON DUPLICATE KEY UPDATE \`$valcol\` = GREATEST(\`$valcol\`, $mx)" >/dev/null
+done <"$counter_fixes"
+n_counters=$(grep -c . "$counter_fixes" 2>/dev/null || true)
+
+# Conclude the merge. Without this the working set stays mid-merge and the
+# next `bd dolt commit` trips over it exactly like before.
+commit_out=$(run_sql "CALL dolt_commit('-Am', 'beads-sync auto-resolve: $n_conflicts row conflict(s), ours as base, their closes re-applied')")
+if printf '%s' "$commit_out" | grep -qiE 'error' && ! printf '%s' "$commit_out" | grep -qi 'nothing to commit'; then
+    warn "bd-resolve-conflicts: resolve applied but the merge commit failed — run 'bd dolt commit' by hand and check the journal."
+    warn "$commit_out"
+    exit 3
+fi
+
+# ---- re-apply the journaled closes ----------------------------------------
+
+n_reapplied=0
+n_close_failed=0
+if [ -s "$JOURNAL" ]; then
+    remaining=$(mktemp "${TMPDIR:-/tmp}/bd-resolve-journal.XXXXXX") || exit 3
+    while IFS=$'\t' read -r id reason; do
+        [ -n "$id" ] || continue
+        if ! id_is_safe "$id"; then
+            warn "bd-resolve-conflicts: journaled id looks unsafe, keeping for a human: $id"
+            printf '%s\t%s\n' "$id" "$reason" >>"$remaining"
+            continue
+        fi
+        st=$(run_sql_scalar "SELECT status FROM issues WHERE id='$id'")
+        if [ "$st" = "closed" ]; then
+            n_reapplied=$((n_reapplied + 1))   # already landed (retry, or ours closed too)
+            continue
+        fi
+        if command -v bd >/dev/null 2>&1 &&
+           bd close "$id" --actor beads-auto-resolve --reason "close from the other lineage preserved by auto-resolve${reason:+ (their reason: $reason)}" >/dev/null 2>&1; then
+            n_reapplied=$((n_reapplied + 1))
+        else
+            n_close_failed=$((n_close_failed + 1))
+            printf '%s\t%s\n' "$id" "$reason" >>"$remaining"
+            warn "bd-resolve-conflicts: could not re-apply close for $id — kept in journal for retry"
+        fi
+    done <"$JOURNAL"
+    if [ -s "$remaining" ]; then mv "$remaining" "$JOURNAL"; else rm -f "$remaining" "$JOURNAL"; fi
+fi
+
+# Flush the closes into a Dolt commit so the push that follows carries them.
+if command -v bd >/dev/null 2>&1 && [ "$n_reapplied" -gt 0 ]; then
+    bd dolt commit >/dev/null 2>&1
+fi
+
+# A resolve is always reported, --quiet or not (same rule as the reconcile:
+# a hook must not hide a merge of lineages).
+printf 'Auto-resolved %s Dolt row conflict(s): ours kept as base, %s close(s) re-applied from the other lineage, %s local close(s) protected, %s counter row(s) taken as MAX, %s same-edge dependency row(s) kept as ours.\n' \
+    "$n_conflicts" "$n_reapplied" "${n_protected:-0}" "${n_counters:-0}" "${n_same_edge:-0}"
+if [ "${n_close_failed:-0}" -gt 0 ]; then
+    warn "bd-resolve-conflicts: $n_close_failed close(s) still pending in $JOURNAL — they retry on the next sync; if this repeats, apply them by hand (bd close <id>)."
+    exit 3
+fi
+exit 0

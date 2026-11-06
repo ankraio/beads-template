@@ -1,0 +1,1052 @@
+[
+{
+"id": "acme-0950a",
+"title": "[bug] notifications: pagination cursor returns the wrong result after a redeploy",
+"status": "open",
+"assignee": "",
+"description": "A rollback does not clear it. The metric stays green while this happens. Owner module: notifications. Check the pagination cursor path end to end."
+},
+{
+"id": "acme-c957b",
+"title": "[bug] scheduler: pagination cursor fails silently on an empty input",
+"status": "in_progress",
+"assignee": "alice",
+"description": "Started after the last dependency bump. Reproduces with two concurrent requests. Owner module: scheduler. Check the pagination cursor path end to end."
+},
+{
+"id": "acme-7b325",
+"title": "[epic] Hooli support sweep 2026-08-29: SUP-70/71",
+"status": "open",
+"assignee": "",
+"description": "Work through the open tickets for Hooli and file what is left."
+},
+{
+"id": "acme-66a80",
+"title": "[bug] reports: health probe fails silently on an empty input",
+"status": "open",
+"assignee": "bob",
+"description": "Workaround: restart the worker pool. A rollback does not clear it. Owner module: reports. Check the health probe path end to end."
+},
+{
+"id": "acme-f4e79",
+"title": "[bug] scheduler: csv download logs nothing when it gives up",
+"status": "in_review",
+"assignee": "",
+"description": "Reproduces with two concurrent requests. The metric stays green while this happens. Owner module: scheduler. Check the csv download path end to end."
+},
+{
+"id": "acme-07992",
+"title": "[epic] Globex support sweep 2026-08-18: SUP-51/52",
+"status": "open",
+"assignee": "",
+"description": "Work through the open tickets for Globex and file what is left."
+},
+{
+"id": "acme-ed553",
+"title": "[feature] worker: search facet races with the nightly job",
+"status": "open",
+"assignee": "",
+"description": "A rollback does not clear it. Started after the last dependency bump. Owner module: worker. Check the search facet path end to end."
+},
+{
+"id": "acme-4da0c",
+"title": "[bug] billing: upload checksum logs nothing when it gives up",
+"status": "open",
+"assignee": "",
+"description": "Started after the last dependency bump. A rollback does not clear it. Owner module: billing. Check the upload checksum path end to end."
+},
+{
+"id": "acme-4ffc3",
+"title": "[bug] queue: session cookie times out under load",
+"status": "in_review",
+"assignee": "bob",
+"description": "Only tenants on the older plan are affected. A rollback does not clear it. Owner module: queue. Check the session cookie path end to end."
+},
+{
+"id": "acme-b6f1c",
+"title": "[bug] exports: locale fallback double counts when retried",
+"status": "in_review",
+"assignee": "alice",
+"description": "Workaround: restart the worker pool. The fix needs a migration, so split it from the UI change. Owner module: exports. Check the locale fallback path end to end."
+},
+{
+"id": "acme-545d5",
+"title": "[bug] mobile: locale fallback double counts when retried",
+"status": "in_progress",
+"assignee": "alice",
+"description": "Workaround: restart the worker pool. The fix needs a migration, so split it from the UI change. Owner module: mobile. Check the locale fallback path end to end."
+},
+{
+"id": "acme-a3832",
+"title": "[bug] storage: search facet double counts when retried",
+"status": "in_review",
+"assignee": "",
+"description": "Workaround: restart the worker pool. A rollback does not clear it. Owner module: storage. Check the search facet path end to end."
+},
+{
+"id": "acme-d9d8e",
+"title": "[task] reports: digest email drops the last page",
+"status": "in_progress",
+"assignee": "",
+"description": "The metric stays green while this happens. The fix needs a migration, so split it from the UI change. Owner module: reports. Check the digest email path end to end."
+},
+{
+"id": "acme-d17ea",
+"title": "[bug] reports: locale fallback drops the last page",
+"status": "open",
+"assignee": "alice",
+"description": "Started after the last dependency bump. The fix needs a migration, so split it from the UI change. Owner module: reports. Check the locale fallback path end to end."
+},
+{
+"id": "acme-30906",
+"title": "[task] admin: password reset drops the last page",
+"status": "in_review",
+"assignee": "",
+"description": "Started after the last dependency bump. Reproduces with two concurrent requests. Owner module: admin. Check the password reset path end to end."
+},
+{
+"id": "acme-77794",
+"title": "[bug] reports: password reset returns the wrong result after a redeploy",
+"status": "open",
+"assignee": "carol",
+"description": "A rollback does not clear it. Started after the last dependency bump. Owner module: reports. Check the password reset path end to end."
+},
+{
+"id": "acme-654df",
+"title": "[task] web: cache key ignores the tenant setting",
+"status": "in_review",
+"assignee": "bob",
+"description": "Started after the last dependency bump. Workaround: restart the worker pool. Owner module: web. Check the cache key path end to end."
+},
+{
+"id": "acme-04e17",
+"title": "[feature] reports: retry budget fails silently on an empty input",
+"status": "open",
+"assignee": "",
+"description": "Workaround: restart the worker pool. Reproduces with two concurrent requests. Owner module: reports. Check the retry budget path end to end."
+},
+{
+"id": "acme-a9250",
+"title": "[feature] worker: digest email times out under load",
+"status": "open",
+"assignee": "alice",
+"description": "A rollback does not clear it. Workaround: restart the worker pool. Owner module: worker. Check the digest email path end to end."
+},
+{
+"id": "acme-83fdb",
+"title": "[bug] billing: health probe fails silently on an empty input",
+"status": "in_progress",
+"assignee": "bob",
+"description": "Seen in staging first, then production. The metric stays green while this happens. Owner module: billing. Check the health probe path end to end."
+},
+{
+"id": "acme-27aba",
+"title": "[task] api: bulk action logs nothing when it gives up",
+"status": "in_review",
+"assignee": "bob",
+"description": "Seen in staging first, then production. Reproduces with two concurrent requests. Owner module: api. Check the bulk action path end to end."
+},
+{
+"id": "acme-93d29",
+"title": "[task] mobile: pagination cursor double counts when retried",
+"status": "open",
+"assignee": "carol",
+"description": "The fix needs a migration, so split it from the UI change. Only tenants on the older plan are affected. Owner module: mobile. Check the pagination cursor path end to end."
+},
+{
+"id": "acme-e0158",
+"title": "[task] webhooks: rate limiter leaks a stale value between requests",
+"status": "in_review",
+"assignee": "",
+"description": "Only tenants on the older plan are affected. The fix needs a migration, so split it from the UI change. Owner module: webhooks. Check the rate limiter path end to end."
+},
+{
+"id": "acme-d6703",
+"title": "[task] webhooks: timezone offset races with the nightly job",
+"status": "open",
+"assignee": "",
+"description": "Reproduces with two concurrent requests. Started after the last dependency bump. Owner module: webhooks. Check the timezone offset path end to end."
+},
+{
+"id": "acme-e3592",
+"title": "[feature] webhooks: invoice total drops the last page",
+"status": "open",
+"assignee": "",
+"description": "Seen in staging first, then production. A rollback does not clear it. Owner module: webhooks. Check the invoice total path end to end."
+},
+{
+"id": "acme-ff514",
+"title": "[task] exports: password reset returns the wrong result after a redeploy",
+"status": "open",
+"assignee": "",
+"description": "Started after the last dependency bump. The fix needs a migration, so split it from the UI change. Owner module: exports. Check the password reset path end to end."
+},
+{
+"id": "acme-2422e",
+"title": "[bug] notifications: dead-letter handling double counts when retried",
+"status": "open",
+"assignee": "",
+"description": "Started after the last dependency bump. The fix needs a migration, so split it from the UI change. Owner module: notifications. Check the dead-letter handling path end to end."
+},
+{
+"id": "acme-4b918",
+"title": "[bug] web: dead-letter handling double counts when retried",
+"status": "open",
+"assignee": "bob",
+"description": "Workaround: restart the worker pool. Started after the last dependency bump. Owner module: web. Check the dead-letter handling path end to end."
+},
+{
+"id": "acme-f4cbb",
+"title": "[feature] notifications: cache key races with the nightly job",
+"status": "in_progress",
+"assignee": "",
+"description": "Started after the last dependency bump. The fix needs a migration, so split it from the UI change. Owner module: notifications. Check the cache key path end to end."
+},
+{
+"id": "acme-c6474",
+"title": "[task] billing: retry budget returns the wrong result after a redeploy",
+"status": "in_review",
+"assignee": "alice",
+"description": "Only tenants on the older plan are affected. Started after the last dependency bump. Owner module: billing. Check the retry budget path end to end."
+},
+{
+"id": "acme-1591b",
+"title": "[bug] auth: health probe double counts when retried",
+"status": "open",
+"assignee": "",
+"description": "Only tenants on the older plan are affected. A rollback does not clear it. Owner module: auth. Check the health probe path end to end."
+},
+{
+"id": "acme-acaba",
+"title": "[bug] notifications: session cookie times out under load",
+"status": "in_review",
+"assignee": "alice",
+"description": "The fix needs a migration, so split it from the UI change. Workaround: restart the worker pool. Owner module: notifications. Check the session cookie path end to end."
+},
+{
+"id": "acme-48192",
+"title": "[bug] api: cache key logs nothing when it gives up",
+"status": "in_review",
+"assignee": "alice",
+"description": "Seen in staging first, then production. The metric stays green while this happens. Owner module: api. Check the cache key path end to end."
+},
+{
+"id": "acme-56641",
+"title": "[task] admin: timezone offset is missing a regression test",
+"status": "open",
+"assignee": "alice",
+"description": "Workaround: restart the worker pool. A rollback does not clear it. Owner module: admin. Check the timezone offset path end to end."
+},
+{
+"id": "acme-78285",
+"title": "[feature] admin: retry budget drops the last page",
+"status": "in_progress",
+"assignee": "bob",
+"description": "A rollback does not clear it. Only tenants on the older plan are affected. Owner module: admin. Check the retry budget path end to end."
+},
+{
+"id": "acme-b0e14",
+"title": "[task] web: locale fallback races with the nightly job",
+"status": "open",
+"assignee": "carol",
+"description": "The fix needs a migration, so split it from the UI change. A rollback does not clear it. Owner module: web. Check the locale fallback path end to end."
+},
+{
+"id": "acme-bd37c",
+"title": "[feature] storage: bulk action drops the last page",
+"status": "open",
+"assignee": "bob",
+"description": "Only tenants on the older plan are affected. A rollback does not clear it. Owner module: storage. Check the bulk action path end to end."
+},
+{
+"id": "acme-ad19b",
+"title": "[task] reports: rate limiter times out under load",
+"status": "open",
+"assignee": "",
+"description": "Seen in staging first, then production. Started after the last dependency bump. Owner module: reports. Check the rate limiter path end to end."
+},
+{
+"id": "acme-ce1aa",
+"title": "[bug] queue: upload checksum races with the nightly job",
+"status": "open",
+"assignee": "carol",
+"description": "Only tenants on the older plan are affected. Workaround: restart the worker pool. Owner module: queue. Check the upload checksum path end to end."
+},
+{
+"id": "acme-627c8",
+"title": "[task] scheduler: feature flag fails silently on an empty input",
+"status": "in_progress",
+"assignee": "",
+"description": "Started after the last dependency bump. The fix needs a migration, so split it from the UI change. Owner module: scheduler. Check the feature flag path end to end."
+},
+{
+"id": "acme-0437e",
+"title": "[feature] admin: index rebuild drops the last page",
+"status": "open",
+"assignee": "carol",
+"description": "Seen in staging first, then production. A rollback does not clear it. Owner module: admin. Check the index rebuild path end to end."
+},
+{
+"id": "acme-dc183",
+"title": "[bug] admin: token refresh returns the wrong result after a redeploy",
+"status": "in_progress",
+"assignee": "bob",
+"description": "Only tenants on the older plan are affected. Started after the last dependency bump. Owner module: admin. Check the token refresh path end to end."
+},
+{
+"id": "acme-c5e80",
+"title": "[task] storage: upload checksum is missing a regression test",
+"status": "open",
+"assignee": "carol",
+"description": "The fix needs a migration, so split it from the UI change. Started after the last dependency bump. Owner module: storage. Check the upload checksum path end to end."
+},
+{
+"id": "acme-eddda",
+"title": "[task] webhooks: index rebuild logs nothing when it gives up",
+"status": "in_review",
+"assignee": "",
+"description": "Only tenants on the older plan are affected. The metric stays green while this happens. Owner module: webhooks. Check the index rebuild path end to end."
+},
+{
+"id": "acme-65d10",
+"title": "[feature] scheduler: index rebuild double counts when retried",
+"status": "open",
+"assignee": "bob",
+"description": "Reproduces with two concurrent requests. The fix needs a migration, so split it from the UI change. Owner module: scheduler. Check the index rebuild path end to end."
+},
+{
+"id": "acme-859b5",
+"title": "[bug] search: rate limiter drops the last page",
+"status": "open",
+"assignee": "alice",
+"description": "Workaround: restart the worker pool. Only tenants on the older plan are affected. Owner module: search. Check the rate limiter path end to end."
+},
+{
+"id": "acme-37967",
+"title": "[feature] storage: health probe fails silently on an empty input",
+"status": "in_review",
+"assignee": "",
+"description": "The metric stays green while this happens. Reproduces with two concurrent requests. Owner module: storage. Check the health probe path end to end."
+},
+{
+"id": "acme-840ae",
+"title": "[feature] scheduler: bulk action leaks a stale value between requests",
+"status": "in_review",
+"assignee": "",
+"description": "The metric stays green while this happens. Workaround: restart the worker pool. Owner module: scheduler. Check the bulk action path end to end."
+},
+{
+"id": "acme-c6116",
+"title": "[bug] auth: index rebuild logs nothing when it gives up",
+"status": "in_review",
+"assignee": "alice",
+"description": "Seen in staging first, then production. Workaround: restart the worker pool. Owner module: auth. Check the index rebuild path end to end."
+},
+{
+"id": "acme-86e61",
+"title": "[bug] notifications: audit log fails silently on an empty input",
+"status": "in_review",
+"assignee": "alice",
+"description": "Reproduces with two concurrent requests. Workaround: restart the worker pool. Owner module: notifications. Check the audit log path end to end."
+},
+{
+"id": "acme-9ejqm",
+"title": "[bug] .owned-paths.json ownership manifest ignored: gateway rate-limit pin keeps disappearing for northwind",
+"status": "open",
+"assignee": "",
+"description": "northwind/eu-west (a1b2c3d4), ticket 7e6f5d4c. The rate-limit pin on the gateway module disappears after each billing_rollup_invoices run from nightly_job_scheduler_org. The writer ignores .owned-paths.json, so the ownership boundary does not hold, and update_module_settings loses to a STALE snapshot of settings.yaml seconds later. Confine each job's commit to the paths it owns."
+},
+{
+"id": "acme-a169f",
+"title": "[feature] admin: upload checksum races with the nightly job",
+"status": "in_progress",
+"assignee": "",
+"description": "Reproduces with two concurrent requests. Workaround: restart the worker pool. Owner module: admin. Check the upload checksum path end to end."
+},
+{
+"id": "acme-43be7",
+"title": "[bug] webhooks: bulk action fails silently on an empty input",
+"status": "open",
+"assignee": "carol",
+"description": "Seen in staging first, then production. A rollback does not clear it. Owner module: webhooks. Check the bulk action path end to end."
+},
+{
+"id": "acme-82c81",
+"title": "[bug] webhooks: feature flag is missing a regression test",
+"status": "in_review",
+"assignee": "alice",
+"description": "Started after the last dependency bump. Reproduces with two concurrent requests. Owner module: webhooks. Check the feature flag path end to end."
+},
+{
+"id": "acme-47a21",
+"title": "[bug] webhooks: locale fallback logs nothing when it gives up",
+"status": "in_progress",
+"assignee": "bob",
+"description": "A rollback does not clear it. The metric stays green while this happens. Owner module: webhooks. Check the locale fallback path end to end."
+},
+{
+"id": "acme-93724",
+"title": "[bug] search: retry budget returns the wrong result after a redeploy",
+"status": "open",
+"assignee": "",
+"description": "The metric stays green while this happens. The fix needs a migration, so split it from the UI change. Owner module: search. Check the retry budget path end to end."
+},
+{
+"id": "acme-60d39",
+"title": "[bug] scheduler: token refresh drops the last page",
+"status": "open",
+"assignee": "carol",
+"description": "Reproduces with two concurrent requests. The metric stays green while this happens. Owner module: scheduler. Check the token refresh path end to end."
+},
+{
+"id": "acme-cd1d3",
+"title": "[bug] notifications: health probe times out under load",
+"status": "open",
+"assignee": "carol",
+"description": "A rollback does not clear it. Workaround: restart the worker pool. Owner module: notifications. Check the health probe path end to end."
+},
+{
+"id": "acme-a5d12",
+"title": "[feature] queue: health probe ignores the tenant setting",
+"status": "in_review",
+"assignee": "",
+"description": "A rollback does not clear it. Workaround: restart the worker pool. Owner module: queue. Check the health probe path end to end."
+},
+{
+"id": "acme-b3a5f",
+"title": "[bug] reports: cache key races with the nightly job",
+"status": "in_review",
+"assignee": "carol",
+"description": "A rollback does not clear it. Started after the last dependency bump. Owner module: reports. Check the cache key path end to end."
+},
+{
+"id": "acme-878ab",
+"title": "[task] auth: pagination cursor leaks a stale value between requests",
+"status": "in_review",
+"assignee": "bob",
+"description": "The metric stays green while this happens. A rollback does not clear it. Owner module: auth. Check the pagination cursor path end to end."
+},
+{
+"id": "acme-8618a",
+"title": "[task] queue: dead-letter handling drops the last page",
+"status": "in_progress",
+"assignee": "bob",
+"description": "Workaround: restart the worker pool. The metric stays green while this happens. Owner module: queue. Check the dead-letter handling path end to end."
+},
+{
+"id": "acme-909eb",
+"title": "[task] queue: search facet leaks a stale value between requests",
+"status": "in_progress",
+"assignee": "",
+"description": "Workaround: restart the worker pool. Reproduces with two concurrent requests. Owner module: queue. Check the search facet path end to end."
+},
+{
+"id": "acme-dd3d8",
+"title": "[feature] reports: bulk action returns the wrong result after a redeploy",
+"status": "open",
+"assignee": "carol",
+"description": "Workaround: restart the worker pool. Reproduces with two concurrent requests. Owner module: reports. Check the bulk action path end to end."
+},
+{
+"id": "acme-722e0",
+"title": "[bug] scheduler: cache key drops the last page",
+"status": "open",
+"assignee": "alice",
+"description": "The metric stays green while this happens. Workaround: restart the worker pool. Owner module: scheduler. Check the cache key path end to end."
+},
+{
+"id": "acme-96841",
+"title": "[task] webhooks: health probe leaks a stale value between requests",
+"status": "open",
+"assignee": "bob",
+"description": "Started after the last dependency bump. A rollback does not clear it. Owner module: webhooks. Check the health probe path end to end."
+},
+{
+"id": "acme-e8a42",
+"title": "[bug] storage: rate limiter fails silently on an empty input",
+"status": "open",
+"assignee": "bob",
+"description": "Workaround: restart the worker pool. Only tenants on the older plan are affected. Owner module: storage. Check the rate limiter path end to end."
+},
+{
+"id": "acme-f3f80",
+"title": "[bug] exports: index rebuild logs nothing when it gives up",
+"status": "open",
+"assignee": "",
+"description": "Started after the last dependency bump. Only tenants on the older plan are affected. Owner module: exports. Check the index rebuild path end to end."
+},
+{
+"id": "acme-e620e",
+"title": "[task] billing: timezone offset times out under load",
+"status": "in_review",
+"assignee": "alice",
+"description": "The metric stays green while this happens. Workaround: restart the worker pool. Owner module: billing. Check the timezone offset path end to end."
+},
+{
+"id": "acme-fc4a6",
+"title": "[task] notifications: csv download logs nothing when it gives up",
+"status": "open",
+"assignee": "",
+"description": "Workaround: restart the worker pool. The fix needs a migration, so split it from the UI change. Owner module: notifications. Check the csv download path end to end."
+},
+{
+"id": "acme-4378b",
+"title": "[bug] auth: bulk action drops the last page",
+"status": "in_review",
+"assignee": "alice",
+"description": "A rollback does not clear it. Only tenants on the older plan are affected. Owner module: auth. Check the bulk action path end to end."
+},
+{
+"id": "acme-d4b76",
+"title": "[bug] auth: dead-letter handling logs nothing when it gives up",
+"status": "in_review",
+"assignee": "alice",
+"description": "The metric stays green while this happens. Seen in staging first, then production. Owner module: auth. Check the dead-letter handling path end to end."
+},
+{
+"id": "acme-38ad1",
+"title": "[task] admin: cache key times out under load",
+"status": "open",
+"assignee": "alice",
+"description": "The metric stays green while this happens. Workaround: restart the worker pool. Owner module: admin. Check the cache key path end to end."
+},
+{
+"id": "acme-f80c2",
+"title": "[feature] search: bulk action double counts when retried",
+"status": "in_review",
+"assignee": "",
+"description": "Workaround: restart the worker pool. The metric stays green while this happens. Owner module: search. Check the bulk action path end to end."
+},
+{
+"id": "acme-6b131",
+"title": "[task] exports: dead-letter handling returns the wrong result after a redeploy",
+"status": "open",
+"assignee": "",
+"description": "Seen in staging first, then production. A rollback does not clear it. Owner module: exports. Check the dead-letter handling path end to end."
+},
+{
+"id": "acme-19955",
+"title": "[feature] queue: audit log logs nothing when it gives up",
+"status": "in_progress",
+"assignee": "",
+"description": "The metric stays green while this happens. Reproduces with two concurrent requests. Owner module: queue. Check the audit log path end to end."
+},
+{
+"id": "acme-d2e59",
+"title": "[task] worker: retry budget races with the nightly job",
+"status": "open",
+"assignee": "alice",
+"description": "The metric stays green while this happens. Only tenants on the older plan are affected. Owner module: worker. Check the retry budget path end to end."
+},
+{
+"id": "acme-c494c",
+"title": "[feature] admin: rate limiter times out under load",
+"status": "in_progress",
+"assignee": "carol",
+"description": "A rollback does not clear it. Seen in staging first, then production. Owner module: admin. Check the rate limiter path end to end."
+},
+{
+"id": "acme-b4099",
+"title": "[bug] mobile: rate limiter drops the last page",
+"status": "open",
+"assignee": "bob",
+"description": "A rollback does not clear it. Workaround: restart the worker pool. Owner module: mobile. Check the rate limiter path end to end."
+},
+{
+"id": "acme-e45eb",
+"title": "[bug] search: invoice total ignores the tenant setting",
+"status": "open",
+"assignee": "bob",
+"description": "Seen in staging first, then production. The metric stays green while this happens. Owner module: search. Check the invoice total path end to end."
+},
+{
+"id": "acme-60d54",
+"title": "[bug] billing: digest email drops the last page",
+"status": "in_progress",
+"assignee": "",
+"description": "The fix needs a migration, so split it from the UI change. A rollback does not clear it. Owner module: billing. Check the digest email path end to end."
+},
+{
+"id": "acme-72df7",
+"title": "[bug] mobile: timezone offset leaks a stale value between requests",
+"status": "open",
+"assignee": "carol",
+"description": "A rollback does not clear it. Workaround: restart the worker pool. Owner module: mobile. Check the timezone offset path end to end."
+},
+{
+"id": "acme-13d7f",
+"title": "[feature] exports: cache key times out under load",
+"status": "in_progress",
+"assignee": "alice",
+"description": "The metric stays green while this happens. Workaround: restart the worker pool. Owner module: exports. Check the cache key path end to end."
+},
+{
+"id": "acme-e53af",
+"title": "[task] scheduler: rate limiter is missing a regression test",
+"status": "open",
+"assignee": "bob",
+"description": "Only tenants on the older plan are affected. A rollback does not clear it. Owner module: scheduler. Check the rate limiter path end to end."
+},
+{
+"id": "acme-7fc9f",
+"title": "[feature] auth: digest email logs nothing when it gives up",
+"status": "open",
+"assignee": "alice",
+"description": "Seen in staging first, then production. A rollback does not clear it. Owner module: auth. Check the digest email path end to end."
+},
+{
+"id": "acme-1eb2d",
+"title": "[bug] web: bulk action races with the nightly job",
+"status": "in_review",
+"assignee": "",
+"description": "The metric stays green while this happens. Workaround: restart the worker pool. Owner module: web. Check the bulk action path end to end."
+},
+{
+"id": "acme-0ad1e",
+"title": "[bug] storage: index rebuild returns the wrong result after a redeploy",
+"status": "in_progress",
+"assignee": "carol",
+"description": "Reproduces with two concurrent requests. Only tenants on the older plan are affected. Owner module: storage. Check the index rebuild path end to end."
+},
+{
+"id": "acme-79b38",
+"title": "[bug] webhooks: pagination cursor logs nothing when it gives up",
+"status": "in_progress",
+"assignee": "",
+"description": "The metric stays green while this happens. Only tenants on the older plan are affected. Owner module: webhooks. Check the pagination cursor path end to end."
+},
+{
+"id": "acme-448c8",
+"title": "[task] search: index rebuild ignores the tenant setting",
+"status": "open",
+"assignee": "",
+"description": "The metric stays green while this happens. A rollback does not clear it. Owner module: search. Check the index rebuild path end to end."
+},
+{
+"id": "acme-44cd2",
+"title": "[bug] webhooks: password reset returns the wrong result after a redeploy",
+"status": "in_progress",
+"assignee": "",
+"description": "Reproduces with two concurrent requests. Only tenants on the older plan are affected. Owner module: webhooks. Check the password reset path end to end."
+},
+{
+"id": "acme-22b2c",
+"title": "[bug] auth: retry budget ignores the tenant setting",
+"status": "open",
+"assignee": "alice",
+"description": "Workaround: restart the worker pool. The metric stays green while this happens. Owner module: auth. Check the retry budget path end to end."
+},
+{
+"id": "acme-9c4eb",
+"title": "[bug] mobile: feature flag leaks a stale value between requests",
+"status": "in_progress",
+"assignee": "",
+"description": "Started after the last dependency bump. Reproduces with two concurrent requests. Owner module: mobile. Check the feature flag path end to end."
+},
+{
+"id": "acme-21a2e",
+"title": "[feature] web: rate limiter returns the wrong result after a redeploy",
+"status": "open",
+"assignee": "",
+"description": "Seen in staging first, then production. Started after the last dependency bump. Owner module: web. Check the rate limiter path end to end."
+},
+{
+"id": "acme-e2aab",
+"title": "[epic] Northwind support sweep 2026-08-11: SUP-41/42/43",
+"status": "open",
+"assignee": "",
+"description": "Work through the open tickets for Northwind and file what is left."
+},
+{
+"id": "acme-d133a",
+"title": "[task] worker: feature flag fails silently on an empty input",
+"status": "open",
+"assignee": "",
+"description": "The metric stays green while this happens. Only tenants on the older plan are affected. Owner module: worker. Check the feature flag path end to end."
+},
+{
+"id": "acme-412fb",
+"title": "[bug] mobile: index rebuild drops the last page",
+"status": "in_progress",
+"assignee": "alice",
+"description": "Reproduces with two concurrent requests. The metric stays green while this happens. Owner module: mobile. Check the index rebuild path end to end."
+},
+{
+"id": "acme-7f0d3",
+"title": "[task] gateway: search facet races with the nightly job",
+"status": "in_review",
+"assignee": "",
+"description": "Reproduces with two concurrent requests. Workaround: restart the worker pool. Owner module: gateway. Check the search facet path end to end."
+},
+{
+"id": "acme-7ba01",
+"title": "[task] exports: invoice total ignores the tenant setting",
+"status": "open",
+"assignee": "",
+"description": "Started after the last dependency bump. Seen in staging first, then production. Owner module: exports. Check the invoice total path end to end."
+},
+{
+"id": "acme-b1e4e",
+"title": "[feature] reports: token refresh fails silently on an empty input",
+"status": "open",
+"assignee": "alice",
+"description": "A rollback does not clear it. Workaround: restart the worker pool. Owner module: reports. Check the token refresh path end to end."
+},
+{
+"id": "acme-d0d2e",
+"title": "[task] admin: session cookie returns the wrong result after a redeploy",
+"status": "in_progress",
+"assignee": "bob",
+"description": "Only tenants on the older plan are affected. A rollback does not clear it. Owner module: admin. Check the session cookie path end to end."
+},
+{
+"id": "acme-30fef",
+"title": "[feature] gateway: token refresh fails silently on an empty input",
+"status": "in_review",
+"assignee": "carol",
+"description": "The metric stays green while this happens. Started after the last dependency bump. Owner module: gateway. Check the token refresh path end to end."
+},
+{
+"id": "acme-14fd9",
+"title": "[bug] queue: feature flag leaks a stale value between requests",
+"status": "open",
+"assignee": "",
+"description": "A rollback does not clear it. Started after the last dependency bump. Owner module: queue. Check the feature flag path end to end."
+},
+{
+"id": "acme-933bb",
+"title": "[feature] search: locale fallback logs nothing when it gives up",
+"status": "in_review",
+"assignee": "",
+"description": "The fix needs a migration, so split it from the UI change. A rollback does not clear it. Owner module: search. Check the locale fallback path end to end."
+},
+{
+"id": "acme-7e922",
+"title": "[bug] worker: token refresh drops the last page",
+"status": "open",
+"assignee": "alice",
+"description": "Workaround: restart the worker pool. Seen in staging first, then production. Owner module: worker. Check the token refresh path end to end."
+},
+{
+"id": "acme-0864a",
+"title": "[bug] admin: search facet fails silently on an empty input",
+"status": "in_review",
+"assignee": "",
+"description": "Workaround: restart the worker pool. The fix needs a migration, so split it from the UI change. Owner module: admin. Check the search facet path end to end."
+},
+{
+"id": "acme-ff667",
+"title": "[task] worker: session cookie times out under load",
+"status": "in_progress",
+"assignee": "",
+"description": "Reproduces with two concurrent requests. Seen in staging first, then production. Owner module: worker. Check the session cookie path end to end."
+},
+{
+"id": "acme-d625b",
+"title": "[task] scheduler: locale fallback returns the wrong result after a redeploy",
+"status": "open",
+"assignee": "",
+"description": "Seen in staging first, then production. A rollback does not clear it. Owner module: scheduler. Check the locale fallback path end to end."
+},
+{
+"id": "acme-33a3a",
+"title": "[task] search: session cookie leaks a stale value between requests",
+"status": "in_progress",
+"assignee": "alice",
+"description": "The fix needs a migration, so split it from the UI change. Reproduces with two concurrent requests. Owner module: search. Check the session cookie path end to end."
+},
+{
+"id": "acme-4b013",
+"title": "[feature] exports: csv download leaks a stale value between requests",
+"status": "open",
+"assignee": "carol",
+"description": "Reproduces with two concurrent requests. Started after the last dependency bump. Owner module: exports. Check the csv download path end to end."
+},
+{
+"id": "acme-a18c3",
+"title": "[bug] notifications: index rebuild leaks a stale value between requests",
+"status": "in_progress",
+"assignee": "",
+"description": "The fix needs a migration, so split it from the UI change. Started after the last dependency bump. Owner module: notifications. Check the index rebuild path end to end."
+},
+{
+"id": "acme-b6035",
+"title": "[bug] queue: digest email logs nothing when it gives up",
+"status": "in_review",
+"assignee": "carol",
+"description": "Only tenants on the older plan are affected. Reproduces with two concurrent requests. Owner module: queue. Check the digest email path end to end."
+},
+{
+"id": "acme-6d205",
+"title": "[epic] Umbrella support sweep 2026-08-25: SUP-61/62/63/64",
+"status": "open",
+"assignee": "",
+"description": "Work through the open tickets for Umbrella and file what is left."
+},
+{
+"id": "acme-b0362",
+"title": "[bug] api: password reset races with the nightly job",
+"status": "open",
+"assignee": "",
+"description": "Reproduces with two concurrent requests. Seen in staging first, then production. Owner module: api. Check the password reset path end to end."
+},
+{
+"id": "acme-0adb7",
+"title": "[feature] reports: session cookie logs nothing when it gives up",
+"status": "open",
+"assignee": "carol",
+"description": "Seen in staging first, then production. Workaround: restart the worker pool. Owner module: reports. Check the session cookie path end to end."
+},
+{
+"id": "acme-78655",
+"title": "[bug] storage: csv download double counts when retried",
+"status": "open",
+"assignee": "alice",
+"description": "The fix needs a migration, so split it from the UI change. Seen in staging first, then production. Owner module: storage. Check the csv download path end to end."
+},
+{
+"id": "acme-040ff",
+"title": "[bug] notifications: retry budget logs nothing when it gives up",
+"status": "in_review",
+"assignee": "bob",
+"description": "The metric stays green while this happens. Started after the last dependency bump. Owner module: notifications. Check the retry budget path end to end."
+},
+{
+"id": "acme-5c872",
+"title": "[bug] queue: index rebuild double counts when retried",
+"status": "open",
+"assignee": "",
+"description": "Workaround: restart the worker pool. The metric stays green while this happens. Owner module: queue. Check the index rebuild path end to end."
+},
+{
+"id": "acme-a7cd5",
+"title": "[feature] web: search facet double counts when retried",
+"status": "open",
+"assignee": "",
+"description": "The fix needs a migration, so split it from the UI change. Only tenants on the older plan are affected. Owner module: web. Check the search facet path end to end."
+},
+{
+"id": "acme-2740f",
+"title": "[bug] search: pagination cursor races with the nightly job",
+"status": "open",
+"assignee": "carol",
+"description": "Seen in staging first, then production. The metric stays green while this happens. Owner module: search. Check the pagination cursor path end to end."
+},
+{
+"id": "acme-9052a",
+"title": "[feature] gateway: rate limiter double counts when retried",
+"status": "open",
+"assignee": "bob",
+"description": "Started after the last dependency bump. The metric stays green while this happens. Owner module: gateway. Check the rate limiter path end to end."
+},
+{
+"id": "acme-e23aa",
+"title": "[task] reports: feature flag leaks a stale value between requests",
+"status": "in_review",
+"assignee": "alice",
+"description": "Reproduces with two concurrent requests. The fix needs a migration, so split it from the UI change. Owner module: reports. Check the feature flag path end to end."
+},
+{
+"id": "acme-0ab99",
+"title": "[feature] worker: rate limiter times out under load",
+"status": "in_review",
+"assignee": "",
+"description": "Only tenants on the older plan are affected. A rollback does not clear it. Owner module: worker. Check the rate limiter path end to end."
+},
+{
+"id": "acme-qtqrn",
+"title": "[bug] Config reconciler overwrites settings.yaml with stale stored state, no divergence guard for modules it does not own",
+"status": "in_progress",
+"assignee": "alice",
+"description": "P1 on tenant northwind/eu-west (a1b2c3d4), ticket 7e6f5d4c. Every pass of the billing_rollup_invoices step, scheduler nightly_job_scheduler_org, commits 'Refresh billing rollup config' and rewrites modules outside its boundary from a STALE snapshot. The rate-limit pin on the gateway module was deleted five times, once 14 seconds after the platform's own update_module_settings write. Needs a divergence guard: never overwrite with a snapshot older than the newest committed write. Ownership lives in .owned-paths.json."
+},
+{
+"id": "acme-a4242",
+"title": "[task] scheduler: password reset fails silently on an empty input",
+"status": "open",
+"assignee": "",
+"description": "The fix needs a migration, so split it from the UI change. The metric stays green while this happens. Owner module: scheduler. Check the password reset path end to end."
+},
+{
+"id": "acme-55a64",
+"title": "[feature] auth: upload checksum races with the nightly job",
+"status": "open",
+"assignee": "",
+"description": "Reproduces with two concurrent requests. Only tenants on the older plan are affected. Owner module: auth. Check the upload checksum path end to end."
+},
+{
+"id": "acme-ef31b",
+"title": "[bug] storage: token refresh logs nothing when it gives up",
+"status": "in_progress",
+"assignee": "",
+"description": "The metric stays green while this happens. Seen in staging first, then production. Owner module: storage. Check the token refresh path end to end."
+},
+{
+"id": "acme-87283",
+"title": "[task] reports: search facet drops the last page",
+"status": "in_review",
+"assignee": "",
+"description": "Seen in staging first, then production. Reproduces with two concurrent requests. Owner module: reports. Check the search facet path end to end."
+},
+{
+"id": "acme-6e162",
+"title": "[bug] admin: digest email logs nothing when it gives up",
+"status": "in_progress",
+"assignee": "alice",
+"description": "Started after the last dependency bump. The metric stays green while this happens. Owner module: admin. Check the digest email path end to end."
+},
+{
+"id": "acme-61e55",
+"title": "[task] worker: pagination cursor times out under load",
+"status": "in_review",
+"assignee": "",
+"description": "A rollback does not clear it. Reproduces with two concurrent requests. Owner module: worker. Check the pagination cursor path end to end."
+},
+{
+"id": "acme-51913",
+"title": "[bug] mobile: csv download drops the last page",
+"status": "in_review",
+"assignee": "",
+"description": "A rollback does not clear it. The fix needs a migration, so split it from the UI change. Owner module: mobile. Check the csv download path end to end."
+},
+{
+"id": "acme-9e10f",
+"title": "[feature] search: feature flag logs nothing when it gives up",
+"status": "open",
+"assignee": "bob",
+"description": "Workaround: restart the worker pool. The metric stays green while this happens. Owner module: search. Check the feature flag path end to end."
+},
+{
+"id": "acme-ec8f9",
+"title": "[task] mobile: cache key logs nothing when it gives up",
+"status": "open",
+"assignee": "bob",
+"description": "Reproduces with two concurrent requests. Seen in staging first, then production. Owner module: mobile. Check the cache key path end to end."
+},
+{
+"id": "acme-7f620",
+"title": "[task] api: index rebuild double counts when retried",
+"status": "open",
+"assignee": "",
+"description": "Started after the last dependency bump. A rollback does not clear it. Owner module: api. Check the index rebuild path end to end."
+},
+{
+"id": "acme-4bc8c",
+"title": "[task] notifications: invoice total ignores the tenant setting",
+"status": "open",
+"assignee": "",
+"description": "Workaround: restart the worker pool. A rollback does not clear it. Owner module: notifications. Check the invoice total path end to end."
+},
+{
+"id": "acme-e1588",
+"title": "[feature] notifications: digest email times out under load",
+"status": "in_review",
+"assignee": "bob",
+"description": "A rollback does not clear it. Started after the last dependency bump. Owner module: notifications. Check the digest email path end to end."
+},
+{
+"id": "acme-b64e3",
+"title": "[bug] notifications: upload checksum races with the nightly job",
+"status": "open",
+"assignee": "",
+"description": "A rollback does not clear it. Seen in staging first, then production. Owner module: notifications. Check the upload checksum path end to end."
+},
+{
+"id": "acme-c31a6",
+"title": "[task] queue: timezone offset ignores the tenant setting",
+"status": "open",
+"assignee": "alice",
+"description": "Only tenants on the older plan are affected. A rollback does not clear it. Owner module: queue. Check the timezone offset path end to end."
+},
+{
+"id": "acme-a53bd",
+"title": "[bug] worker: index rebuild is missing a regression test",
+"status": "in_progress",
+"assignee": "",
+"description": "Reproduces with two concurrent requests. The fix needs a migration, so split it from the UI change. Owner module: worker. Check the index rebuild path end to end."
+},
+{
+"id": "acme-3d61a",
+"title": "[task] reports: pagination cursor logs nothing when it gives up",
+"status": "open",
+"assignee": "alice",
+"description": "Started after the last dependency bump. Only tenants on the older plan are affected. Owner module: reports. Check the pagination cursor path end to end."
+},
+{
+"id": "acme-d3c5f",
+"title": "[task] web: feature flag fails silently on an empty input",
+"status": "in_progress",
+"assignee": "alice",
+"description": "Started after the last dependency bump. Workaround: restart the worker pool. Owner module: web. Check the feature flag path end to end."
+},
+{
+"id": "acme-890be",
+"title": "[task] web: pagination cursor times out under load",
+"status": "open",
+"assignee": "alice",
+"description": "Started after the last dependency bump. A rollback does not clear it. Owner module: web. Check the pagination cursor path end to end."
+},
+{
+"id": "acme-87383",
+"title": "[bug] exports: session cookie drops the last page",
+"status": "open",
+"assignee": "alice",
+"description": "Started after the last dependency bump. The metric stays green while this happens. Owner module: exports. Check the session cookie path end to end."
+},
+{
+"id": "acme-4772f",
+"title": "[task] webhooks: dead-letter handling logs nothing when it gives up",
+"status": "in_progress",
+"assignee": "",
+"description": "Started after the last dependency bump. A rollback does not clear it. Owner module: webhooks. Check the dead-letter handling path end to end."
+},
+{
+"id": "acme-f3bc1",
+"title": "[bug] web: session cookie drops the last page",
+"status": "open",
+"assignee": "bob",
+"description": "Seen in staging first, then production. Only tenants on the older plan are affected. Owner module: web. Check the session cookie path end to end."
+},
+{
+"id": "acme-32a65",
+"title": "[task] worker: password reset races with the nightly job",
+"status": "open",
+"assignee": "bob",
+"description": "Workaround: restart the worker pool. The metric stays green while this happens. Owner module: worker. Check the password reset path end to end."
+},
+{
+"id": "acme-0c6eb",
+"title": "[bug] storage: invoice total times out under load",
+"status": "open",
+"assignee": "bob",
+"description": "The metric stays green while this happens. Reproduces with two concurrent requests. Owner module: storage. Check the invoice total path end to end."
+},
+{
+"id": "acme-1cb91",
+"title": "[bug] auth: invoice total times out under load",
+"status": "open",
+"assignee": "alice",
+"description": "Started after the last dependency bump. The metric stays green while this happens. Owner module: auth. Check the invoice total path end to end."
+},
+{
+"id": "acme-21510",
+"title": "[task] webhooks: token refresh returns the wrong result after a redeploy",
+"status": "open",
+"assignee": "alice",
+"description": "Workaround: restart the worker pool. Only tenants on the older plan are affected. Owner module: webhooks. Check the token refresh path end to end."
+},
+{
+"id": "acme-57b5a",
+"title": "[feature] api: search facet double counts when retried",
+"status": "open",
+"assignee": "alice",
+"description": "The fix needs a migration, so split it from the UI change. Seen in staging first, then production. Owner module: api. Check the search facet path end to end."
+},
+{
+"id": "acme-efd0c",
+"title": "[feature] reports: dead-letter handling logs nothing when it gives up",
+"status": "open",
+"assignee": "bob",
+"description": "Reproduces with two concurrent requests. A rollback does not clear it. Owner module: reports. Check the dead-letter handling path end to end."
+}
+]

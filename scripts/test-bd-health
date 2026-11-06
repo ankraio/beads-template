@@ -136,18 +136,23 @@ check self-healing 47 1 1 "$NONE" "$NOW" \
     "a missing sync log is not evidence the reconcile failed"
 
 # --- 6. the Dolt-only side on its own -------------------------------------
-# No JSONL-only records means nothing is blocking the auto-export, so this is
-# not the reconciler's fork at all: it is bd's export trailing the newest
-# writes, and the next mutating command clears it.
+# No JSONL-only records means nothing is blocking the export, so this is not the
+# reconciler's fork at all: it is the export trailing the newest writes, and the
+# next full sync clears it.
 log=$(synclog "[2026-08-20 12:03:00] reconcile-fork (rc=3) in /ws/beads:")
 check export-lag 0 1 1 "$log" "$NOW" \
     "a Dolt-only fork with a freshly written jsonl is export lag"
 check export-lag 0 1 0 "$NONE" "$NOW" \
     "a Dolt-only fork does not depend on the reconciler or the hook"
 
-# ...but an export that has not run in an hour while the database has issues it
+# The hook exports once per full sync, so a session filing beads for a few hours
+# with no new session starting is lag, not a frozen export (acme-ywm6d.10).
+check export-lag 0 1 1 "$log" "$((JSONL_AT + 7200))" \
+    "beads filed hours after the last full sync are export lag"
+
+# ...but an export that has not run in a day while the database has issues it
 # lacks is frozen, and the committed jsonl — the GitHub issue view — is stale.
-check export-frozen 0 1 1 "$log" "$((JSONL_AT + 7200))" \
+check export-frozen 0 1 1 "$log" "$((JSONL_AT + FORK_EXPORT_GRACE + 3600))" \
     "a Dolt-only fork with a stale jsonl is a frozen export"
 # Exactly at the grace boundary counts as stale: the window is generous
 # already, and a wrong answer here should be the loud one.
@@ -179,8 +184,219 @@ check "failed:2026-08-20 12:03:00" 47 1 1 "$log" "$NOW" \
     "unscoped keeps the old newest-line behavior"
 
 echo
+echo "dolt_engine_verdict (disk truth):"
+
+MODETMP=$(mktemp -d)
+trap 'rm -rf "$MODETMP"' EXIT
+
+engine_check() {
+    label="$1"; want="$2"; dir="$3"
+    dolt_engine_verdict "$dir"
+    got=$?
+    if [ "$got" = "$want" ]; then
+        printf '  ok   %s\n' "$label"
+    else
+        printf '  FAIL %s (want %s, got %s)\n' "$label" "$want" "$got"
+        FAILED=$((FAILED + 1))
+    fi
+}
+
+# The condition this check exists for: the database is still embedded.
+mkdir -p "$MODETMP/emb/embeddeddolt"
+engine_check "embedded data on disk is reported" 0 "$MODETMP/emb"
+
+# Migrated. Say nothing.
+mkdir -p "$MODETMP/srv/dolt"
+engine_check "server layout is silent" 1 "$MODETMP/srv"
+
+# THE CASE THAT MADE THIS DISK-BASED. metadata.json is tracked in git, so one
+# machine committing "server" makes every checkout declare server. A check
+# reading the declaration would go silent on a machine that still has all its
+# data in embeddeddolt and has migrated nothing.
+mkdir -p "$MODETMP/pulled/embeddeddolt"
+printf '{"dolt_mode":"server"}' >"$MODETMP/pulled/metadata.json"
+engine_check "a pulled 'server' declaration does not hide embedded data" 0 "$MODETMP/pulled"
+
+# Neither directory: a fresh or broken checkout. Not "fine".
+mkdir -p "$MODETMP/none"
+engine_check "neither layout present is unknown" 2 "$MODETMP/none"
+
+echo
+echo "dolt_declared_mode (message detail only):"
+mode_check() {
+    label="$1"; want="$2"; file="$3"
+    got=$(dolt_declared_mode "$file")
+    if [ "$got" = "$want" ]; then
+        printf '  ok   %s\n' "$label"
+    else
+        printf '  FAIL %s (want %s, got %s)\n' "$label" "$want" "$got"
+        FAILED=$((FAILED + 1))
+    fi
+}
+printf '{"dolt_mode":"server"}' >"$MODETMP/d-server.json"
+mode_check "reads server" server "$MODETMP/d-server.json"
+printf '{"dolt_mode":"embedded"}' >"$MODETMP/d-emb.json"
+mode_check "reads embedded" embedded "$MODETMP/d-emb.json"
+mode_check "a missing file is unknown" unknown "$MODETMP/d-missing.json"
+printf 'not json' >"$MODETMP/d-broken.json"
+mode_check "unparseable is unknown, not healthy" unknown "$MODETMP/d-broken.json"
+printf '{"dolt_mode":"something-new"}' >"$MODETMP/d-future.json"
+mode_check "an unrecognised mode is unknown" unknown "$MODETMP/d-future.json"
+
+echo
+echo "checkout_verdict (is the shared tracker checkout converging?):"
+
+# Real scratch git history - a bare "origin", the shared checkout, and a clone
+# playing the other machines - and the real hook template, because the verdict
+# asks the hook which commits it refuses to reset over. Isolated from the
+# operator's git config.
+CVT=$(mktemp -d)
+trap 'rm -rf "$TMP" "$MODETMP" "$CVT"' EXIT
+HOOK="$SCRIPT_DIR/../templates/beads-sync.sh"
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+export GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.com
+export GIT_COMMITTER_NAME=test GIT_COMMITTER_EMAIL=test@example.com
+g() { git -c init.defaultBranch=main -c commit.gpgsign=false "$@"; }
+g init -q --bare "$CVT/origin.git"
+g clone -q "$CVT/origin.git" "$CVT/other" 2>/dev/null
+(
+    cd "$CVT/other" && g checkout -q -b main 2>/dev/null
+    mkdir -p .beads && echo seed >ledger.txt && echo '{"id":"acme-1"}' >.beads/issues.jsonl
+    g add -A && g commit -qm seed && g push -q origin main
+)
+clone() { rm -rf "$1"; g clone -q "$CVT/origin.git" "$1" 2>/dev/null; }
+# other <n>: the other machines publish <n> export commits.
+other() {
+    ( cd "$CVT/other" && g pull -q --rebase origin main &&
+      i=0; while [ "$i" -lt "$1" ]; do
+          echo "{\"id\":\"acme-o$RANDOM$i\"}" >>.beads/issues.jsonl
+          g commit -qam "chore: sync issue export"; i=$((i + 1))
+      done && g push -q origin main )
+}
+# A hand commit on the checkout's main at a fixed time, so ages are exact.
+T0=1790000000
+hand_commit() {
+    ( cd "$1" && echo "$2" >>ledger.txt &&
+      GIT_COMMITTER_DATE="@$T0 +0000" GIT_AUTHOR_DATE="@$T0 +0000" g commit -qam "$3" )
+}
+cv() {
+    # cv <want> <repo> <now> <max_behind> <name> — fetch like the hook does, then ask
+    g -C "$2" fetch -q origin 2>/dev/null
+    checkout_verdict "$2" "$HOOK" "$3" "$4" 24
+    if [ "$CV_VERDICT" = "$1" ]; then
+        pass "$5"
+    else
+        fail "$5" "checkout_verdict answered '$CV_VERDICT' (behind=$CV_BEHIND age=${CV_AGE_H}h blocking='$CV_BLOCKING'), expected '$1'"
+    fi
+}
+
+clone "$CVT/c1"
+cv ok "$CVT/c1" "$T0" 100 "a checkout at origin/main is converging"
+other 3
+cv ok "$CVT/c1" "$T0" 100 "three commits of team traffic behind is normal lag"
+cv behind "$CVT/c1" "$T0" 2 "past the threshold it is reported as behind"
+[ "$CV_BEHIND" = 3 ] && pass "  ...with the exact count" || fail "  ...with the exact count" "CV_BEHIND=$CV_BEHIND"
+
+# THE REGRESSION (acme-n0unr): a hand commit on main, origin moved on, and a
+# day has passed. The hook logs "not resetting" on every sync and nothing else
+# turns red, so this is the finding - naming the commit.
+clone "$CVT/c2"
+hand_commit "$CVT/c2" "acme-x acme-y   # distinct" "dup-check: record x~y"
+other 1
+cv blocked "$CVT/c2" "$((T0 + 30 * 3600))" 100 "a day-old hand commit on a diverged main is blocked"
+case "$CV_BLOCKING" in *"dup-check: record x~y"*) pass "  ...naming the commit" ;; *) fail "  ...naming the commit" "CV_BLOCKING='$CV_BLOCKING'" ;; esac
+[ "$CV_AGE_H" = 30 ] && pass "  ...and its age" || fail "  ...and its age" "CV_AGE_H=$CV_AGE_H"
+case "$CV_NAMED" in "$(git -C "$CVT/c2" rev-parse --short HEAD) dup-check: record x~y") pass "  ...in the hook's one-line form" ;; *) fail "  ...in the hook's one-line form" "CV_NAMED='$CV_NAMED'" ;; esac
+
+# Within the grace window it is not reported yet: the PR that lands it may
+# already be open.
+cv ok "$CVT/c2" "$((T0 + 2 * 3600))" 100 "a fresh hand commit is inside the grace window"
+# ...unless the lag is already past the threshold, and then the commit is
+# named as what is holding it.
+cv behind "$CVT/c2" "$((T0 + 2 * 3600))" 0 "a fresh hand commit past the lag threshold is reported as behind"
+case "$CV_BLOCKING" in *"dup-check: record x~y"*) pass "  ...naming what holds it" ;; *) fail "  ...naming what holds it" "CV_BLOCKING='$CV_BLOCKING'" ;; esac
+
+# Not diverged: the hook's push publishes the commit as it always has, so a
+# hand commit alone is not a stuck checkout.
+clone "$CVT/c3"
+hand_commit "$CVT/c3" "acme-p acme-q   # distinct" "dup-check: record p~q"
+cv ok "$CVT/c3" "$((T0 + 30 * 3600))" 100 "a hand commit on an undiverged main is not blocked"
+
+# The hook's own commits never block, however old.
+clone "$CVT/c4"
+( cd "$CVT/c4" && echo '{"id":"acme-l"}' >>.beads/issues.jsonl &&
+  GIT_COMMITTER_DATE="@$T0 +0000" g commit -qam "chore: sync issue export" )
+other 1
+cv ok "$CVT/c4" "$((T0 + 30 * 3600))" 100 "an old export commit on a diverged main is not blocked"
+
+# Landed since through a PR with the same patch: the hook drops it itself on
+# the next sync, so there is nothing to report.
+clone "$CVT/c5"
+hand_commit "$CVT/c5" "acme-r acme-s   # distinct" "dup-check: record r~s"
+h5=$(git -C "$CVT/c5" rev-parse HEAD)
+g -C "$CVT/other" fetch -q "$CVT/c5" "$h5" 2>/dev/null
+( cd "$CVT/other" && g pull -q --rebase origin main && g cherry-pick -x "$h5" >/dev/null && g push -q origin main )
+cv ok "$CVT/c5" "$((T0 + 30 * 3600))" 100 "a hand commit already on origin does not block"
+
+# Uncommitted work outside the export also stops the hook; named when behind.
+clone "$CVT/c6"
+echo "local edit" >>"$CVT/c6/ledger.txt"
+other 2
+cv behind "$CVT/c6" "$T0" 1 "a dirty tree that is behind is reported"
+[ "$CV_DIRTY" = ledger.txt ] && pass "  ...naming the uncommitted file" || fail "  ...naming the uncommitted file" "CV_DIRTY='$CV_DIRTY'"
+
+# Off main: the hook exports and converges only on main.
+clone "$CVT/c7"
+g -C "$CVT/c7" checkout -q -b feature
+cv off-main "$CVT/c7" "$T0" 100 "a checkout on a branch is off main"
+[ "$CV_BRANCH" = feature ] && pass "  ...naming the branch" || fail "  ...naming the branch" "CV_BRANCH='$CV_BRANCH'"
+g -C "$CVT/c7" checkout -q --detach
+cv off-main "$CVT/c7" "$T0" 100 "a detached HEAD is off main"
+[ -z "$CV_BRANCH" ] && pass "  ...with no branch" || fail "  ...with no branch" "CV_BRANCH='$CV_BRANCH'"
+
+# No origin/main to compare against: "could not tell", never "fine".
+g init -q "$CVT/lonely"
+checkout_verdict "$CVT/lonely" "$HOOK" "$T0" 100 24
+[ "$CV_VERDICT" = unknown ] && pass "no origin/main is unknown" || fail "no origin/main is unknown" "got '$CV_VERDICT'"
+
+# --- open backlog: the growth baseline (acme-vkfojk.4) ----------------------
+# Growth is "today minus the newest count between 14 and 7 days ago". Wrong one
+# way and a fresh machine reports growth from nothing on its first session;
+# wrong the other way and a month-old count makes any backlog look like a flood.
+OB=$TMP/open-history.tsv
+OBNOW=$(date -u -j -f '%Y-%m-%d %H:%M:%S' '2026-10-24 12:00:00' +%s 2>/dev/null \
+    || date -u -d '2026-10-24 12:00:00' +%s)
+printf '2026-09-20\t3000\n2026-10-10\t3900\n2026-10-14\t4000\n2026-10-16\t4100\n2026-10-20\t4300\n' >"$OB"
+got=$(open_backlog_baseline "$OB" "$OBNOW")
+[ "$got" = "$(printf '2026-10-16\t4100')" ] && pass "baseline is the newest count 7 to 14 days back" \
+    || fail "baseline is the newest count 7 to 14 days back" "got '$got'"
+printf '2026-10-20\t4300\n2026-10-23\t4350\n' >"$OB"
+got=$(open_backlog_baseline "$OB" "$OBNOW")
+[ -z "$got" ] && pass "a history younger than a week gives no baseline (no growth from zero)" \
+    || fail "a history younger than a week gives no baseline (no growth from zero)" "got '$got'"
+printf '2026-09-01\t2000\n' >"$OB"
+got=$(open_backlog_baseline "$OB" "$OBNOW")
+[ -z "$got" ] && pass "a count older than 14 days is not a baseline" \
+    || fail "a count older than 14 days is not a baseline" "got '$got'"
+printf '2026-10-15\tgarbage\n2026-10-14\t4000\n' >"$OB"
+got=$(open_backlog_baseline "$OB" "$OBNOW")
+[ "$got" = "$(printf '2026-10-14\t4000')" ] && pass "a malformed line is skipped, not used" \
+    || fail "a malformed line is skipped, not used" "got '$got'"
+got=$(open_backlog_baseline "$TMP/does-not-exist" "$OBNOW")
+[ -z "$got" ] && pass "no history file is no baseline" || fail "no history file is no baseline" "got '$got'"
+
+# --- 12. Dolt's history on the git remote --------------------------------------
+echo "history_finding:"
+for v in old-dolt unset stale-server; do
+    if [ -n "$(history_finding "$v")" ]; then pass "$v is reported"; else fail "$v is reported" "no message"; fi
+done
+for v in ok "" something-else; do
+    if [ -z "$(history_finding "$v")" ]; then pass "'$v' says nothing"; else fail "'$v' says nothing" "$(history_finding "$v")"; fi
+done
+
+echo
 if [ "$FAILED" -eq 0 ]; then
-    echo "all fork verdict tests passed"
+    echo "all bd-health tests passed"
     exit 0
 fi
 echo "$FAILED test(s) failed"

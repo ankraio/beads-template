@@ -3,6 +3,19 @@
     "BEADS_DIR": "/ABSOLUTE/PATH/TO/WORKSPACE/beads/.beads"
   },
   "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/ABSOLUTE/PATH/TO/WORKSPACE/beads/scripts/beads-precreate-guard.py",
+            "timeout": 30,
+            "statusMessage": "Checking for an existing bead"
+          }
+        ]
+      }
+    ],
     "SessionStart": [
       {
         "matcher": "",
@@ -19,13 +32,13 @@
           },
           {
             "type": "command",
-            "command": "cd /ABSOLUTE/PATH/TO/WORKSPACE/beads && scripts/bd-dup-check --quiet",
+            "command": "cd /ABSOLUTE/PATH/TO/WORKSPACE/beads && { [ -x scripts/checkout-staleness ] && scripts/checkout-staleness --quiet; } || true",
             "timeout": 30,
-            "statusMessage": "Checking beads for duplicates"
+            "statusMessage": "Checking shared checkouts against origin"
           },
           {
             "type": "command",
-            "command": "\"$HOME\"/.claude/hooks/beads-sync.sh /ABSOLUTE/PATH/TO/WORKSPACE/beads",
+            "command": "sh /ABSOLUTE/PATH/TO/WORKSPACE/beads/templates/beads-sync.sh /ABSOLUTE/PATH/TO/WORKSPACE/beads",
             "async": true,
             "timeout": 90,
             "statusMessage": "Syncing beads with remote"
@@ -39,8 +52,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"$HOME\"/.claude/hooks/beads-sync.sh /ABSOLUTE/PATH/TO/WORKSPACE/beads",
-            "timeout": 90,
+            "command": "sh /ABSOLUTE/PATH/TO/WORKSPACE/beads/templates/beads-sync.sh /ABSOLUTE/PATH/TO/WORKSPACE/beads --quick",
+            "timeout": 60,
             "statusMessage": "Syncing beads to remote"
           }
         ]

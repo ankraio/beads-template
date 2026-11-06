@@ -1,0 +1,383 @@
+#!/usr/bin/env python3
+"""Offline transport and refusal tests: never contact the real tracker."""
+import contextlib
+import importlib.machinery
+import importlib.util
+import io
+import json
+import os
+from pathlib import Path
+import subprocess
+import tempfile
+import unittest
+from unittest.mock import patch
+
+loader = importlib.machinery.SourceFileLoader('recovery', str(Path(__file__).with_name('bd-recover-git-upload')))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+recovery = importlib.util.module_from_spec(spec)
+loader.exec_module(recovery)
+
+
+class RecoveryTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='beads-upload-test-')
+        self.root = Path(self.temp.name)
+        self.repo = self.root / 'workspace' / 'beads'
+        self.repo.mkdir(parents=True)
+        self.remote = self.root / 'remote.git'
+        self.cache = self.repo / '.beads/dolt/test/.dolt/git-remote-cache/test/repo.git'
+        self.cache.mkdir(parents=True)
+        self.source_ref = 'refs/dolt/blobstore/origin/dolt/data/00000000-0000-4000-8000-000000000001'
+        self.journal = self.root / 'journal.json'
+        self.home_patch = patch.object(Path, 'home', return_value=self.root / 'home')
+        self.home_patch.start()
+        self.batch_patch = patch.object(recovery, 'MAX_BATCH', 700 * 1024)
+        self.batch_patch.start()
+        self.output = contextlib.redirect_stdout(io.StringIO())
+        self.output.__enter__()
+        self.git(self.root, 'init', '--bare', '-q', str(self.remote))
+        for repo in (self.repo, self.cache):
+            self.git(repo, 'init', '-q')
+            self.git(repo, 'config', 'user.name', 'Offline test')
+            self.git(repo, 'config', 'user.email', 'test@example.invalid')
+            self.git(repo, 'config', 'core.hooksPath', '/dev/null')
+            self.git(repo, 'remote', 'add', 'origin', str(self.remote))
+        self.git(self.remote, 'config', 'receive.maxInputSize', '1m')
+        self.git(self.remote, 'config', 'receive.unpackLimit', '0')
+        (self.cache / 'manifest').write_text('synthetic baseline\n')
+        self.git(self.cache, 'add', '.')
+        self.git(self.cache, 'commit', '-qm', 'base')
+        self.base = self.git(self.cache, 'rev-parse', 'HEAD')
+        self.git(self.cache, 'push', 'origin', 'HEAD:refs/dolt/data')
+        for i in range(4):
+            (self.cache / f'table-{i}').write_bytes(os.urandom(512 * 1024))
+        self.git(self.cache, 'add', '.')
+        self.git(self.cache, 'commit', '-qm', 'intended original data')
+        self.source = self.git(self.cache, 'rev-parse', 'HEAD')
+        self.git(self.cache, 'update-ref', self.source_ref, self.source)
+
+    def tearDown(self):
+        self.output.__exit__(None, None, None)
+        self.batch_patch.stop()
+        self.home_patch.stop()
+        self.temp.cleanup()
+
+    def git(self, repo, *args):
+        result = subprocess.run(['git', '-C', str(repo), *args], capture_output=True, check=True)
+        return result.stdout.decode().strip()
+
+    def plan(self):
+        recovery.make_plan(self.repo, self.cache, self.source_ref, self.journal)
+        return json.loads(self.journal.read_text())
+
+    def refs(self):
+        return recovery.Git(self.cache).refs()
+
+    def test_oversized_push_then_bounded_upload_preserves_exact_history(self):
+        failed = recovery.Git(self.cache).run('push', 'origin', 'HEAD:refs/dolt/data', allow_failure=True)
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn(b'maximum allowed size', failed.stderr)
+        plan = self.plan()
+        self.assertEqual(self.journal.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self.refs(), {'refs/dolt/data': self.base})
+        recovery.apply_plan(self.journal)
+        self.assertEqual(self.refs()['refs/dolt/data'], self.base)
+        with self.assertRaises(recovery.Refused):
+            recovery.apply_plan(self.journal, cleanup=True)
+        # Simulates normal publication by the owning Dolt implementation.
+        self.git(self.cache, 'push', 'origin', 'HEAD:refs/dolt/data')
+        self.assertEqual(self.git(self.remote, 'rev-parse', 'refs/dolt/data'), self.source)
+        self.assertEqual(self.git(self.remote, 'rev-list', 'refs/dolt/data'), self.git(self.cache, 'rev-list', self.source))
+        foreign = 'refs/dolt/uploads/beads-recovery-someone-else/keep'
+        self.git(self.cache, 'push', 'origin', self.base + ':' + foreign)
+        recovery.apply_plan(self.journal, cleanup=True)
+        recovery.apply_plan(self.journal, cleanup=True)
+        self.assertEqual(self.refs(), {'refs/dolt/data': self.source, foreign: self.base})
+        self.git(self.remote, 'fsck', '--full')
+        self.assertTrue(json.loads(self.journal.read_text())['cleaned'])
+        self.assertEqual(len(plan['objects']), 4)
+
+    def test_resume_after_disconnect_including_an_unacknowledged_batch(self):
+        plan = self.plan()
+        original = recovery.Git.run
+        pushes = 0
+        def disconnect(store, *args, **kwargs):
+            nonlocal pushes
+            result = original(store, *args, **kwargs)
+            if args[0] == 'push':
+                pushes += 1
+                if pushes == 2:
+                    raise recovery.Refused('simulated disconnect after server accepted batch')
+            return result
+        with patch.object(recovery.Git, 'run', disconnect):
+            with self.assertRaises(recovery.Refused):
+                recovery.apply_plan(self.journal)
+        self.assertEqual(len(self.refs()), 3)
+        recovery.apply_plan(self.journal)
+        recovery.apply_plan(self.journal)
+        self.assertEqual(len(self.refs()), 5)
+        self.assertEqual(self.refs()['refs/dolt/data'], self.base)
+
+    def test_refuses_occupied_sync_lock_without_changing_it(self):
+        self.plan()
+        with recovery.sync_lock(self.repo):
+            with self.assertRaisesRegex(recovery.Refused, 'lock is held'):
+                recovery.apply_plan(self.journal)
+        self.assertEqual(self.refs(), {'refs/dolt/data': self.base})
+
+    def test_refuses_tampered_plan_and_does_not_upload_unrelated_blob(self):
+        plan = self.plan()
+        plan['objects'][0]['oid'] = 'f' * 40
+        recovery.write_journal(self.journal, plan)
+        with self.assertRaisesRegex(recovery.Refused, 'intended reachable blobs'):
+            recovery.apply_plan(self.journal)
+        self.assertEqual(self.refs(), {'refs/dolt/data': self.base})
+
+    def test_refuses_source_drift(self):
+        self.plan()
+        self.git(self.cache, 'update-ref', self.source_ref, self.base)
+        with self.assertRaisesRegex(recovery.Refused, 'source or destination changed'):
+            recovery.apply_plan(self.journal)
+        self.assertEqual(self.refs(), {'refs/dolt/data': self.base})
+
+    def test_refuses_remote_drift(self):
+        self.plan()
+        self.git(self.cache, 'commit', '--allow-empty', '-qm', 'new commit', '--amend')
+        # Move data to another small commit without the intended blobs.
+        tree = self.git(self.cache, 'rev-parse', self.base + '^{tree}')
+        changed = self.git(self.cache, 'commit-tree', tree, '-p', self.base, '-m', 'other writer')
+        self.git(self.cache, 'push', 'origin', changed + ':refs/dolt/data')
+        with self.assertRaisesRegex(recovery.Refused, 'source or destination changed'):
+            recovery.apply_plan(self.journal)
+
+    def test_refuses_changed_owned_ref_and_keeps_unrelated_refs(self):
+        plan = self.plan()
+        ref = plan['objects'][0]['ref']
+        self.git(self.cache, 'push', 'origin', self.base + ':' + ref)
+        with self.assertRaisesRegex(recovery.Refused, 'temporary ref changed'):
+            recovery.apply_plan(self.journal)
+        with self.assertRaisesRegex(recovery.Refused, 'temporary ref changed'):
+            recovery.apply_plan(self.journal, cleanup=True)
+        self.assertEqual(self.refs()[ref], self.base)
+
+    def test_cleanup_leases_refuse_a_concurrent_ref_replacement(self):
+        plan = self.plan()
+        recovery.apply_plan(self.journal)
+        self.git(self.cache, 'push', 'origin', 'HEAD:refs/dolt/data')
+        original = recovery.Git.run
+        ref = plan['objects'][0]['ref']
+        raced = False
+        def replace_before_delete(store, *args, **kwargs):
+            nonlocal raced
+            if args[0] == 'push' and not raced:
+                raced = True
+                self.git(self.remote, 'update-ref', ref, self.base)
+            return original(store, *args, **kwargs)
+        with patch.object(recovery.Git, 'run', replace_before_delete):
+            with self.assertRaises(recovery.Refused):
+                recovery.apply_plan(self.journal, cleanup=True)
+        self.assertEqual(self.refs()[ref], self.base)
+        self.assertEqual(self.refs()['refs/dolt/data'], self.source)
+
+    def test_refuses_mismatched_cache_remote(self):
+        self.git(self.cache, 'remote', 'set-url', 'origin', str(self.root / 'other.git'))
+        with self.assertRaisesRegex(recovery.Refused, 'does not match'):
+            self.plan()
+        self.assertFalse(self.journal.exists())
+
+    def test_refuses_large_blob_and_preserves_destination(self):
+        with patch.object(recovery, 'MAX_BATCH', 100):
+            with self.assertRaisesRegex(recovery.Refused, 'individual blob'):
+                self.plan()
+        self.assertFalse(self.journal.exists())
+        self.assertEqual(self.refs(), {'refs/dolt/data': self.base})
+
+    def test_refuses_public_or_symlink_journal(self):
+        self.plan()
+        self.journal.chmod(0o644)
+        with self.assertRaisesRegex(recovery.Refused, 'private'):
+            recovery.apply_plan(self.journal)
+        link = self.root / 'link'
+        link.symlink_to(self.journal)
+        with self.assertRaises(recovery.Refused):
+            recovery.apply_plan(link)
+
+    def root_snapshot(self):
+        tree = self.git(self.cache, 'rev-parse', self.source + '^{tree}')
+        self.source = self.git(self.cache, 'commit-tree', tree, '-m', 'Dolt native root snapshot')
+        self.git(self.cache, 'update-ref', self.source_ref, self.source)
+        paired = self.source_ref.replace('/blobstore/', '/remotes/', 1)
+        self.git(self.cache, 'update-ref', paired, self.base)
+        return paired
+
+    def test_native_root_snapshot_uses_recorded_base_and_keeps_exact_commit(self):
+        paired = self.root_snapshot()
+        plan = self.plan()
+        self.assertEqual(plan['source_mode'], 'root_snapshot')
+        recovery.apply_plan(self.journal)
+        self.assertEqual(self.refs()['refs/dolt/data'], self.base)
+        # Only this disposable fixture simulates Dolt's own CAS publication;
+        # the recovery tool never updates or forces the data ref.
+        self.git(self.cache, 'push', '--force-with-lease=refs/dolt/data:' + self.base,
+                 'origin', self.source + ':refs/dolt/data')
+        self.git(self.cache, 'update-ref', paired, self.source)
+        recovery.apply_plan(self.journal, cleanup=True)
+        self.assertEqual(self.refs(), {'refs/dolt/data': self.source})
+        self.assertEqual(self.git(self.remote, 'rev-list', 'refs/dolt/data'), self.source)
+        self.git(self.remote, 'fsck', '--full')
+
+    def published_replacement(self):
+        paired = self.root_snapshot()
+        plan = self.plan()
+        recovery.apply_plan(self.journal)
+        # Native reconciliation compacts/replaces an original table part.
+        (self.cache / 'table-0').write_text('replacement table part\n')
+        self.git(self.cache, 'add', '.')
+        tree = self.git(self.cache, 'write-tree')
+        published = self.git(self.cache, 'commit-tree', tree, '-m', 'native replacement snapshot')
+        self.git(self.cache, 'push', '--force-with-lease=refs/dolt/data:' + self.base,
+                 'origin', published + ':refs/dolt/data')
+        self.git(self.cache, 'update-ref', self.source_ref, published)
+        self.git(self.cache, 'update-ref', paired, published)
+        return paired, plan, published
+
+    def test_cleanup_accepts_exact_published_native_replacement(self):
+        paired, plan, published = self.published_replacement()
+        reachable = set(self.git(self.cache, 'rev-list', '--objects', '--no-object-names', published).splitlines())
+        self.assertTrue(any(item['oid'] not in reachable for item in plan['objects']))
+        foreign = 'refs/dolt/uploads/beads-recovery-other/keep'
+        self.git(self.cache, 'push', 'origin', self.base + ':' + foreign)
+        recovery.apply_plan(self.journal, cleanup=True)
+        recovery.apply_plan(self.journal, cleanup=True)
+        self.assertEqual(self.refs(), {'refs/dolt/data': published, foreign: self.base})
+        self.assertEqual(self.git(self.cache, 'rev-parse', paired), published)
+        self.assertEqual(self.git(self.cache, 'rev-parse', self.source_ref), published)
+        self.assertEqual(self.git(self.remote, 'show', published + ':table-0'), 'replacement table part')
+        self.git(self.remote, 'fsck', '--full')
+        self.assertTrue(json.loads(self.journal.read_text())['cleaned'])
+
+    def test_cleanup_replacement_refuses_source_or_tracking_drift(self):
+        paired, plan, published = self.published_replacement()
+        expected = self.refs()
+        for ref in (self.source_ref, paired):
+            for replacement in (self.base, None):
+                with self.subTest(ref=ref, replacement=replacement):
+                    if replacement is None:
+                        self.git(self.cache, 'update-ref', '-d', ref)
+                    else:
+                        self.git(self.cache, 'update-ref', ref, replacement)
+                    with self.assertRaises(recovery.Refused):
+                        recovery.apply_plan(self.journal, cleanup=True)
+                    self.assertEqual(self.refs(), expected)
+                    self.assertFalse(json.loads(self.journal.read_text())['cleaned'])
+                    self.git(self.cache, 'update-ref', ref, published)
+
+    def test_cleanup_replacement_refuses_unchanged_base_even_with_matching_cache_refs(self):
+        paired = self.root_snapshot()
+        self.plan()
+        recovery.apply_plan(self.journal)
+        expected = self.refs()
+        self.git(self.cache, 'update-ref', self.source_ref, self.base)
+        self.git(self.cache, 'update-ref', paired, self.base)
+        with self.assertRaises(recovery.Refused):
+            recovery.apply_plan(self.journal, cleanup=True)
+        self.assertEqual(self.refs(), expected)
+
+    def test_cleanup_replacement_keeps_compare_and_delete_leases(self):
+        paired, plan, published = self.published_replacement()
+        original = recovery.Git.run
+        ref = plan['objects'][0]['ref']
+        raced = False
+        def replace_before_delete(store, *args, **kwargs):
+            nonlocal raced
+            if args[0] == 'push' and not raced:
+                raced = True
+                self.git(self.remote, 'update-ref', ref, self.base)
+            return original(store, *args, **kwargs)
+        with patch.object(recovery.Git, 'run', replace_before_delete):
+            with self.assertRaises(recovery.Refused):
+                recovery.apply_plan(self.journal, cleanup=True)
+        self.assertTrue(raced)
+        self.assertEqual(self.refs()[ref], self.base)
+        self.assertEqual(self.refs()['refs/dolt/data'], published)
+
+    def test_root_snapshot_requires_exact_recorded_base_at_plan_and_upload(self):
+        paired = self.root_snapshot()
+        self.git(self.cache, 'update-ref', paired, self.source)
+        with self.assertRaisesRegex(recovery.Refused, 'observed Dolt remote base'):
+            self.plan()
+        self.git(self.cache, 'update-ref', paired, self.base)
+        self.plan()
+        self.git(self.cache, 'update-ref', paired, self.source)
+        with self.assertRaisesRegex(recovery.Refused, 'observed Dolt remote base'):
+            recovery.apply_plan(self.journal)
+        self.assertEqual(self.refs(), {'refs/dolt/data': self.base})
+
+    def test_plan_accepts_observed_fifty_mebibyte_dolt_parts(self):
+        with (self.cache / 'large-table-part').open('wb') as part:
+            part.truncate(50 * 1024 * 1024)
+        self.git(self.cache, 'add', '.')
+        self.git(self.cache, 'commit', '-qm', 'standard Dolt table part')
+        self.source = self.git(self.cache, 'rev-parse', 'HEAD')
+        self.git(self.cache, 'update-ref', self.source_ref, self.source)
+        with patch.object(recovery, 'MAX_BATCH', 64 * 1024 * 1024):
+            plan = self.plan()
+        self.assertEqual(max(item['size'] for item in plan['objects']), 50 * 1024 * 1024)
+        self.assertEqual(self.refs(), {'refs/dolt/data': self.base})
+
+    def test_root_snapshot_without_paired_remote_ref_is_refused(self):
+        paired = self.root_snapshot()
+        self.git(self.cache, 'update-ref', '-d', paired)
+        with self.assertRaises(recovery.Refused):
+            self.plan()
+        self.assertFalse(self.journal.exists())
+
+    def test_arbitrary_divergent_history_is_refused(self):
+        self.root_snapshot()
+        tree = self.git(self.cache, 'rev-parse', self.source + '^{tree}')
+        child = self.git(self.cache, 'commit-tree', tree, '-p', self.source, '-m', 'divergent child')
+        self.git(self.cache, 'update-ref', self.source_ref, child)
+        with self.assertRaisesRegex(recovery.Refused, 'divergent ancestry'):
+            self.plan()
+        self.assertEqual(self.refs(), {'refs/dolt/data': self.base})
+
+    def test_malformed_journal_shapes_are_closed_refusals(self):
+        original = self.plan()
+        for invalid in ([], None, dict(original, recovery=42), dict(original, version=True), dict(original, objects={})):
+            with self.subTest(value=invalid):
+                recovery.write_journal(self.journal, invalid)
+                with self.assertRaisesRegex(recovery.Refused, 'invalid recovery journal'):
+                    recovery.apply_plan(self.journal)
+        self.assertEqual(self.refs(), {'refs/dolt/data': self.base})
+
+    def test_refuses_push_url_that_differs_from_fetch_url(self):
+        self.git(self.cache, 'config', 'remote.origin.pushurl', str(self.root / 'elsewhere.git'))
+        with self.assertRaisesRegex(recovery.Refused, 'does not match'):
+            self.plan()
+        self.assertFalse(self.journal.exists())
+
+    def test_existing_plan_is_never_overwritten(self):
+        self.plan()
+        original = self.journal.read_bytes()
+        with self.assertRaisesRegex(recovery.Refused, 'already exists'):
+            self.plan()
+        self.assertEqual(original, self.journal.read_bytes())
+
+    def test_timeout_is_closed_and_does_not_log_subprocess_details(self):
+        with patch.object(recovery.subprocess, 'run', side_effect=subprocess.TimeoutExpired('private URL', 1)):
+            with self.assertRaisesRegex(recovery.Refused, '^Git command timed out; inspect the journal and resume$'):
+                recovery.Git(self.cache).run('ls-remote', 'origin')
+
+    def test_refuses_cache_outside_tracker(self):
+        with self.assertRaises(ValueError):
+            recovery.contexts(self.repo, self.remote)
+
+    def test_remote_identity_never_accepts_embedded_secrets(self):
+        self.assertEqual(recovery.identity('git@github.com:acme/beads.git'), recovery.identity('https://github.com/acme/beads.git'))
+        for value in ('https://token@github.com/acme/beads', 'https://git:secret@github.com/acme/beads', 'https://github.com/beads?token=secret'):
+            with self.assertRaises(recovery.Refused):
+                recovery.identity(value)
+
+
+if __name__ == '__main__':
+    unittest.main(verbosity=2)

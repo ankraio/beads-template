@@ -49,6 +49,7 @@ run() {
     # machine running the tests from injecting its warning into the output
     # under comparison (/dev/null is never a regular file, so -f fails).
     # Test 8 pre-sets the variable to point at a fixture instead.
+    BD_DUP_CHECK_OFFLINE_MARKER="${BD_DUP_CHECK_OFFLINE_MARKER:-/dev/null}" \
     BD_DUP_CHECK_STALE_MARKER="${BD_DUP_CHECK_STALE_MARKER:-/dev/null}" \
         BD_DUP_CHECK_ALLOWLIST="$1" BD_DUP_CHECK_JSON="$2" "$CHECK" ${3:-} 2>&1
 }
@@ -186,6 +187,17 @@ out=$(BD_DUP_CHECK_STALE_MARKER="$TMP/stale-marker" run "$TMP/none.txt" "$TMP/sc
 case "$out" in
     *"TRACKER PARTITIONED"*) pass "--quiet still announces a partitioned tracker" ;;
     *) fail "--quiet still announces a partitioned tracker" "$out" ;;
+esac
+
+printf 'offline since test\n' >"$TMP/offline-marker"
+out=$(BD_DUP_CHECK_OFFLINE_MARKER="$TMP/offline-marker" run "$TMP/none.txt" "$TMP/scan.json" --quiet)
+case "$out" in
+    *"TRACKER OFFLINE"*) pass "--quiet still warns about offline duplicate checks" ;;
+    *) fail "offline warning" "$out" ;;
+esac
+case "$out" in
+    *"operator merge"*|*"TRACKER PARTITIONED"*) fail "offline must not prescribe conflict repair" "$out" ;;
+    *) pass "offline does not prescribe conflict repair" ;;
 esac
 
 echo

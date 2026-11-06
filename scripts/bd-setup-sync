@@ -31,7 +31,7 @@
 #                       verdict plus the version is written to local state.
 #   who else has it?    A heartbeat published into the repo, ONE FILE PER
 #                       MACHINE so two machines can never conflict, which
-#                       bd-setup-report turns into a fleet view.
+#                       bd-setup-report turns into a team view.
 #
 # And it installs the cron that runs all of that on a cadence, because a check
 # that only runs at session start cannot see the machine that has not started
@@ -101,8 +101,11 @@ now_utc() { date -u '+%Y-%m-%dT%H:%M:%SZ'; }
 setup_manifest() {
     repo=$1
     ws=$2
-    printf 'hook\t%s\t%s\texact\t755\n' \
-        "$repo/templates/beads-sync.sh" "$HOME/.claude/hooks/beads-sync.sh"
+    # The sync hook is no longer an artifact: since 2026-09-01 the settings
+    # reference templates/beads-sync.sh IN PLACE (it relocates itself to a temp
+    # copy at start, see its header), so there is no installed copy to drift.
+    # A machine still on the old copy is told so by the `settings` verdict
+    # below, whose template now carries the in-place command.
     printf 'agent-rules\t%s\t%s\texact\t644\n' \
         "$repo/templates/workspace-CLAUDE.md" "$ws/CLAUDE.md"
     printf 'settings\t%s\t%s\ttemplated\t644\n' \
@@ -182,6 +185,27 @@ verify_artifact() {
             fi
             ;;
         templated)
+            # A settings file is legitimately MORE than its template: the
+            # workspace path is substituted in and other blocks (permissions,
+            # extra env) are merged by hand. So compare only what the template
+            # owns - the hooks block and env.BEADS_DIR - structurally, after
+            # the reverse substitution. Byte comparison alone made every
+            # hand-merged file "unverifiable" for as long as it existed, which
+            # in turn made up_to_date false on every machine and the launchd
+            # check exit 3 forever (a red light nobody could turn green is a
+            # red light nobody reads). The structural check applies only when
+            # the template actually carries a hooks block; a toy template
+            # without one falls through to the byte rule.
+            if command -v jq >/dev/null 2>&1 &&
+                    jq -e '.hooks | type == "object"' "$tmpl" >/dev/null 2>&1; then
+                want=$(jq -S '{hooks: .hooks, beads_dir: (.env.BEADS_DIR // null)}' "$tmpl" 2>/dev/null)
+                have=$(sed "s#$ws#/ABSOLUTE/PATH/TO/WORKSPACE#g" "$target" 2>/dev/null |
+                    jq -S '{hooks: .hooks, beads_dir: (.env.BEADS_DIR // null)}' 2>/dev/null)
+                if [ -n "$want" ] && [ "$want" = "$have" ]; then
+                    echo "current"
+                    return
+                fi
+            fi
             if sed "s#$ws#/ABSOLUTE/PATH/TO/WORKSPACE#g" "$target" 2>/dev/null |
                     cmp -s - "$tmpl"; then
                 echo "current"
@@ -302,13 +326,7 @@ fi
 if [ -z "$BEADS_REPO" ] && [ -n "${BEADS_DIR:-}" ]; then
     BEADS_REPO=$(dirname "$BEADS_DIR")
 fi
-if [ -z "$BEADS_REPO" ]; then
-    # No hardcoded fallback: on a machine running two trackers a default path
-    # silently answers about the wrong one, and "which tracker did you mean?"
-    # is the one question this tool must never guess at.
-    echo "$(basename "$0"): pass the path to your beads repo (or set BEADS_SETUP_REPO / BEADS_DIR)" >&2
-    exit 1
-fi
+[ -n "$BEADS_REPO" ] || { echo "bd-setup-sync: pass the beads repo path, or set BEADS_DIR or BEADS_SETUP_REPO - there is no default, because a guessed tracker is the wrong tracker on a machine with two workspaces" >&2; exit 1; }
 
 if [ ! -d "$BEADS_REPO/templates" ]; then
     echo "bd-setup-sync: no templates/ under $BEADS_REPO — pass the beads repo path" >&2
@@ -318,8 +336,8 @@ BEADS_REPO=$(cd "$BEADS_REPO" && pwd)
 
 # The workspace is the parent of the MAIN checkout, not of whatever copy of
 # the repo this script was invoked from. Run from a worktree under
-# .mr-worktrees/ — which is exactly how a change to these templates gets
-# tested — the naive dirname answers ".mr-worktrees", and every artifact then
+# .worktrees/ — which is exactly how a change to these templates gets
+# tested — the naive dirname answers ".worktrees", and every artifact then
 # looks "NOT INSTALLED" because we went looking in a directory nobody
 # installs into. Templates still come from the invoked copy, so testing a
 # template change against the real installed files works.
@@ -503,7 +521,7 @@ CHECKED=$(now_utc)
 # answers "has it even pulled the change?". It is NOT evidence the machine is
 # running it — the first version of this file published the template version
 # alone, so a machine that had pulled the new templates and installed none of
-# them still reported as "current" in the fleet report, which is precisely the
+# them still reported as "current" in the team report, which is precisely the
 # machine the report exists to find. `up_to_date` is the load-bearing field
 # and the report keys on it; the version is what makes a laggard's row
 # readable ("stuck on X" vs "has X but has not applied it").
@@ -527,7 +545,6 @@ publish_heartbeat() {
     hbdir=$(heartbeat_dir "$BEADS_REPO")
     hb="$hbdir/$(machine_id).json"
     mkdir -p "$hbdir"
-    cp "$STATE" "$hb" || return 1
 
     # Only commit when something a reader would care about changed, or when
     # the published copy has gone stale. last_checked moves every run, so
@@ -542,8 +559,17 @@ publish_heartbeat() {
         stale=0
     fi
     if [ "$prev_version" = "$VERSION" ] && [ "$stale" = 0 ]; then
+        # Nothing to publish - and nothing to WRITE. The heartbeat is a
+        # tracked file, and the old code copied the fresh state (whose
+        # last_checked moves every run) over it here, leaving it modified in
+        # the working tree between publishes. The sync hook then refused its
+        # jsonl convergence over what looked like someone's uncommitted work
+        # ("not resetting", 22 times in one trimmed log window).
+        # Restore any such leftover from a run of the old code while at it.
+        (cd "$BEADS_REPO" && git checkout -q -- ".beads-setup/heartbeats/$(machine_id).json" 2>/dev/null)
         return 0
     fi
+    cp "$STATE" "$hb" || return 1
 
     (
         cd "$BEADS_REPO" || exit 1
