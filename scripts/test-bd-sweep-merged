@@ -244,6 +244,12 @@ audit_check "" \
 
 audit_check "acme-a1b2 acme-c3d4" \
     "several delivery citations are all extracted" \
+    "$(jq -nc '{title: "fix two (acme-a1b2)", headRefName: "b", body: "Beads: acme-a1b2, acme-c3d4"}')"
+
+# The audit reads the same ranking as the close path (section 10): beside a
+# Bead: line, a title id that line does not list is what the PR is ABOUT.
+audit_check "acme-c3d4" \
+    "a title id beside a Bead: line that does not list it is not extracted" \
     "$(jq -nc '{title: "fix two (acme-a1b2)", headRefName: "b", body: "Beads: acme-c3d4"}')"
 
 audit_check "acme-qtdma.7" \
@@ -280,6 +286,148 @@ if [ "$prefix_got" = "widget" ]; then
 else
     fail "another workspace's prefix is derived just as well" "got '$prefix_got'"
 fi
+
+# --- 10. the citation sites are ranked, not pooled (acme-d9x4e) ---------
+#
+# A Bead:/Beads: line, when present, IS the list of what the PR delivers.
+# Without one, the title's ids are. Only when neither names a bead does the
+# branch speak, and then only the id it starts with. Pooling all three is how
+# a PR delivers beads it only talks about.
+
+# acme/beads#8, verbatim where it matters. It delivers acme-ouxcd; its
+# title and branch name acme-eyrqq and acme-h34rf because the allowlist line
+# it adds records THOSE two as not-duplicates. Pooled, the title alone made it
+# a delivery of both: the sweep had already closed eyrqq on it, and h34rf -
+# open, being worked - was next in line.
+BEADS_8_TITLE="dup-check: record acme-eyrqq / acme-h34rf as distinct (acme-ouxcd)"
+BEADS_8_BRANCH="acme-ouxcd-2-h34rf"
+BEADS_8_BODY=$'**Bead: acme-ouxcd** — follow-up to #7, first real use of the allowlist it added.\n\nAbout an hour after #7 landed, the team filed `acme-h34rf` and the check flagged it against `acme-eyrqq` at 51%. They are not duplicates: **h34rf was filed by the eyrqq job while working it.**\n\nVerified: `scripts/test-bd-dup-check` 17/17 still pass.\n'
+check false acme-h34rf "$BEADS_8_TITLE" "$BEADS_8_BRANCH" "$BEADS_8_BODY" \
+    "beads#8: a bead the title only talks about is not delivered by it"
+check false acme-eyrqq "$BEADS_8_TITLE" "$BEADS_8_BRANCH" "$BEADS_8_BODY" \
+    "beads#8: neither is the other bead its title names"
+check true acme-ouxcd "$BEADS_8_TITLE" "$BEADS_8_BRANCH" "$BEADS_8_BODY" \
+    "beads#8: the bead on its Bead: line is delivered"
+audit_check "acme-ouxcd" \
+    "beads#8: the reverse audit reads the same single delivery" \
+    "$(pr_json "$BEADS_8_TITLE" "$BEADS_8_BRANCH" "$BEADS_8_BODY")"
+
+# acme/acme-frontend#153: one PR, a parent-level bead and its four
+# children, all on one Beads: line. Every one of them is delivered, and
+# nothing beyond the list is.
+FE_153_TITLE="feat(ink): the shared primitives on Ink: badges, states, the side sheet and choices (acme-b8vdx.6)"
+FE_153_BRANCH="acme-b8vdx.6-primitives"
+FE_153_BODY=$'Beads: acme-b8vdx.6, acme-b8vdx.6.1, acme-b8vdx.6.2, acme-b8vdx.6.3, acme-b8vdx.6.4\n\n## Badge and StatusPill render Ink\'s Badge\n\nBadge and StatusPill keep their names and props.\n'
+for id in acme-b8vdx.6 acme-b8vdx.6.1 acme-b8vdx.6.2 acme-b8vdx.6.3 acme-b8vdx.6.4; do
+    check true "$id" "$FE_153_TITLE" "$FE_153_BRANCH" "$FE_153_BODY" \
+        "acme-frontend#153: $id on a multi-bead Beads: line is delivered"
+done
+check false acme-b8vdx "$FE_153_TITLE" "$FE_153_BRANCH" "$FE_153_BODY" \
+    "acme-frontend#153: the epic above the listed beads is not"
+check false acme-b8vdx.6.5 "$FE_153_TITLE" "$FE_153_BRANCH" "$FE_153_BODY" \
+    "acme-frontend#153: a sibling that is not listed is not"
+audit_check "acme-b8vdx.6 acme-b8vdx.6.1 acme-b8vdx.6.2 acme-b8vdx.6.3 acme-b8vdx.6.4" \
+    "acme-frontend#153: the reverse audit extracts the whole Beads: line" \
+    "$(pr_json "$FE_153_TITLE" "$FE_153_BRANCH" "$FE_153_BODY")"
+
+# A title id in the FAMILY of a listed bead - its child, or the epic it belongs
+# to - refines the Bead: line rather than contradicting it, and both shapes
+# are common. api#3239: the line names the epic, the title the child.
+check true acme-u3jsj.14 \
+    "fix(cluster): the dedicated-etcd lane reaches etcdctl without assuming crictl (acme-u3jsj.14)" \
+    "fix/acme-u3jsj-etcd-lane-no-crictl" $'Bead: acme-u3jsj\n' \
+    "a title naming a child of the Bead: line's bead still delivers the child"
+check true acme-u3jsj \
+    "fix(cluster): the dedicated-etcd lane reaches etcdctl without assuming crictl (acme-u3jsj.14)" \
+    "fix/acme-u3jsj-etcd-lane-no-crictl" $'Bead: acme-u3jsj\n' \
+    "... and the Bead: line's own bead stays delivered"
+# acme-docs#195: the title names the epic, the Beads: line its children. The
+# sweep closed acme-us966 on it (with its three sibling PRs) - an epic cited
+# this way still closes only once its children have (children_still_open).
+check true acme-us966 \
+    "docs(ai board): a blocked ticket's choice from chat, the CLI, and Slack/Teams (acme-us966)" \
+    "docs/ticket-decision-parity" $'Bead: acme-us966.1, acme-us966.2, acme-us966.3\n' \
+    "a title naming the epic of the Bead: line's beads still delivers the epic"
+check false acme-us967 \
+    "docs(ai board): follow-up to acme-us967 (acme-us966)" \
+    "docs/ticket-decision-parity" $'Bead: acme-us966.1\n' \
+    "... but a title id outside that family does not"
+
+# A Bead: line that names no bead at all is not a list; the title still speaks.
+check true acme-x7q2 "fix the sweep (acme-x7q2)" "b" $'Bead: n/a\n' \
+    "a Bead: line naming no bead falls through to the title"
+
+# The branch beside a title or a Bead: line. web#2072's branch carries the
+# id the work was first filed under (acme-whdvi.73), whose row a tracker sync
+# later handed to a different issue; its Bead: line and title say .74.
+check false acme-whdvi.73 \
+    "fix(stacks): a failed draft sync rollback is never sent as the user's edit (acme-whdvi.74)" \
+    "fix/acme-whdvi.73-rollback-origin" $'Bead: acme-whdvi.74\n' \
+    "a branch id beside a Bead: line that lists another bead is not delivered"
+# acme-cli#183: a child spelled with a hyphen in the branch reads as its parent.
+check false acme-0xsdd \
+    "fix(backup): recovery advice that matches the vault (acme-0xsdd.28)" \
+    "fix/acme-0xsdd-28-vault-recovery-advice" "why" \
+    "a branch id beside a title citation is not delivered"
+check true acme-0xsdd.28 \
+    "fix(backup): recovery advice that matches the vault (acme-0xsdd.28)" \
+    "fix/acme-0xsdd-28-vault-recovery-advice" "why" \
+    "... while the title's own citation is"
+
+# The branch alone: only the id it starts with, after `type/` segments.
+check true acme-x7q2 "fix the sweep" "fix/acme-x7q2-the-sweep" "why" \
+    "a branch-only citation after a type/ prefix is delivered"
+check true acme-x7q2 "fix the sweep" "mattias/fix/acme-x7q2-the-sweep" "why" \
+    "a branch-only citation after several path segments is delivered"
+check true acme-ouxcd "record two beads" "acme-ouxcd-2-acme-h34rf" "why" \
+    "the id a branch starts with is delivered"
+check false acme-h34rf "record two beads" "acme-ouxcd-2-acme-h34rf" "why" \
+    "a second id later in the branch is not"
+check false acme-x7q2 "fix the sweep" "docs/the-sweep-acme-x7q2" "why" \
+    "an id embedded after a slug in the branch is not"
+check false acme-x7q2 "fix the sweep" "fix/foo-acme-x7q2/bar" "why" \
+    "an id embedded inside a path segment is not"
+
+# --- the shared GitHub budget (acme-mfhky) -------------------------------
+# rate_decision is the whole policy for "may this sweep keep spending the
+# token's budget": carry on, wait out a reset that is close, or stop. Its
+# failure modes are both quiet — a sweep that never stops drains the budget
+# every other session on the machine shares, and one that stops on a missing
+# header silences a healthy run — so each edge is pinned here.
+decide() {
+    # decide <expected> <remaining> <limit> <reset> <now> <name>
+    local got
+    got=$(rate_decision "$2" "$3" "$4" "$5")
+    if [ "$got" = "$1" ]; then pass "$6"; else fail "$6" "rate_decision $2 $3 $4 $5 said '$got', expected '$1'"; fi
+}
+unset BD_SWEEP_RATE_RESERVE_PCT BD_SWEEP_RATE_WAIT
+decide ok 4553 5000 1000 900 "a healthy core budget carries on"
+decide ok 501 5000 1000 900 "one above the 10% reserve still carries on"
+decide stop 500 5000 4500 900 "at the reserve, an hour from reset: stop"
+decide stop 0 5000 4500 900 "an exhausted budget an hour from reset: stop"
+decide "wait 11" 3 30 910 900 "the search budget at its reserve, resetting in 10s: wait it out"
+decide "wait 1" 0 30 890 900 "a reset already in the past waits a second, never a negative time"
+decide stop 2 30 960 900 "a search reset past BD_SWEEP_RATE_WAIT: stop"
+decide ok "" "" "" 900 "no budget headers is not evidence of exhaustion"
+decide ok abc 5000 1000 900 "an unreadable remaining count is not either"
+decide stop 0 60 "" 900 "exhausted with no readable reset: stop rather than guess"
+BD_SWEEP_RATE_WAIT=90 decide "wait 61" 2 30 960 900 "BD_SWEEP_RATE_WAIT widens the wait"
+BD_SWEEP_RATE_RESERVE_PCT=0 decide ok 1 5000 4500 900 "a 0% reserve spends down to the last call"
+
+# header_value reads the budget off `gh api -i`, whose header names arrive in
+# whatever case GitHub sent (HTTP/2 lowercases them, gh title-cases them) and
+# whose lines end in CRLF.
+HEADERS=$'Content-Type: application/json\r\nX-Ratelimit-Remaining: 4553\r\nx-ratelimit-reset: 1790686682\r\nEtag: W/"78:10"\r\n'
+got=$(printf '%s' "$HEADERS" | header_value x-ratelimit-remaining)
+[ "$got" = 4553 ] && pass "header_value matches a header name in any case, without its CR" ||
+    fail "header_value remaining" "got '$got'"
+got=$(printf '%s' "$HEADERS" | header_value x-ratelimit-reset)
+[ "$got" = 1790686682 ] && pass "header_value reads a lowercase header" || fail "header_value reset" "got '$got'"
+got=$(printf '%s' "$HEADERS" | header_value etag)
+[ "$got" = 'W/"78:10"' ] && pass "header_value keeps a value that itself contains a colon" ||
+    fail "header_value etag" "got '$got'"
+got=$(printf '%s' "$HEADERS" | header_value retry-after)
+[ -z "$got" ] && pass "header_value answers nothing for an absent header" || fail "header_value absent" "got '$got'"
 
 echo
 if [ "$FAILED" -eq 0 ]; then

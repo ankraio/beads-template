@@ -27,15 +27,22 @@
 # fixtures — the harness acme-vz559 used to reproduce its defect and verify its
 # fix in two offline runs, committed rather than thrown away.
 #
-# THE MAINTENANCE CALL this pins gh's CLI invocation shape: the fakes match on
-# `gh pr view`, `gh search prs` and `gh api repos/.../pulls...`, and they apply
-# the script's own `--jq` filters with real jq (so those filters are under test
-# too, not stubbed past). If you change HOW bd-sweep-merged calls gh, this file
-# must change with it — and it tells you so: an unmodelled call is recorded and
-# fails the scenario rather than degrading quietly into a wrong verdict. That
-# coupling is the price. It is worth paying here because the alternative is the
-# five bugs above, each of which cost more to find in production than the whole
-# harness costs to keep.
+# THE MAINTENANCE CALL this pins gh's CLI invocation shape: the fake answers
+# `gh api -i` on the four surfaces the script uses (the open-PR listing, one PR
+# over REST, the issue search, batched GraphQL PR lookups) with real status
+# lines, rate-limit headers and ETags, and the script's own jq runs on what it
+# returns. If you change HOW bd-sweep-merged calls gh, this file must change
+# with it — and it tells you so: an unmodelled call is recorded and fails the
+# scenario rather than degrading quietly into a wrong verdict. That coupling is
+# the price. It is worth paying here because the alternative is the five bugs
+# above, each of which cost more to find in production than the whole harness
+# costs to keep.
+#
+# The fake also logs every call, which is how section 8 pins what a run COSTS:
+# acme-mfhky was a sweep that listed every sibling repo's open PRs once per
+# close candidate instead of once per run — correct verdicts, silent, and
+# ~420 REST calls a run against a budget every session on the machine shares.
+# No verdict-only assertion could have seen it.
 #
 # Everything runs offline: no network, no GitHub token, no bd database. The
 # workspace is a throwaway git repo whose origin URL supplies the owner.
@@ -81,6 +88,7 @@ cat > "$SHIM/bd" <<'FAKE_BD'
 # fake bd — every subcommand bd-sweep-merged uses, and a loud failure for any
 # it does not: an unmodelled call must fail the test, not silently answer "".
 set -uo pipefail
+printf '%s\n' "$*" >> "$E2E_DIR/bd-calls.log"
 case "${1:-}" in
     where) printf '%s\n' "$E2E_WORKSPACE" ;;
     # Real bd hides closed issues from `bd list` unless --all is passed. The
@@ -90,6 +98,12 @@ case "${1:-}" in
     # parked-parent tests while the live sweep still reported MISRECORDED.
     list)
         if printf '%s\n' "$@" | grep -qx -- --all; then
+            # One refused listing, for the scenario where a failure must not be
+            # remembered as an answer.
+            if [ -e "$E2E_DIR/fail-next-list-all" ]; then
+                rm -f "$E2E_DIR/fail-next-list-all"
+                exit 1
+            fi
             cat "$E2E_DIR/bd-list.json"
         else
             jq -c '[ .[] | select((.status // "") != "closed") ]' "$E2E_DIR/bd-list.json"
@@ -100,6 +114,18 @@ case "${1:-}" in
         cat "$f" ;;
     close)
         id=$2; shift 2
+        # E2E_FAIL_CLOSE=1 models the 2026-08-30 shape: bd answers, refuses.
+        if [ "${E2E_FAIL_CLOSE:-0}" = 1 ]; then
+            echo "Error: database is locked by another dolt process" >&2
+            exit 1
+        fi
+        # E2E_BLOCKED_CLOSE=1 models the acme-a17dx shape: bd answers with a
+        # KNOWN state - the bead has an open dependency. Permanent until
+        # someone acts, so it must not degrade the run.
+        if [ "${E2E_BLOCKED_CLOSE:-0}" = 1 ]; then
+            echo "cannot close $id: blocked by open issues [acme-zzz] (use --force to override)" >&2
+            exit 1
+        fi
         printf '%s %s\n' "$id" "$*" >> "$E2E_DIR/closed.log"
         echo "closed $id" ;;
     *) printf 'bd %s\n' "$*" >> "$E2E_DIR/unexpected.log"; exit 90 ;;
@@ -108,114 +134,166 @@ FAKE_BD
 
 cat > "$SHIM/gh" <<'FAKE_GH'
 #!/usr/bin/env bash
-# fake gh — answers the three surfaces bd-sweep-merged uses, applying the
-# script's own --jq filters with real jq so those filters are under test.
+# fake gh — `gh api -i` only, which is the one way bd-sweep-merged calls gh:
+# a status line, headers (CRLF, as gh prints them) carrying the rate-limit
+# budget, a blank line, the body. Four surfaces: the open-PR listing (REST,
+# paged, with ETags), one PR (REST), the issue search (REST), and batched PR
+# lookups (GraphQL). Anything else — `gh pr view`, `gh search prs`, a call
+# without -i — is unmodelled and fails the scenario.
 #
 # Fixtures in $E2E_DIR:
-#   pr-<owner>-<repo>-<n>.json  one PR, in `gh pr view --json` shape. Serves the
-#                               REST surface too, mapped here to REST's shape,
-#                               so a scenario declares each PR once.
+#   pr-<owner>-<repo>-<n>.json  one PR, in GraphQL's pullRequest shape. Serves
+#                               REST too, mapped here to REST's shape, so a
+#                               scenario declares each PR once.
 #   open-<owner>-<repo>.json    that repo's open PRs, REST shape. A MISSING file
 #                               is a 404 — "no such repo under this owner".
 #   search-<bead-id>.json       search hits; missing means no hits.
-# Failure switches: E2E_FAIL_SEARCH, E2E_FAIL_PRVIEW, E2E_FAIL_REST,
-# E2E_FAIL_OPENPRS. Error text carries "HTTP 404"/"HTTP 502" because the script
-# distinguishes a definitive 404 from a surface that broke.
+# Failure switches: E2E_FAIL_SEARCH, E2E_FAIL_GRAPHQL, E2E_FAIL_REST,
+# E2E_FAIL_OPENPRS (HTTP 502), and unresolvable-<owner>-<repo>-<n> markers.
+# Budget switches: E2E_RATE_<CORE|GRAPHQL|SEARCH> is that budget's remaining
+# count (default: all but one), E2E_REFUSE_<...>=1 answers 403 for budget.
+# Both hold only until E2E_RATE_RESET_AT on the virtual clock (below).
+#
+# Every call is appended to $E2E_DIR/gh-calls.log as
+# "<resource> <status> <what>", which is what the call-count scenarios read.
 set -uo pipefail
 
 unexpected() { printf 'gh %s\n' "$*" >> "$E2E_DIR/unexpected.log"; exit 90; }
 
-sub=${1:-}
-shift || true
-case "$sub" in
-    search)
-        [ "${1:-}" = prs ] || unexpected search "$@"
-        shift
-        query=""; filter="."
-        while [ $# -gt 0 ]; do
-            case $1 in
-                --owner|--json) shift ;;
-                --jq) filter=$2; shift ;;
-                -*) ;;
-                *) query=$1 ;;
-            esac
-            shift
-        done
-        if [ "${E2E_FAIL_SEARCH:-0}" = 1 ]; then
-            echo "gh: GraphQL: Something went wrong" >&2
-            exit 1
+[ "${1:-}" = api ] || unexpected "$@"
+shift
+include=0; path=""; query=""; if_none_match=""
+while [ $# -gt 0 ]; do
+    case $1 in
+        -i) include=1 ;;
+        -H) case $2 in If-None-Match:\ *) if_none_match=${2#If-None-Match: } ;; *) unexpected api -H "$2" ;; esac; shift ;;
+        -f) case $2 in query=*) query=${2#query=} ;; *) unexpected api -f "$2" ;; esac; shift ;;
+        -*) unexpected api "$1" ;;
+        *) path=$1 ;;
+    esac
+    shift
+done
+[ "$include" = 1 ] || unexpected api "$path" "(without -i: no budget headers)"
+
+# The virtual clock: real time plus every second the fake sleep has slept, so a
+# scenario can make the script wait out a reset without the suite waiting.
+slept=$(awk '{ s += $1 } END { printf "%d", s }' "$E2E_DIR/slept" 2>/dev/null || echo 0)
+now=$(( $(date +%s) + ${slept:-0} ))
+reset_at=${E2E_RATE_RESET_AT:-$(( $(date +%s) + 3600 ))}
+
+respond() {
+    # respond <status> <resource> <body-file|""> [extra header]
+    local status=$1 resource=$2 body=$3 extra=${4:-} limit remaining var
+    case $resource in search) limit=30 ;; *) limit=5000 ;; esac
+    var=E2E_RATE_$(printf '%s' "$resource" | tr '[:lower:]' '[:upper:]')
+    remaining=${!var:-$((limit - 1))}
+    [ "$now" -ge "$reset_at" ] && remaining=$((limit - 1))
+    printf '%s %s %s\n' "$resource" "$status" "${path:-graphql}" >> "$E2E_DIR/gh-calls.log"
+    printf 'HTTP/2.0 %s X\n' "$status"
+    printf 'Content-Type: application/json; charset=utf-8\r\n'
+    printf 'X-Ratelimit-Limit: %s\r\nX-Ratelimit-Remaining: %s\r\n' "$limit" "$remaining"
+    printf 'X-Ratelimit-Reset: %s\r\nX-Ratelimit-Resource: %s\r\n' "$reset_at" "$resource"
+    [ -n "$extra" ] && printf '%s\r\n' "$extra"
+    printf '\r\n'
+    [ -n "$body" ] && cat "$body"
+    case $status in 2??) exit 0 ;; *) exit 1 ;; esac
+}
+
+refused() {
+    # A 403 for budget, while the scenario's refusal switch holds.
+    local var
+    var=E2E_REFUSE_$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')
+    [ "${!var:-0}" = 1 ] && [ "$now" -lt "$reset_at" ]
+}
+
+tmp=$(mktemp "$E2E_DIR/gh-body.XXXXXX")
+trap 'rm -f "$tmp"' EXIT
+
+if [ "$path" = graphql ]; then
+    if refused graphql; then
+        echo '{"message": "API rate limit exceeded for user ID 1."}' > "$tmp"
+        E2E_RATE_GRAPHQL=0 respond 403 graphql "$tmp"
+    fi
+    refs=$(printf '%s' "$query" | grep -oE 'p[0-9]+: repository\(owner: "[^"]+", name: "[^"]+"\) \{ pullRequest\(number: [0-9]+\)' |
+        sed -E 's/^(p[0-9]+): repository\(owner: "([^"]+)", name: "([^"]+)"\) \{ pullRequest\(number: ([0-9]+)\)$/\1 \2 \3 \4/')
+    [ -n "$refs" ] || unexpected api graphql "(no pullRequest aliases in: $query)"
+    [ "${E2E_FAIL_GRAPHQL:-0}" = 1 ] && { echo '{"message": "Something went wrong"}' > "$tmp"; respond 502 graphql "$tmp"; }
+    data='{}'; errors='[]'
+    while read -r alias o r n; do
+        # One PR neither surface will answer takes its whole batch down, as an
+        # outage would; the script then asks about each PR alone.
+        [ -f "$E2E_DIR/unresolvable-$o-$r-$n" ] && { echo '{}' > "$tmp"; respond 502 graphql "$tmp"; }
+        f="$E2E_DIR/pr-$o-$r-$n.json"
+        if [ -f "$f" ]; then
+            data=$(jq -c --arg a "$alias" --slurpfile pr "$f" '. + {($a): {pullRequest: $pr[0]}}' <<<"$data")
+        else
+            data=$(jq -c --arg a "$alias" '. + {($a): {pullRequest: null}}' <<<"$data")
+            errors=$(jq -c --arg a "$alias" --arg n "$n" \
+                '. + [{type: "NOT_FOUND", path: [$a, "pullRequest"], message: ("Could not resolve to a PullRequest with the number of " + $n + ".")}]' <<<"$errors")
         fi
-        f="$E2E_DIR/search-$query.json"
-        [ -f "$f" ] && jq -r "$filter" "$f"
-        exit 0 ;;
-    pr)
-        [ "${1:-}" = view ] || unexpected pr "$@"
-        shift
-        num=$1; shift
-        repo=""
-        while [ $# -gt 0 ]; do
-            case $1 in
-                --repo) repo=$2; shift ;;
-                --json) shift ;;
-            esac
-            shift
-        done
-        if [ "${E2E_FAIL_PRVIEW:-0}" = 1 ] ||
-           [ -f "$E2E_DIR/unresolvable-${repo//\//-}-$num" ]; then
-            echo "gh: GraphQL: Something went wrong" >&2
-            exit 1
+    done <<<"$refs"
+    jq -nc --argjson d "$data" --argjson e "$errors" \
+        'if ($e | length) > 0 then {data: $d, errors: $e} else {data: $d} end' > "$tmp"
+    respond 200 graphql "$tmp"
+fi
+
+case "$path" in
+    search/issues\?*)
+        refused search && { echo '{"message": "API rate limit exceeded for user ID 1."}' > "$tmp"; E2E_RATE_SEARCH=0 respond 403 search "$tmp"; }
+        [ "${E2E_FAIL_SEARCH:-0}" = 1 ] && { echo '{"message": "Bad Gateway"}' > "$tmp"; respond 502 search "$tmp"; }
+        q=${path#*q=}; q=${q%%&*}
+        q=$(printf '%b' "${q//%/\\x}")
+        # The script sends "( <bead-id> ) type:pr user:<owner>", as gh does.
+        case "$q" in "( "*" ) type:pr user:"*) ;; *) unexpected api "$path" "(query shape: $q)" ;; esac
+        id=${q#( }; id=${id%% )*}
+        f="$E2E_DIR/search-$id.json"
+        if [ -f "$f" ]; then
+            jq -c '{total_count: length, incomplete_results: false,
+                    items: map({number, repository_url: ("https://api.github.com/repos/" + .repository.nameWithOwner)})}' "$f" > "$tmp"
+        else
+            echo '{"total_count": 0, "incomplete_results": false, "items": []}' > "$tmp"
         fi
-        f="$E2E_DIR/pr-${repo//\//-}-$num.json"
-        [ -f "$f" ] || { echo "gh: could not resolve to a PullRequest" >&2; exit 1; }
-        cat "$f" ;;
-    api)
-        path=""; filter=""
-        while [ $# -gt 0 ]; do
-            case $1 in
-                --jq) filter=$2; shift ;;
-                -*) ;;
-                *) path=$1 ;;
-            esac
-            shift
-        done
-        case "$path" in
-            repos/*/pulls\?state=open*)
-                or=${path#repos/}; or=${or%%/pulls*}
-                if [ "${E2E_FAIL_OPENPRS:-0}" = 1 ]; then
-                    echo "gh: HTTP 502: Bad Gateway" >&2
-                    exit 1
-                fi
-                f="$E2E_DIR/open-${or//\//-}.json"
-                [ -f "$f" ] || { echo "gh: HTTP 404: Not Found ($path)" >&2; exit 1; }
-                jq -r "$filter" "$f" ;;
-            repos/*/pulls/[0-9]*)
-                rest=${path#repos/}; or=${rest%/pulls/*}; num=${rest##*/}
-                if [ "${E2E_FAIL_REST:-0}" = 1 ] ||
-                   [ -f "$E2E_DIR/unresolvable-${or//\//-}-$num" ]; then
-                    echo "gh: HTTP 502: Bad Gateway" >&2
-                    exit 1
-                fi
-                f="$E2E_DIR/pr-${or//\//-}-$num.json"
-                [ -f "$f" ] || { echo "gh: HTTP 404: Not Found ($path)" >&2; exit 1; }
-                # view shape -> REST shape: REST reports merged separately from
-                # state, and folding the two back is the script's job.
-                jq -c '{merged: (.state == "MERGED"),
-                        state: (if .state == "MERGED" then "closed"
-                                else (.state | ascii_downcase) end),
-                        title, body, head: {ref: .headRefName},
-                        merged_at: .mergedAt}' "$f" ;;
-            *) unexpected api "$path" ;;
-        esac ;;
-    *) unexpected "$sub" "$@" ;;
+        respond 200 search "$tmp" ;;
+    repos/*/pulls\?state=open\&per_page=100\&page=*)
+        refused core && { echo '{"message": "API rate limit exceeded for user ID 1."}' > "$tmp"; E2E_RATE_CORE=0 respond 403 core "$tmp"; }
+        or=${path#repos/}; or=${or%%/pulls*}; page=${path##*page=}
+        [ "${E2E_FAIL_OPENPRS:-0}" = 1 ] && { echo '{"message": "Bad Gateway"}' > "$tmp"; respond 502 core "$tmp"; }
+        f="$E2E_DIR/open-${or//\//-}.json"
+        [ -f "$f" ] || { echo '{"message": "Not Found"}' > "$tmp"; respond 404 core "$tmp"; }
+        jq -c --argjson p "$page" '.[(($p - 1) * 100):($p * 100)]' "$f" > "$tmp"
+        etag="W/\"$(cksum < "$tmp" | awk '{print $1}')\""
+        if [ -n "$if_none_match" ] && [ "$if_none_match" = "$etag" ]; then
+            : > "$tmp"
+            respond 304 core "" "ETag: $etag"
+        fi
+        respond 200 core "$tmp" "ETag: $etag" ;;
+    repos/*/pulls/[0-9]*)
+        refused core && { echo '{"message": "API rate limit exceeded for user ID 1."}' > "$tmp"; E2E_RATE_CORE=0 respond 403 core "$tmp"; }
+        rest=${path#repos/}; or=${rest%/pulls/*}; num=${rest##*/}
+        if [ "${E2E_FAIL_REST:-0}" = 1 ] || [ -f "$E2E_DIR/unresolvable-${or//\//-}-$num" ]; then
+            echo '{"message": "Bad Gateway"}' > "$tmp"
+            respond 502 core "$tmp"
+        fi
+        f="$E2E_DIR/pr-${or//\//-}-$num.json"
+        [ -f "$f" ] || { echo '{"message": "Not Found"}' > "$tmp"; respond 404 core "$tmp"; }
+        # GraphQL shape -> REST shape: REST reports merged separately from
+        # state, and folding the two back is the script's job.
+        jq -c '{merged: (.state == "MERGED"),
+                state: (if .state == "MERGED" then "closed" else (.state | ascii_downcase) end),
+                title, body, head: {ref: .headRefName}, merged_at: .mergedAt}' "$f" > "$tmp"
+        respond 200 core "$tmp" ;;
+    *) unexpected api "$path" ;;
 esac
 FAKE_GH
 
-# The sweep sleeps ~2.2s between search calls for GitHub's rate limit and 2s
-# between pr_lookup retries. There is no rate limit here, and a suite that
-# really slept would be too slow to run before every ship — which is the same
-# as not having one.
+# The sweep sleeps ~2.2s between search calls for GitHub's rate limit, 2s
+# between pr_lookup retries, and until a budget resets when it is at its
+# reserve. There is no rate limit here, and a suite that really slept would be
+# too slow to run before every ship — which is the same as not having one. So
+# sleeping only advances the fake gh's virtual clock.
 cat > "$SHIM/sleep" <<'FAKE_SLEEP'
 #!/usr/bin/env bash
+printf '%s\n' "${1:-0}" >> "$E2E_DIR/slept"
 exit 0
 FAKE_SLEEP
 
@@ -235,7 +313,16 @@ scenario() {
     BEAD_IDS=()
     BEAD_ROWS=()
     export BD_SWEEP_REPOS="api web"
-    export E2E_FAIL_SEARCH=0 E2E_FAIL_PRVIEW=0 E2E_FAIL_REST=0 E2E_FAIL_OPENPRS=0
+    # Never the real ~/.cache: the ETag cache is per scenario unless a
+    # scenario deliberately shares it between two runs.
+    export BD_SWEEP_CACHE_DIR="$E2E_DIR/cache"
+    export E2E_FAIL_SEARCH=0 E2E_FAIL_GRAPHQL=0 E2E_FAIL_REST=0 E2E_FAIL_OPENPRS=0 E2E_FAIL_CLOSE=0 E2E_BLOCKED_CLOSE=0
+    unset E2E_RATE_CORE E2E_RATE_GRAPHQL E2E_RATE_SEARCH E2E_REFUSE_CORE E2E_REFUSE_GRAPHQL E2E_REFUSE_SEARCH
+    unset BD_SWEEP_RATE_RESERVE_PCT BD_SWEEP_RATE_WAIT
+    export E2E_RATE_RESET_AT=$(( $(date +%s) + 3600 ))
+    : > "$E2E_DIR/gh-calls.log"
+    : > "$E2E_DIR/bd-calls.log"
+    rm -f "$E2E_DIR/fail-next-list-all"
     # Both candidate repos exist and have no open PRs unless a scenario says so.
     repo_open api
     repo_open web
@@ -339,6 +426,22 @@ expect_not_closed() {
     ! grep -q "^$1 " "$E2E_DIR/closed.log" || fail "$1 was CLOSED and must not be"
 }
 
+calls() {
+    # calls [<resource> [<status> [<what-regex>]]] — how many gh calls this
+    # scenario made that match, from the fake's call log.
+    awk -v r="${1:-}" -v s="${2:-}" -v w="${3:-}" '
+        (r == "" || $1 == r) && (s == "" || $2 == s) && (w == "" || $3 ~ w) { n++ }
+        END { print n + 0 }' "$E2E_DIR/gh-calls.log"
+}
+
+expect_calls() {
+    # expect_calls <n> <description> [<resource> [<status> [<what-regex>]]]
+    local want=$1 what=$2 got
+    shift 2
+    got=$(calls "$@")
+    [ "$got" = "$want" ] || fail "$what: $got gh call(s), expected $want — log: $(tr '\n' ';' < "$E2E_DIR/gh-calls.log")"
+}
+
 finish() {
     if [ -s "$E2E_DIR/unexpected.log" ]; then
         fail "the fakes saw a call they do not model: $(tr '\n' ';' < "$E2E_DIR/unexpected.log")"
@@ -363,6 +466,37 @@ run_sweep --apply
 expect_rc 0
 expect_says "acme-aaa: CLOSED — $OWNER/api#100"
 expect_closed acme-aaa
+finish
+
+scenario "a close bd rejects is DEGRADED and exits 3, never reported CLOSED"
+bead acme-aaa 2026-08-01T00:00:00Z "delivered in api#100"
+pr $OWNER/api 100 MERGED "acme-aaa: do the thing" acme-aaa-do-the-thing \
+    "why" 2026-08-05T09:00:00Z
+E2E_FAIL_CLOSE=1
+run_sweep --apply
+expect_rc 3
+expect_says "acme-aaa: DEGRADED — bd close failed"
+expect_silent_about "acme-aaa: CLOSED"
+expect_not_closed acme-aaa
+finish
+
+scenario "a close bd refuses on an open dependency is reported, not DEGRADED"
+# acme-a17dx: bd ANSWERS here - the bead is blocked by an open dependency,
+# which is a known state and permanent until someone acts on it. Reporting it
+# as DEGRADED ("re-run when bd answers") made the nightly exit 3 on the same
+# two beads every night, taking --search-citing - the only direction-1 rescue
+# lane - down with it. A dependency block belongs with "children still open".
+bead acme-aaa 2026-08-01T00:00:00Z "delivered in api#100"
+pr $OWNER/api 100 MERGED "acme-aaa: do the thing" acme-aaa-do-the-thing \
+    "why" 2026-08-05T09:00:00Z
+E2E_BLOCKED_CLOSE=1
+run_sweep --apply
+expect_rc 0
+expect_says "acme-aaa: PRs merged"
+expect_says "blocked by open dependencies — acme-zzz"
+expect_silent_about DEGRADED
+expect_silent_about "acme-aaa: CLOSED"
+expect_not_closed acme-aaa
 finish
 
 scenario "a dry run reports the close and closes nothing"
@@ -492,7 +626,7 @@ scenario "a PR neither surface will resolve is DEGRADED, not 'not merged'"
 bead acme-aaa 2026-08-01T00:00:00Z "delivered in api#100"
 pr $OWNER/api 100 MERGED "acme-aaa: do the thing" acme-aaa-do-the-thing \
     "why" 2026-08-05T09:00:00Z
-export E2E_FAIL_PRVIEW=1 E2E_FAIL_REST=1
+export E2E_FAIL_GRAPHQL=1 E2E_FAIL_REST=1
 run_sweep --apply
 expect_rc 3
 expect_says "DEGRADED — GitHub would not resolve: $OWNER/api#100"
@@ -504,7 +638,7 @@ scenario "REST answers what GraphQL will not, and the run stays clean"
 bead acme-aaa 2026-08-01T00:00:00Z "delivered in api#100"
 pr $OWNER/api 100 MERGED "acme-aaa: do the thing" acme-aaa-do-the-thing \
     "why" 2026-08-05T09:00:00Z
-export E2E_FAIL_PRVIEW=1
+export E2E_FAIL_GRAPHQL=1
 run_sweep --apply
 expect_rc 0
 expect_silent_about DEGRADED
@@ -512,13 +646,45 @@ expect_closed acme-aaa
 finish
 
 # A definitive 404 is an answer: the ref is reported MISSING, the bead stays
-# open, and the run does not paint itself red.
+# open, and the run does not paint itself red. It is reported as "no PR
+# recorded", not as "not all merged": a number that is not a PR in that repo
+# can never merge, so the old wording promised a close that could not come.
 scenario "a bead citing a deleted PR is MISSING, not DEGRADED"
 bead acme-aaa 2026-08-01T00:00:00Z "delivered in api#404"
 run_sweep --apply
 expect_rc 0
-expect_says "citing PRs not all merged — $OWNER/api#404(MISSING)"
+expect_says "no PR cites this bead — its only references are not pull requests in the repo they were attributed to (MISSING: $OWNER/api#404)"
+expect_silent_about "citing PRs not all merged"
 expect_silent_about DEGRADED
+expect_not_closed acme-aaa
+finish
+
+# acme-4ea0z: a phantom ref must not block a close. The harvester pins a
+# bare "#N" in prose to the bead's one mentioned repo, so "mitigated by
+# #1231" (a web PR) became worker#1231, which does not exist, and the
+# MISSING entry sat in the unmerged list beside a merged, citing worker#68 -
+# acme-i5ufw stayed in in_review 24 days on "citing PRs not all merged".
+# A phantom is permanent, so blocking on it was "never closes".
+scenario "a MISSING ref beside a merged citing PR does not block the close"
+bead acme-aaa 2026-08-01T00:00:00Z "mitigated by api#404, delivered in api#100"
+pr $OWNER/api 100 MERGED "acme-aaa: do the thing" acme-aaa-do-the-thing \
+    "why" 2026-08-05T09:00:00Z
+run_sweep --apply
+expect_rc 0
+expect_says "ignored, not a PR in the repo it was attributed to: $OWNER/api#404"
+expect_silent_about "citing PRs not all merged"
+expect_silent_about DEGRADED
+expect_closed acme-aaa
+finish
+
+# ...but it authorizes nothing either: a MISSING ref beside an OPEN citing PR
+# still leaves the bead open on the open PR.
+scenario "a MISSING ref does not authorize a close past an open citing PR"
+bead acme-aaa 2026-08-01T00:00:00Z "mitigated by api#404, delivered in api#100"
+pr $OWNER/api 100 OPEN "acme-aaa: do the thing" acme-aaa-do-the-thing "why"
+run_sweep --apply
+expect_rc 0
+expect_says "citing PRs not all merged — $OWNER/api#100(OPEN)"
 expect_not_closed acme-aaa
 finish
 
@@ -691,6 +857,271 @@ scenario "an empty in_review backlog is a clean no-op"
 run_sweep --apply
 expect_rc 0
 expect_says "Nothing in in_progress/in_review"
+finish
+
+# --- 7. a PR delivers what its Bead: line lists (acme-d9x4e) ------------
+# acme/beads#8 delivers acme-ouxcd and names acme-h34rf in its title and
+# branch as the subject of a not-a-duplicate record. The nightly
+# --search-citing pass finds it for both beads, since both ids are in it; only
+# ouxcd may close. h34rf was in_progress and being worked when a dry run said
+# "acme-h34rf: would close — acme/beads#8".
+BEADS_8_TITLE="dup-check: record acme-eyrqq / acme-h34rf as distinct (acme-ouxcd)"
+BEADS_8_BODY=$'**Bead: acme-ouxcd** — follow-up to #7, first real use of the allowlist it added.\n\nThe team filed `acme-h34rf` and the check flagged it against `acme-eyrqq` at 51%.\n'
+
+scenario "a merged PR whose title only talks about a bead does not close it (beads#8)"
+bead acme-h34rf 2026-08-18T16:33:34Z "web type-aware eslint OOM"
+pr $OWNER/beads 8 MERGED "$BEADS_8_TITLE" acme-ouxcd-2-h34rf "$BEADS_8_BODY" \
+    2026-08-18T15:18:59Z
+search_hit acme-h34rf $OWNER/beads 8
+run_sweep --apply --search-citing
+expect_rc 0
+expect_silent_about "acme-h34rf: CLOSED"
+expect_says "acme-h34rf: no PR cites this bead (context only: $OWNER/beads#8)"
+expect_not_closed acme-h34rf
+finish
+
+scenario "the same PR still closes the bead on its Bead: line (beads#8)"
+bead acme-ouxcd 2026-08-18T15:05:36Z "dup-check allowlist"
+pr $OWNER/beads 8 MERGED "$BEADS_8_TITLE" acme-ouxcd-2-h34rf "$BEADS_8_BODY" \
+    2026-08-18T15:18:59Z
+search_hit acme-ouxcd $OWNER/beads 8
+run_sweep --apply --search-citing
+expect_rc 0
+expect_says "acme-ouxcd: CLOSED — $OWNER/beads#8"
+expect_closed acme-ouxcd
+finish
+
+# acme/acme-frontend#153 delivers five beads on one Beads: line. A child
+# listed after the first still closes on it.
+scenario "a child listed on a multi-bead Beads: line closes (acme-frontend#153)"
+bead acme-b8vdx.6.3 2026-09-29T08:00:00Z "choices on Ink" in_review
+pr $OWNER/acme-frontend 153 MERGED \
+    "feat(ink): the shared primitives on Ink: badges, states, the side sheet and choices (acme-b8vdx.6)" \
+    acme-b8vdx.6-primitives \
+    $'Beads: acme-b8vdx.6, acme-b8vdx.6.1, acme-b8vdx.6.2, acme-b8vdx.6.3, acme-b8vdx.6.4\n\n## Badge\n' \
+    2026-09-29T10:10:58Z
+search_hit acme-b8vdx.6.3 $OWNER/acme-frontend 153
+run_sweep --apply --search-citing
+expect_rc 0
+expect_says "acme-b8vdx.6.3: CLOSED — $OWNER/acme-frontend#153"
+expect_closed acme-b8vdx.6.3
+finish
+
+# The blocking direction reads the same rule: an open PR whose Bead: line lists
+# another bead does not hold this one open just because its branch starts with
+# this id (web#2072's shape: the branch kept the id the work was first filed
+# under).
+scenario "an open PR whose Bead: line lists another bead does not block"
+bead acme-aaa 2026-08-01T00:00:00Z "delivered in api#100"
+pr $OWNER/api 100 MERGED "acme-aaa: do the thing" acme-aaa-do-the-thing \
+    "why" 2026-08-05T09:00:00Z
+open_pr api 1244 "fix: the sibling defect (acme-bbb)" acme-aaa-sibling \
+    $'Bead: acme-bbb\n'
+run_sweep --apply
+expect_rc 0
+expect_closed acme-aaa
+finish
+
+# --- 8. what a run costs the shared GitHub budget (acme-mfhky) ----------
+# Every session start and end on a machine sweeps, and every sweep spends the
+# one token everything else on the machine spends too. These pin the cost, not
+# just the verdicts: the open-PR index used to be rebuilt for EVERY close
+# candidate (it was built inside $(...), so its "built" state died with the
+# subshell), which is correct, silent, and 13 x 32 = ~420 REST calls a run
+# where 32 would do.
+multi_bead_fixture() {
+    bead acme-aaa 2026-08-01T00:00:00Z "delivered in api#100"
+    bead acme-bbb 2026-08-01T00:00:00Z "delivered in web#200"
+    bead acme-ccc 2026-08-01T00:00:00Z "builds on api#100, delivered in api#300"
+    bead acme-ddd 2026-08-01T00:00:00Z "no references yet"
+    bead acme-eee 2026-08-01T00:00:00Z "in flight in api#400"
+    pr $OWNER/api 100 MERGED "acme-aaa: one" acme-aaa-one "why" 2026-08-05T09:00:00Z
+    pr $OWNER/web 200 MERGED "acme-bbb: two" acme-bbb-two "why" 2026-08-05T09:00:00Z
+    pr $OWNER/api 300 MERGED "acme-ccc: three" acme-ccc-three "why" 2026-08-05T09:00:00Z
+    pr $OWNER/api 400 OPEN "acme-eee: four" acme-eee-four "why"
+    open_pr api 400 "acme-eee: four" acme-eee-four "why"
+}
+
+# Three close candidates over two repos, a PR two beads name, a bead with no
+# references and one blocked on an open PR. Before the fix this run made 14 gh
+# calls: 6 open-PR listings (3 candidates x 2 repos), 5 `gh pr view`, 3
+# `gh search prs` (each of which also spent a hidden GraphQL query).
+scenario "a multi-bead run lists each repo's open PRs once, not once per close candidate (acme-mfhky)"
+multi_bead_fixture
+run_sweep --apply
+expect_rc 0
+expect_closed acme-aaa
+expect_closed acme-bbb
+expect_closed acme-ccc
+expect_not_closed acme-eee
+expect_says "acme-eee: citing PRs not all merged — $OWNER/api#400(OPEN)"
+expect_calls 1 "api's open PRs listed" core "" "^repos/$OWNER/api/pulls[?]state=open"
+expect_calls 1 "web's open PRs listed" core "" "^repos/$OWNER/web/pulls[?]state=open"
+expect_calls 1 "GraphQL batches for every PR any bead names (api#100 twice)" graphql
+expect_calls 0 "per-PR REST lookups" core "" "^repos/[^?]*/pulls/[0-9]"
+expect_calls 3 "pre-close searches, one per close candidate" search
+expect_calls 6 "gh calls in all"
+finish
+
+# A number that is no PR at all — usually an issue the harvester read as one
+# (acme-4ea0z) — is settled once per run: GraphQL's NOT_FOUND in the batch,
+# then REST's definitive 404, then the cache. Not once per bead naming it.
+# children_of runs inside $(...) for every swept bead, so a listing held in a
+# shell variable was made again each time: 34 MB and a jq pass per bead, 280 times
+# a sweep (acme-ywm6d.11). Same bug, same place to pin it as acme-mfhky above.
+scenario "a multi-bead run dumps the tracker once, not once per swept bead (acme-ywm6d.11)"
+bead acme-dm1 2026-08-01T00:00:00Z "delivered in api#101"
+bead acme-dm2 2026-08-01T00:00:00Z "delivered in api#102"
+bead acme-dm3 2026-08-01T00:00:00Z "delivered in api#103"
+pr $OWNER/api 101 MERGED "acme-dm1: one" acme-dm1-one "why" 2026-08-05T09:00:00Z
+pr $OWNER/api 102 MERGED "acme-dm2: two" acme-dm2-two "why" 2026-08-05T09:00:00Z
+pr $OWNER/api 103 MERGED "acme-dm3: three" acme-dm3-three "why" 2026-08-05T09:00:00Z
+run_sweep --apply
+expect_rc 0
+expect_closed acme-dm1
+expect_closed acme-dm2
+expect_closed acme-dm3
+dumps=$(grep -c -e '^list .*--all' "$E2E_DIR/bd-calls.log")
+[ "$dumps" = 1 ] || fail "bd list --all ran $dumps times for three beads, wanted 1"
+finish
+
+scenario "a tracker dump that failed is asked again, and is not read as no children"
+bead acme-dr1 2026-08-01T00:00:00Z "delivered in api#111"
+bead acme-dr2 2026-08-01T00:00:00Z "delivered in api#112" in_review
+bead acme-dr3 2026-08-01T00:00:00Z "delivered in api#113"
+child_row acme-dr2.1 acme-dr2 closed
+pr $OWNER/api 111 MERGED "acme-dr1: one" acme-dr1-one "why" 2026-08-05T09:00:00Z
+pr $OWNER/api 112 MERGED "acme-dr2.1: the child" acme-dr2.1-the-child "why" 2026-08-05T09:00:00Z
+pr $OWNER/api 113 MERGED "acme-dr3: three" acme-dr3-three "why" 2026-08-05T09:00:00Z
+: > "$E2E_DIR/fail-next-list-all"
+run_sweep
+expect_rc 0
+dumps=$(grep -c -e '^list .*--all' "$E2E_DIR/bd-calls.log")
+[ "$dumps" = 2 ] || fail "bd list --all ran $dumps times, wanted 2: the refused one, then one that is kept"
+expect_silent_about "acme-dr2: MISRECORDED"
+finish
+
+scenario "a phantom ref named by two beads is asked about once"
+bead acme-aaa 2026-08-01T00:00:00Z "mitigated by api#404"
+bead acme-bbb 2026-08-01T00:00:00Z "see also api#404"
+run_sweep --apply
+expect_rc 0
+expect_says "acme-aaa: no PR cites this bead — its only references are not pull requests in the repo they were attributed to (MISSING: $OWNER/api#404)"
+expect_says "acme-bbb: no PR cites this bead — its only references are not pull requests in the repo they were attributed to (MISSING: $OWNER/api#404)"
+expect_calls 1 "GraphQL batches" graphql
+expect_calls 1 "REST lookups of the phantom" core 404 "^repos/$OWNER/api/pulls/404$"
+expect_calls 2 "gh calls in all"
+finish
+
+# A parent parked on open children cannot close whatever GitHub says, and it
+# stays parked for days. Asked last, that check made every sweep pay a search,
+# its sleep and the whole open-PR listing for each such parent first: 24 of 40
+# pre-close searches in a live dry run on 2026-09-29.
+scenario "a parent parked on open children costs no search and no open-PR listing"
+bead acme-par 2026-08-01T00:00:00Z "delivered in api#100" in_review
+child_row acme-par.1 acme-par open
+pr $OWNER/api 100 MERGED "acme-par: the parent's own part" acme-par-own-part \
+    "why" 2026-08-05T09:00:00Z
+run_sweep --apply
+expect_rc 0
+expect_says "acme-par: PRs merged ( $OWNER/api#100) but children still open — acme-par.1(open)"
+expect_not_closed acme-par
+expect_calls 0 "searches" search
+expect_calls 0 "open-PR listings" core "" "pulls[?]state=open"
+expect_calls 1 "gh calls in all (the PR lookup)"
+finish
+
+# The listings are conditional requests: a repo whose open PRs have not changed
+# since the last sweep answers 304, which GitHub does not bill — and the
+# remembered body must still be READ, or a 304 would be "no open PRs", the
+# exact silent answer the cross-check exists to refuse (acme-vz559).
+scenario "a second sweep re-lists unchanged open PRs as unbilled 304s, and still reads them"
+bead acme-kdod 2026-08-17T08:00:00Z "started in api#100"
+pr $OWNER/api 100 MERGED "acme-kdod: first half" acme-kdod-first-half \
+    "why" 2026-08-17T12:00:00Z
+open_pr api 1244 "acme-kdod: fix the sweep" acme-kdod-fix-the-sweep "why"
+run_sweep --apply
+expect_calls 2 "first run: full listings" core 200 "pulls[?]state=open"
+: > "$E2E_DIR/gh-calls.log"
+run_sweep --apply
+expect_rc 0
+expect_calls 2 "second run: both listings answered 304" core 304 "pulls[?]state=open"
+expect_calls 0 "second run: billed listings" core 200 "pulls[?]state=open"
+expect_says "citing PRs not all merged (open-PR cross-check) — $OWNER/api#1244(OPEN)"
+expect_says "of them unbilled 304s"
+expect_not_closed acme-kdod
+finish
+
+scenario "a listing that changed since the last sweep is read in full"
+bead acme-aaa 2026-08-01T00:00:00Z "delivered in api#100"
+pr $OWNER/api 100 MERGED "acme-aaa: do the thing" acme-aaa-do-the-thing \
+    "why" 2026-08-05T09:00:00Z
+run_sweep
+expect_says "acme-aaa: would close"
+open_pr api 1244 "acme-aaa: the rest" acme-aaa-the-rest "why"
+: > "$E2E_DIR/gh-calls.log"
+run_sweep
+expect_calls 1 "the changed listing, fetched in full" core 200 "^repos/$OWNER/api/pulls[?]state=open"
+expect_calls 1 "the unchanged one, a 304" core 304 "^repos/$OWNER/web/pulls[?]state=open"
+expect_says "citing PRs not all merged (open-PR cross-check) — $OWNER/api#1244(OPEN)"
+expect_silent_about "would close"
+finish
+
+# The budget itself. acme-gahlf, 2026-09-29: the core budget hit 5000/5000
+# and every close candidate after that printed its own "open-PR cross-check
+# could not be completed" line — 7 of 7 — which reads like a GitHub outage.
+# At the reserve the sweep now stops asking, says so once, and leaves the rest.
+scenario "a budget at its reserve stops the sweep: one line, and no GitHub call after it"
+bead acme-aaa 2026-08-01T00:00:00Z "delivered in api#100"
+bead acme-bbb 2026-08-01T00:00:00Z "delivered in web#200"
+bead acme-ddd 2026-08-01T00:00:00Z "no references yet"
+pr $OWNER/api 100 MERGED "acme-aaa: one" acme-aaa-one "why" 2026-08-05T09:00:00Z
+pr $OWNER/web 200 MERGED "acme-bbb: two" acme-bbb-two "why" 2026-08-05T09:00:00Z
+export E2E_RATE_CORE=100      # reserve is 10% of 5000; resets in an hour
+run_sweep --apply
+expect_rc 3
+expect_says "stopped early to spare the shared GitHub token: GitHub core budget at 100/5000"
+expect_says "2 bead(s) that still needed GitHub were not evaluated and are left as they were: acme-aaa acme-bbb"
+expect_says "acme-ddd: no PR references found"
+expect_silent_about "cross-check could not be completed"
+expect_silent_about "search failed"
+expect_not_closed acme-aaa
+expect_not_closed acme-bbb
+# The GraphQL prefetch, aaa's pre-close search, and the one listing whose
+# headers said stop. Nothing after that.
+expect_calls 3 "gh calls in all"
+expect_calls 1 "open-PR listings" core "" "pulls[?]state=open"
+finish
+
+scenario "a search refused for budget waits out a reset seconds away, then carries on"
+bead acme-aaa 2026-08-01T00:00:00Z "delivered in api#100"
+pr $OWNER/api 100 MERGED "acme-aaa: do the thing" acme-aaa-do-the-thing \
+    "why" 2026-08-05T09:00:00Z
+export E2E_REFUSE_SEARCH=1 E2E_RATE_RESET_AT=$(( $(date +%s) + 10 ))
+run_sweep --apply
+expect_rc 0
+expect_silent_about DEGRADED
+expect_closed acme-aaa
+expect_calls 1 "the refused search" search 403
+expect_calls 1 "the retried search" search 200
+awk '$1 >= 10 { found = 1 } END { exit !found }' "$E2E_DIR/slept" 2>/dev/null ||
+    fail "the sweep did not wait for the search budget to reset (slept: $(tr '\n' ' ' < "$E2E_DIR/slept" 2>/dev/null))"
+finish
+
+scenario "a refusal whose reset is an hour away stops instead of sleeping on it"
+bead acme-aaa 2026-08-01T00:00:00Z "delivered in api#100"
+pr $OWNER/api 100 MERGED "acme-aaa: do the thing" acme-aaa-do-the-thing \
+    "why" 2026-08-05T09:00:00Z
+export E2E_REFUSE_SEARCH=1
+run_sweep --apply
+expect_rc 3
+expect_says "GitHub search budget at 0/30"
+expect_says "GitHub refused a call for budget (HTTP 403)"
+expect_says "not evaluated and are left as they were: acme-aaa"
+expect_not_closed acme-aaa
+expect_calls 1 "searches: the refused one, not retried" search
+! awk '$1 >= 20 { found = 1 } END { exit !found }' "$E2E_DIR/slept" 2>/dev/null ||
+    fail "the sweep slept toward an hour-away reset (slept: $(tr '\n' ' ' < "$E2E_DIR/slept"))"
 finish
 
 echo

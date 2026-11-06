@@ -1,0 +1,194 @@
+#!/usr/bin/env python3
+"""Offline ownership and timeout tests. No real process receives a signal."""
+from importlib.machinery import SourceFileLoader
+import importlib.util
+from pathlib import Path
+import signal
+import sys
+import unittest
+from unittest.mock import patch
+
+loader = SourceFileLoader("remote_children", str(Path(__file__).with_name("bd-dolt-remote-children")))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+loader.exec_module(module)
+P = module.Process
+REPO = Path("/tracker")
+
+
+class RemoteChildrenTests(unittest.TestCase):
+    def setUp(self):
+        self.owner = P(10, 1, 10000, "start", ("dolt", "sql-server", "--socket", "/tracker/.beads/dolt.sock"))
+        self.child = P(20, 10, 1000, "push-start", ("git", "push", "--force-with-lease=refs/dolt/data:abc", "origin", "refs/dolt/tmp:refs/dolt/data"))
+        self.ssh = P(30, 20, 990, "ssh-start", ("ssh", "git@example.com", "git-receive-pack 'repo'"))
+        self.processes = {p.pid: p for p in (self.owner, self.child, self.ssh)}
+        self.signals, self.lines = [], []
+
+    def inspect(self, apply=True, read=None, identify=None):
+        def send(pid, sig):
+            self.signals.append((pid, sig))
+            self.processes.pop(pid, None)
+        module.inspect(REPO, 920, apply, read=read or (lambda: self.processes.copy()),
+                       identify=identify or (lambda repo, processes: self.owner),
+                       send=send, emit=self.lines.append)
+
+    def test_expired_push_terminates_only_remote_children(self):
+        self.inspect()
+        self.assertEqual(self.signals, [(30, signal.SIGTERM), (20, signal.SIGTERM)])
+        self.assertIn(10, self.processes)
+        self.assertTrue(any("surviving_children=0" in line for line in self.lines))
+        self.assertFalse(any("git@example" in line for line in self.lines))
+
+    def test_identity_refspec_and_surviving_signal_are_reported(self):
+        self.processes[20] = P(20, 10, 1000, self.child.started, self.child.argv[:-1] + ("refs/dolt/data",))
+        module.inspect(REPO, 920, True, read=lambda: self.processes.copy(),
+                       identify=lambda repo, processes: self.owner,
+                       send=lambda pid, sig: self.signals.append((pid, sig)), emit=self.lines.append)
+        self.assertEqual(len(self.signals), 2)
+        self.assertTrue(any("surviving_children=2" in line for line in self.lines))
+
+    def test_report_only(self):
+        self.inspect(False)
+        self.assertEqual(self.signals, [])
+        self.assertTrue(any("state=expired" in line for line in self.lines))
+
+    def test_longer_upload_budget_preserved(self):
+        for age in (299, 301, 899, 920):
+            self.processes[20] = P(20, 10, age, self.child.started, self.child.argv)
+            self.inspect()
+            self.assertEqual(self.signals, [])
+
+    def test_active_client_any_tracker_prevents_termination(self):
+        for argv in (("bd", "dolt", "push"), ("dolt", "push", "origin", "main"), ("bd", "sql", "CALL DOLT_PUSH()")):
+            self.processes[40] = P(40, 1, 10, "client", argv)
+            self.inspect()
+            self.assertEqual(self.signals, [])
+
+    def test_other_server_and_ordinary_git_push_untouched(self):
+        self.processes[20] = P(20, 99, 1000, self.child.started, self.child.argv)
+        self.inspect()
+        self.assertEqual(self.signals, [])
+        self.processes[20] = P(20, 10, 1000, self.child.started, ("git", "push", "origin", "main"))
+        self.inspect()
+        self.assertEqual(self.signals, [])
+
+    def test_pid_reuse_and_new_client_prevent_signals(self):
+        for mode in ("pid", "client", "server"):
+            calls = 0
+            def read():
+                nonlocal calls
+                calls += 1
+                result = self.processes.copy()
+                if calls > 1:
+                    if mode == "pid":
+                        result[20] = P(20, 10, 0, "new-start", self.child.argv)
+                    elif mode == "client":
+                        result[40] = P(40, 1, 0, "new", ("bd", "dolt", "push"))
+                    else:
+                        result[10] = P(10, 1, 0, "new-server", self.owner.argv)
+                return result
+            self.inspect(read=read, identify=lambda repo, processes: processes[10])
+            self.assertEqual(self.signals, [])
+
+    def test_unknown_ownership_does_not_signal(self):
+        def unknown(repo, processes):
+            raise ValueError("ambiguous")
+        with self.assertRaises(ValueError):
+            self.inspect(identify=unknown)
+        self.assertEqual(self.signals, [])
+
+    @staticmethod
+    def lsof(processes, by_pid):
+        """A fake lsof, as it behaves: `-a -p PID -d cwd -Fn` gives PID's cwd and
+        fails for a process that is gone; `-t PATH` gives the pids holding that
+        socket and fails when none does (a bd-started server opens none)."""
+        def run(*args):
+            if args[:2] == ("lsof", "-t"):
+                holders = [p.pid for p in processes.values()
+                           if args[2] in module.sockets(p.argv) and p.pid in by_pid]
+                if not holders:
+                    raise module.subprocess.CalledProcessError(1, args)
+                return "".join(f"{pid}\n" for pid in holders)
+            assert args[:3] == ("lsof", "-a", "-p") and args[4:] == ("-d", "cwd", "-Fn"), args
+            pid = int(args[3])
+            if pid not in by_pid:
+                raise module.subprocess.CalledProcessError(1, args)
+            return f"p{pid}\nfcwd\nn{by_pid[pid]}\n"
+        return run
+
+    def server(self, processes, by_pid, gone=()):
+        with patch.object(module, "run", side_effect=self.lsof(processes, by_pid)), \
+             patch.object(module, "alive", side_effect=lambda pid: pid not in gone):
+            return module.server(REPO, processes)
+
+    def test_launchd_server_with_its_socket_is_the_owner(self):
+        self.assertEqual(self.server(self.processes, {10: "/tracker/.beads/dolt"}), self.owner)
+        equals = P(10, 1, 10000, "start", ("dolt", "sql-server", "--socket=/tracker/.beads/dolt.sock"))
+        self.assertEqual(self.server({10: equals}, {10: "/tracker/.beads/dolt"}), equals)
+
+    def test_bd_started_server_without_a_socket_is_the_owner(self):
+        # acme-1r64tl: bd starts its own server with no --socket, so requiring
+        # one answered "ownership is unknown" on every machine without the
+        # launchd agent and the history restart deferred on every sync.
+        bd = P(10, 1, 10000, "start", ("dolt", "sql-server", "-H", "127.0.0.1", "-P", "3307"))
+        self.assertEqual(self.server({10: bd, 20: self.child}, {10: "/tracker/.beads/dolt"}), bd)
+
+    def test_bd_started_server_expired_push_is_reported_and_terminated(self):
+        # acme-zghgik (2): with the real ownership check, an expired push on a
+        # server bd started is reported and TERMed under the existing rules.
+        bd = P(10, 1, 10000, "start", ("dolt", "sql-server", "-H", "127.0.0.1", "-P", "49461",
+                                       "--loglevel=warning"))
+        self.processes = {p.pid: p for p in (bd, self.child, self.ssh)}
+        cwd = {10: "/tracker/.beads/dolt", 20: "/tmp", 30: "/tmp"}
+        with patch.object(module, "run", side_effect=self.lsof(self.processes, cwd)):
+            self.inspect(identify=module.server)
+        self.assertIn("server-side remote status: server=10 pushes=1 live_remote_client=no", self.lines)
+        self.assertEqual(self.signals, [(30, signal.SIGTERM), (20, signal.SIGTERM)])
+        self.assertIn(10, self.processes)
+
+    def test_a_server_elsewhere_is_not_the_owner(self):
+        with self.assertRaises(ValueError):
+            self.server(self.processes, {10: "/other/.beads/dolt"})
+
+    def test_another_trackers_server_is_ignored(self):
+        other = P(11, 1, 10000, "start", ("dolt", "sql-server", "-P", "3308"))
+        found = self.server({10: self.owner, 11: other},
+                            {10: "/tracker/.beads/dolt", 11: "/games/.beads/dolt"})
+        self.assertEqual(found, self.owner)
+
+    def test_a_socket_that_disagrees_is_refused(self):
+        wrong = P(10, 1, 1000, "start", ("dolt", "sql-server", "--socket", "/other/dolt.sock"))
+        with self.assertRaises(ValueError):
+            self.server({10: wrong}, {10: "/tracker/.beads/dolt"})
+
+    def test_two_servers_on_one_data_directory_is_unknown(self):
+        bd = P(11, 1, 50, "start", ("dolt", "sql-server", "-P", "3307"))
+        with self.assertRaises(ValueError):
+            self.server({10: self.owner, 11: bd},
+                        {10: "/tracker/.beads/dolt", 11: "/tracker/.beads/dolt"})
+
+    def test_a_candidate_that_exited_is_skipped_and_one_alive_is_not(self):
+        gone = P(11, 1, 50, "start", ("dolt", "sql-server", "-P", "3308"))
+        self.assertEqual(self.server({10: self.owner, 11: gone}, {10: "/tracker/.beads/dolt"},
+                                     gone={11}), self.owner)
+        with self.assertRaises(module.subprocess.CalledProcessError):
+            self.server({10: self.owner, 11: gone}, {10: "/tracker/.beads/dolt"})
+
+    def test_alive(self):
+        self.assertTrue(module.alive(module.os.getpid()))
+        with patch.object(module.os, "kill", side_effect=ProcessLookupError):
+            self.assertFalse(module.alive(12345))
+        with patch.object(module.os, "kill", side_effect=PermissionError):
+            self.assertTrue(module.alive(1))
+
+    def test_process_snapshot_and_age(self):
+        self.assertEqual(module.seconds("2-03:04:05"), 183845)
+        self.assertEqual(module.seconds("15:20"), 920)
+        sample = "10 1 2-03:04:05 Thu Oct 29 20:00:00 2026 /usr/bin/dolt sql-server --socket /tracker/.beads/dolt.sock\n"
+        with patch.object(module, "run", return_value=sample):
+            self.assertEqual(module.snapshot()[10].age, 183845)
+
+
+if __name__ == "__main__":
+    unittest.main()

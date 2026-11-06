@@ -78,7 +78,7 @@ Nothing to build. Validate changes with:
 ```bash
 bash -n scripts/bd-health scripts/bd-dup-check scripts/bd-sweep-merged \
         scripts/bd-reconcile-fork scripts/bd-setup-sync \
-        scripts/bd-setup-report scripts/bd-review-gate
+        scripts/bd-setup-report
 sh -n templates/beads-sync.sh
 jq empty templates/workspace-settings.json
 scripts/test-bd-dup-check          # offline
@@ -86,13 +86,12 @@ scripts/test-bd-health             # offline
 scripts/test-bd-sweep-merged       # offline
 scripts/test-bd-sweep-merged-e2e   # offline (fake bd + fake gh)
 scripts/test-bd-setup-sync         # offline
-scripts/test-bd-review-gate        # offline
 scripts/bd-health                  # live check, report-only
 scripts/bd-sweep-merged            # dry run, closes nothing without --apply
 ```
 
 `templates/` holds files that must live *outside* a git repo to work (the
-workspace-root `CLAUDE.md`, `.claude/settings.json`, `~/.claude/hooks/`). They
+workspace-root `CLAUDE.md`, `.claude/settings.json`, `.beads/PRIME.md`). They
 are versioned here and copied out — **edit team rules here**, not only in your
 local copy, or teammates' agents drift apart.
 
@@ -131,8 +130,13 @@ The bead lifecycle usually ends at "PR opened", but the PR merges after the
 session is gone — without the rules below, done work parks in `in_progress`
 forever and gets re-triaged.
 
-- **Cite the bead id in every PR** — in the title, the branch name, or a
-  `Bead: <id>` line in the body. Body prose does NOT count.
+- **Cite the bead id in every PR**, on a `Bead: <id>` line in the body
+  (`Beads: <a>, <b>` for several). This is what lets automation close the
+  bead when the PR merges — and in multi-PR features, every PR must cite it
+  or the bead can close before the siblings land. The title and the branch
+  name are fallbacks, not additions: when a `Bead:` line is present it is the
+  whole list, and the branch counts only when nothing else names a bead, and
+  then only the id it starts with (CLAUDE.md has the rule).
 - **Set `in_review` when the PR opens**: `bd update <id> --status=in_review`.
 - **`scripts/bd-sweep-merged`** closes `in_progress`/`in_review` beads whose
   delivering PRs have all merged. Dry-run by default; `--apply` to close,

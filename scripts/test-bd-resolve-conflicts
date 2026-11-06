@@ -1,0 +1,336 @@
+#!/usr/bin/env bash
+# Offline tests for scripts/bd-resolve-conflicts.
+#
+# These drive the WHOLE resolve against a real scratch Dolt store (dolt init
+# in a temp dir, two branches, a genuinely conflicted merge), with a fake `bd`
+# on PATH — no network, no server, no live tracker. The policy being pinned is
+# acme-tvzv9.4's, and each scenario is one of its clauses:
+#
+#   1. ours is the base, THEIR close is re-applied, OUR close is never
+#      reopened, counters take MAX
+#   2. a conflicted table outside the whitelist refuses (exit 4, untouched)
+#   3. dry run changes nothing
+#   4. a SCHEMA conflict refuses (exit 4, untouched)
+#   5. a close whose re-apply fails stays journaled (exit 3) and lands on
+#      the next run — the "their close is never lost" guarantee
+#   6. a dependencies conflict where both sides record the SAME edge resolves
+#      (acme-il6ct), and 7. one where they record different edges still
+#      refuses
+#
+# The conflicts are real because every bd write bumps updated_at, so two
+# lineages touching the same row always collide on that cell — the fixture
+# reproduces exactly that.
+
+set -uo pipefail
+cd "$(dirname "$0")/.."
+RESOLVER="$PWD/scripts/bd-resolve-conflicts"
+
+command -v dolt >/dev/null 2>&1 || { echo "SKIP: dolt not installed"; exit 0; }
+command -v jq   >/dev/null 2>&1 || { echo "SKIP: jq not installed"; exit 0; }
+
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/test-bd-resolve.XXXXXX")
+trap 'rm -rf "$TMP"' EXIT
+export HOME="$TMP/home"           # sandbox dolt's global config
+mkdir -p "$HOME"
+dolt config --global --add user.name  "test" >/dev/null
+dolt config --global --add user.email "test@test" >/dev/null
+# Every dolt invocation otherwise forks a send-metrics phone-home, which
+# roughly doubles this suite's wall clock and reaches the network.
+dolt config --global --add metrics.disabled true >/dev/null 2>&1 || true
+
+pass=0; fail=0
+ok()   { pass=$((pass+1)); }
+bad()  { fail=$((fail+1)); echo "FAIL: $*"; }
+check() { # check <desc> <expected> <actual>
+    if [ "$2" = "$3" ]; then ok; else bad "$1 — expected [$2], got [$3]"; fi
+}
+
+sql() { (cd "$DATA" && dolt sql -q "$1" 2>&1); }
+scalar() { (cd "$DATA" && dolt sql -r csv -q "$1" 2>/dev/null) | sed -n 2p; }
+
+# Build a fresh fixture. Args: none. Sets BEADS/DATA and leaves the store
+# mid-merge with conflicts in issues, child_counters and issue_counter.
+# Every edit bumps updated_at on both sides — that cell collision is what
+# makes real bd lineages conflict on every shared row.
+mk_fixture() {
+    BEADS="$TMP/$1/.beads"; DATA="$BEADS/dolt/acme"
+    mkdir -p "$DATA"
+    (cd "$DATA" && dolt init >/dev/null 2>&1)
+    sql "CREATE TABLE issues (id varchar(255) PRIMARY KEY, title varchar(500), description longtext, status varchar(32) NOT NULL DEFAULT 'open', close_reason longtext, closed_at datetime, created_at datetime, created_by varchar(255), updated_at datetime);
+         CREATE TABLE child_counters (parent_id varchar(255) PRIMARY KEY, last_child int NOT NULL DEFAULT 0);
+         CREATE TABLE issue_counter (prefix varchar(255) PRIMARY KEY, last_id int NOT NULL DEFAULT 0);
+         CREATE TABLE labels (issue_id varchar(255) PRIMARY KEY, label varchar(255));
+         INSERT INTO issues (id, title, description, status, created_at, created_by, updated_at) VALUES
+           ('acme-aaa', 'issue A', 'base A', 'open', '2026-07-20 09:00:00', 'alice', '2026-08-01 00:00:00'),
+           ('acme-bbb', 'issue B', 'base B', 'open', '2026-07-20 09:00:00', 'alice', '2026-08-01 00:00:00'),
+           ('acme-ccc', 'issue C', 'base C', 'open', '2026-07-20 09:00:00', 'alice', '2026-08-01 00:00:00');
+         INSERT INTO child_counters VALUES ('acme-f45lr', 5);
+         INSERT INTO issue_counter VALUES ('acme', 100);
+         INSERT INTO labels VALUES ('acme-aaa', 'base-label');" >/dev/null
+    (cd "$DATA" && dolt add -A >/dev/null && dolt commit -m seed >/dev/null)
+
+    (cd "$DATA" && dolt checkout -b theirs >/dev/null 2>&1)
+    sql "UPDATE issues SET status='closed', close_reason='their-close-reason', closed_at='2026-08-02 10:00:00', updated_at='2026-08-02 10:00:00' WHERE id='acme-aaa';
+         UPDATE issues SET title='their B title', updated_at='2026-08-02 10:00:00' WHERE id='acme-bbb';
+         UPDATE issues SET description='their C', updated_at='2026-08-02 10:00:00' WHERE id='acme-ccc';
+         UPDATE child_counters SET last_child=8 WHERE parent_id='acme-f45lr';
+         UPDATE issue_counter SET last_id=104 WHERE prefix='acme';" >/dev/null
+    (cd "$DATA" && dolt add -A >/dev/null && dolt commit -m theirs >/dev/null)
+
+    (cd "$DATA" && dolt checkout main >/dev/null 2>&1)
+    sql "UPDATE issues SET description='our A desc', updated_at='2026-08-02 11:00:00' WHERE id='acme-aaa';
+         UPDATE issues SET status='closed', close_reason='our-close-reason', closed_at='2026-08-02 11:00:00', updated_at='2026-08-02 11:00:00' WHERE id='acme-bbb';
+         UPDATE issues SET description='our C', updated_at='2026-08-02 11:00:00' WHERE id='acme-ccc';
+         UPDATE child_counters SET last_child=6 WHERE parent_id='acme-f45lr';
+         UPDATE issue_counter SET last_id=102 WHERE prefix='acme';" >/dev/null
+    (cd "$DATA" && dolt add -A >/dev/null && dolt commit -m ours >/dev/null)
+
+    (cd "$DATA" && dolt merge theirs >/dev/null 2>&1)   # conflicts expected
+}
+
+# Fake bd: `close` applies the close straight into the fixture store (and
+# logs the call), `dolt commit` stages+commits. FAKE_BD_CLOSE_FAILS=1 makes
+# every close fail, for the journal-retry scenario.
+mk_fake_bd() {
+    mkdir -p "$TMP/bin"
+    cat >"$TMP/bin/bd" <<'FAKE'
+#!/usr/bin/env bash
+echo "bd $*" >>"$FAKE_BD_LOG"
+case "$1" in
+    close)
+        [ "${FAKE_BD_CLOSE_FAILS:-0}" = 1 ] && exit 1
+        id="$2"
+        (cd "$FAKE_BD_DATA" && dolt sql -q "UPDATE issues SET status='closed', updated_at=NOW() WHERE id='$id'" >/dev/null 2>&1)
+        exit 0 ;;
+    dolt)
+        [ "$2" = commit ] || exit 0
+        (cd "$FAKE_BD_DATA" && dolt add -A >/dev/null 2>&1 && dolt commit -m "bd dolt commit" >/dev/null 2>&1)
+        exit 0 ;;
+esac
+exit 0
+FAKE
+    chmod +x "$TMP/bin/bd"
+}
+mk_fake_bd
+export FAKE_BD_LOG="$TMP/bd.log"
+
+run_resolver() { # run_resolver <args...>; uses current BEADS/DATA
+    PATH="$TMP/bin:$PATH" BEADS_DIR="$BEADS" FAKE_BD_DATA="$DATA" \
+        "$RESOLVER" "$@" >"$TMP/out" 2>"$TMP/err"
+}
+
+# ---- unit: the whitelist verdict ------------------------------------------
+export BD_RESOLVE_CONFLICTS_LIB=1
+. "$RESOLVER"
+unset BD_RESOLVE_CONFLICTS_LIB
+resolve_tables_verdict "issues";                      check "verdict: issues alone"             0 $?
+resolve_tables_verdict "$(printf 'issues\nchild_counters\nissue_counter')"; check "verdict: all whitelisted" 0 $?
+resolve_tables_verdict "$(printf 'issues\nlabels')";  check "verdict: labels refuses"           1 $?
+resolve_tables_verdict "comments";                    check "verdict: comments refuses"         1 $?
+resolve_tables_verdict "";                            check "verdict: empty list is fine"       0 $?
+resolve_tables_verdict "dependencies";                check "verdict: dependencies allowed"     0 $?
+resolve_tables_verdict "$(printf 'issues\ndependencies')"; check "verdict: issues+dependencies" 0 $?
+id_is_safe "acme-qtdma.4";                           check "id_is_safe: dotted child id"       0 $?
+id_is_safe "x'; DROP TABLE issues;--";                check "id_is_safe: injection refused"     1 $?
+
+# ---- scenario 1: the policy, end to end -----------------------------------
+mk_fixture s1
+n=$(scalar "SELECT COALESCE(SUM(num_conflicts),0) FROM dolt_conflicts")
+[ "${n:-0}" -gt 0 ] || bad "s1 fixture: expected a conflicted merge, got none — fixture broken"
+run_resolver --apply
+check "s1: exit 0"                      0 $?
+check "s1: their close re-applied"      "closed"      "$(scalar "SELECT status FROM issues WHERE id='acme-aaa'")"
+check "s1: ours is the base"            "our A desc"  "$(scalar "SELECT description FROM issues WHERE id='acme-aaa'")"
+check "s1: our close never reopened"    "closed"      "$(scalar "SELECT status FROM issues WHERE id='acme-bbb'")"
+check "s1: our close reason kept"       "our-close-reason" "$(scalar "SELECT close_reason FROM issues WHERE id='acme-bbb'")"
+check "s1: non-status field stays ours" "our C"       "$(scalar "SELECT description FROM issues WHERE id='acme-ccc'")"
+check "s1: child counter is MAX"        "8"           "$(scalar "SELECT last_child FROM child_counters WHERE parent_id='acme-f45lr'")"
+check "s1: issue counter is MAX"        "104"         "$(scalar "SELECT last_id FROM issue_counter WHERE prefix='acme'")"
+check "s1: no conflicts left"           "0"           "$(scalar "SELECT COALESCE(SUM(num_conflicts),0) FROM dolt_conflicts")"
+check "s1: merge concluded"             "false"       "$(scalar "SELECT CASE WHEN is_merging THEN 'true' ELSE 'false' END FROM dolt_merge_status")"
+[ -f "$BEADS/auto-resolve-pending-closes" ] && bad "s1: journal should be gone" || ok
+grep -q "close acme-aaa" "$FAKE_BD_LOG" && ok || bad "s1: bd close was not called for acme-aaa"
+grep -q "their-close-reason" "$FAKE_BD_LOG" && ok || bad "s1: their close reason not carried into bd close"
+grep -q "Auto-resolved" "$TMP/out" && ok || bad "s1: resolve not reported"
+# acme-bbb has a different title on each side (theirs retitled, ours closed)
+# and must NOT read as an id collision: it is one bead, and its creation
+# instant is the same on both sides (acme-pbxzd).
+grep -qi "COLLISION" "$TMP/err" && bad "s1: a retitled bead must not read as an id collision" || ok
+
+# ---- scenarios 8 to 10: one id, two beads (acme-pbxzd) -------------------
+# Child ids come from a per-parent counter in each machine's own store, so two
+# machines filing a child of one parent between syncs both mint <parent>.<n>.
+# The row then has two sides that are not two versions of one bead but two
+# different beads, and --ours does not merge them, it destroys one. The
+# fixture is the 2026-09-04 shape: neither side has the row in the base, each
+# inserts its own.
+mk_collision_fixture() { # <dir> <our_title> <their_title> <our_created_at> <their_created_at>
+    BEADS="$TMP/$1/.beads"; DATA="$BEADS/dolt/acme"
+    mkdir -p "$DATA"
+    (cd "$DATA" && dolt init >/dev/null 2>&1)
+    sql "CREATE TABLE issues (id varchar(255) PRIMARY KEY, title varchar(500), description longtext, status varchar(32) NOT NULL DEFAULT 'open', close_reason longtext, closed_at datetime, created_at datetime, created_by varchar(255), updated_at datetime);
+         CREATE TABLE child_counters (parent_id varchar(255) PRIMARY KEY, last_child int NOT NULL DEFAULT 0);
+         INSERT INTO child_counters VALUES ('acme-z5cq5', 32);" >/dev/null
+    (cd "$DATA" && dolt add -A >/dev/null && dolt commit -m seed >/dev/null)
+    (cd "$DATA" && dolt checkout -b theirs >/dev/null 2>&1)
+    sql "INSERT INTO issues (id,title,description,status,created_at,created_by,updated_at) VALUES
+           ('acme-z5cq5.33','$3','the alert reader sees only one path','open','$5','alice','$5');
+         UPDATE child_counters SET last_child=33 WHERE parent_id='acme-z5cq5';" >/dev/null
+    (cd "$DATA" && dolt add -A >/dev/null && dolt commit -m theirs >/dev/null)
+    (cd "$DATA" && dolt checkout main >/dev/null 2>&1)
+    sql "INSERT INTO issues (id,title,description,status,created_at,created_by,updated_at) VALUES
+           ('acme-z5cq5.33','$2','render close evidence on the ticket timeline','open','$4','alice','$4');
+         UPDATE child_counters SET last_child=33 WHERE parent_id='acme-z5cq5';" >/dev/null
+    (cd "$DATA" && dolt add -A >/dev/null && dolt commit -m ours >/dev/null)
+    (cd "$DATA" && dolt merge theirs >/dev/null 2>&1)
+}
+
+# 8. The incident itself: two different beads, minted 18 minutes apart. The
+# whole point is that nothing is resolved, because the resolve is what would
+# destroy the other lineage's bead beyond recovery.
+mk_collision_fixture s8 'Portal: render close evidence' '[cluster] the alert reader sees only one path' \
+    '2026-09-04 12:55:00' '2026-09-04 12:37:00'
+n=$(scalar "SELECT COALESCE(SUM(num_conflicts),0) FROM dolt_conflicts")
+[ "${n:-0}" -gt 0 ] || bad "s8 fixture: expected an issues conflict, got none - fixture broken"
+run_resolver --apply
+check "s8: exit 4 on an id collision" 4 $?
+n=$(scalar "SELECT COALESCE(SUM(num_conflicts),0) FROM dolt_conflicts")
+[ "${n:-0}" -gt 0 ] && ok || bad "s8: conflicts must be untouched, found none"
+check "s8: merge still open"  "true" "$(scalar "SELECT CASE WHEN is_merging THEN 'true' ELSE 'false' END FROM dolt_merge_status")"
+grep -qi "COLLISION" "$TMP/err" && ok || bad "s8: refusal must name the collision"
+grep -qi "operator merge" "$TMP/err" && ok || bad "s8: refusal must point at the operator merge"
+grep -q "acme-z5cq5.33" "$TMP/err" && ok || bad "s8: refusal must name the colliding id"
+# The other lineage's bead only exists in the conflict table until the
+# resolve runs, so the refusal has to say how to read it out.
+grep -q "dolt_conflicts_issues" "$TMP/err" && ok || bad "s8: refusal must give the recipe for reading both sides"
+
+# 9. Same id, minted apart, SAME title: two machines filed one child twice.
+# Those are duplicates of each other, so this resolves rather than freezing
+# every machine, but it says so.
+mk_collision_fixture s9 'Same follow-up' 'Same follow-up' '2026-09-04 12:55:00' '2026-09-04 12:37:00'
+run_resolver --apply
+check "s9: exit 0 on a same-title collision" 0 $?
+check "s9: conflicts cleared" "0" "$(scalar "SELECT COALESCE(SUM(num_conflicts),0) FROM dolt_conflicts")"
+check "s9: ours is the base" "render close evidence on the ticket timeline" \
+    "$(scalar "SELECT description FROM issues WHERE id='acme-z5cq5.33'")"
+grep -qi "SAME title" "$TMP/err" && ok || bad "s9: folding a duplicate must be reported"
+
+# 10. The false positive that would freeze every sync: ONE bead, edited on
+# both sides so the titles differ, with the creation instant that both
+# lineages share. It must resolve.
+mk_collision_fixture s10 'Retitled by us' 'Retitled by them' '2026-09-04 12:37:00' '2026-09-04 12:37:00'
+run_resolver --apply
+check "s10: exit 0 when one bead was retitled on both sides" 0 $?
+check "s10: conflicts cleared" "0" "$(scalar "SELECT COALESCE(SUM(num_conflicts),0) FROM dolt_conflicts")"
+check "s10: ours is the base" "Retitled by us" "$(scalar "SELECT title FROM issues WHERE id='acme-z5cq5.33'")"
+grep -qi "COLLISION" "$TMP/err" && bad "s10: one bead edited twice must never read as a collision" || ok
+
+# ---- scenario 2: non-whitelisted table refuses ----------------------------
+mk_fixture s2
+sql_theirs() { (cd "$DATA" && dolt checkout theirs >/dev/null 2>&1 && dolt sql -q "$1" >/dev/null && dolt add -A >/dev/null && dolt commit -m x >/dev/null && dolt checkout main >/dev/null 2>&1); }
+# Rebuild s2 with a labels conflict on top: both sides change the same cell.
+BEADS="$TMP/s2b/.beads"; DATA="$BEADS/dolt/acme"
+mkdir -p "$DATA"; (cd "$DATA" && dolt init >/dev/null 2>&1)
+sql "CREATE TABLE labels (issue_id varchar(255) PRIMARY KEY, label varchar(255));
+     INSERT INTO labels VALUES ('acme-aaa', 'base');" >/dev/null
+(cd "$DATA" && dolt add -A >/dev/null && dolt commit -m seed >/dev/null && dolt checkout -b theirs >/dev/null 2>&1)
+sql "UPDATE labels SET label='their-label'" >/dev/null
+(cd "$DATA" && dolt add -A >/dev/null && dolt commit -m theirs >/dev/null && dolt checkout main >/dev/null 2>&1)
+sql "UPDATE labels SET label='our-label'" >/dev/null
+(cd "$DATA" && dolt add -A >/dev/null && dolt commit -m ours >/dev/null && dolt merge theirs >/dev/null 2>&1)
+run_resolver --apply
+check "s2: exit 4 on non-whitelisted table" 4 $?
+n=$(scalar "SELECT COALESCE(SUM(num_conflicts),0) FROM dolt_conflicts")
+[ "${n:-0}" -gt 0 ] && ok || bad "s2: conflicts must be untouched, found none"
+grep -qi "operator merge" "$TMP/err" && ok || bad "s2: refusal must point at the operator merge"
+
+# ---- scenario 3: dry run changes nothing ----------------------------------
+mk_fixture s3
+before=$(scalar "SELECT COALESCE(SUM(num_conflicts),0) FROM dolt_conflicts")
+run_resolver
+check "s3: dry run exits 0" 0 $?
+check "s3: conflicts untouched" "$before" "$(scalar "SELECT COALESCE(SUM(num_conflicts),0) FROM dolt_conflicts")"
+check "s3: our close intact" "closed" "$(scalar "SELECT status FROM issues WHERE id='acme-bbb'")"
+grep -q "would keep ours as base" "$TMP/out" && ok || bad "s3: dry run must print the census"
+grep -c "bd close" "$FAKE_BD_LOG" >/dev/null; closes_before=$(grep -c "^bd close" "$FAKE_BD_LOG" || true)
+check "s3: no closes applied" "${closes_before:-0}" "${closes_before:-0}"
+
+# ---- scenario 4: schema conflict refuses ----------------------------------
+BEADS="$TMP/s4/.beads"; DATA="$BEADS/dolt/acme"
+mkdir -p "$DATA"; (cd "$DATA" && dolt init >/dev/null 2>&1)
+sql "CREATE TABLE issues (id varchar(255) PRIMARY KEY, title varchar(500));" >/dev/null
+(cd "$DATA" && dolt add -A >/dev/null && dolt commit -m seed >/dev/null && dolt checkout -b theirs >/dev/null 2>&1)
+sql "ALTER TABLE issues MODIFY title varchar(400);" >/dev/null
+(cd "$DATA" && dolt add -A >/dev/null && dolt commit -m theirs >/dev/null && dolt checkout main >/dev/null 2>&1)
+sql "ALTER TABLE issues MODIFY title varchar(300);" >/dev/null
+(cd "$DATA" && dolt add -A >/dev/null && dolt commit -m ours >/dev/null && dolt merge theirs >/dev/null 2>&1)
+n_schema=$(scalar "SELECT COUNT(*) FROM dolt_schema_conflicts")
+if [ "${n_schema:-0}" -gt 0 ]; then
+    run_resolver --apply
+    check "s4: exit 4 on schema conflict" 4 $?
+    grep -qi "schema" "$TMP/err" && ok || bad "s4: refusal must name the schema conflict"
+else
+    echo "SKIP: this dolt version auto-merged the schema change (no schema conflict to pin)"
+fi
+
+# ---- scenario 5: a failed close stays journaled and lands on retry --------
+mk_fixture s5
+FAKE_BD_CLOSE_FAILS=1 run_resolver --apply
+check "s5: exit 3 when a close cannot land" 3 $?
+[ -s "$BEADS/auto-resolve-pending-closes" ] && ok || bad "s5: journal must keep the failed close"
+grep -q "acme-aaa" "$BEADS/auto-resolve-pending-closes" && ok || bad "s5: journal must name acme-aaa"
+check "s5: conflicts still cleared" "0" "$(scalar "SELECT COALESCE(SUM(num_conflicts),0) FROM dolt_conflicts")"
+run_resolver --apply     # bd works again; no conflicts, journal only
+check "s5: retry exits 0" 0 $?
+check "s5: journaled close landed on retry" "closed" "$(scalar "SELECT status FROM issues WHERE id='acme-aaa'")"
+[ -f "$BEADS/auto-resolve-pending-closes" ] && bad "s5: journal must be empty after retry" || ok
+
+# ---- scenarios 6 and 7: the dependencies policy (acme-il6ct) -------------
+# Both machines record the SAME parent-child edge. The row's key is derived
+# from the edge, so both lineages mint the same id and differ only in
+# created_at/created_by — ours is lossless and the resolve must proceed.
+# Change any identity column and it becomes a real disagreement that must
+# still refuse, which is the pair s6/s7 pins.
+mk_dep_fixture() { # mk_dep_fixture <name> <their_type>
+    BEADS="$TMP/$1/.beads"; DATA="$BEADS/dolt/acme"
+    mkdir -p "$DATA"
+    (cd "$DATA" && dolt init >/dev/null 2>&1)
+    sql "CREATE TABLE dependencies (
+           id varchar(255) PRIMARY KEY, issue_id varchar(255),
+           depends_on_issue_id varchar(255), type varchar(64),
+           metadata longtext, thread_id varchar(255),
+           created_at datetime, created_by varchar(255));" >/dev/null
+    (cd "$DATA" && dolt add -A >/dev/null && dolt commit -m seed >/dev/null)
+    (cd "$DATA" && dolt checkout -b theirs >/dev/null 2>&1)
+    sql "INSERT INTO dependencies VALUES ('edge-1','acme-ki7zz.1','acme-ki7zz','$2','{}','','2026-09-03 19:59:33','Morty');" >/dev/null
+    (cd "$DATA" && dolt add -A >/dev/null && dolt commit -m theirs >/dev/null)
+    (cd "$DATA" && dolt checkout main >/dev/null 2>&1)
+    sql "INSERT INTO dependencies VALUES ('edge-1','acme-ki7zz.1','acme-ki7zz','parent-child','{}','','2026-09-03 20:51:34','alice');" >/dev/null
+    (cd "$DATA" && dolt add -A >/dev/null && dolt commit -m ours >/dev/null)
+    (cd "$DATA" && dolt merge theirs >/dev/null 2>&1)
+}
+
+mk_dep_fixture s6 'parent-child'      # same edge, only provenance differs
+n=$(scalar "SELECT COALESCE(SUM(num_conflicts),0) FROM dolt_conflicts")
+[ "${n:-0}" -gt 0 ] || bad "s6 fixture: expected a dependencies conflict, got none — fixture broken"
+run_resolver --apply
+check "s6: exit 0 on same-edge dependency"  0   $?
+check "s6: conflicts cleared"               "0" "$(scalar "SELECT COALESCE(SUM(num_conflicts),0) FROM dolt_conflicts")"
+check "s6: merge concluded"                 "false" "$(scalar "SELECT CASE WHEN is_merging THEN 'true' ELSE 'false' END FROM dolt_merge_status")"
+check "s6: the edge survives"               "parent-child" "$(scalar "SELECT type FROM dependencies WHERE id='edge-1'")"
+check "s6: ours is the base (provenance)"   "alice" "$(scalar "SELECT created_by FROM dependencies WHERE id='edge-1'")"
+grep -q "same-edge dependency" "$TMP/out" && ok || bad "s6: resolve must report the dependency rows"
+
+mk_dep_fixture s7 'blocks'            # SAME key, DIFFERENT edge type
+n=$(scalar "SELECT COALESCE(SUM(num_conflicts),0) FROM dolt_conflicts")
+[ "${n:-0}" -gt 0 ] || bad "s7 fixture: expected a dependencies conflict, got none — fixture broken"
+run_resolver --apply
+check "s7: exit 4 on different-edge dependency" 4 $?
+n=$(scalar "SELECT COALESCE(SUM(num_conflicts),0) FROM dolt_conflicts")
+[ "${n:-0}" -gt 0 ] && ok || bad "s7: conflicts must be untouched, found none"
+grep -qi "different edges" "$TMP/err" && ok || bad "s7: refusal must say the edges differ"
+grep -qi "operator merge" "$TMP/err" && ok || bad "s7: refusal must point at the operator merge"
+
+echo
+echo "test-bd-resolve-conflicts: $pass passed, $fail failed"
+[ "$fail" -eq 0 ]

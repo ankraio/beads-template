@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# Behaviour of scripts/bd-export-jsonl against a fake bd.
+#
+# What matters is what it must never do: replace the file when that would lose
+# records, or when it cannot tell. Each case therefore checks the exit code, that
+# the file holds what it should, and that no temporary file was left behind.
+set -u
+
+HERE=$(cd "$(dirname "$0")" && pwd)
+SCRIPT="$HERE/bd-export-jsonl"
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+
+mkdir -p "$TMP/bin" "$TMP/db"
+cat >"$TMP/bin/bd" <<'EOF'
+#!/bin/sh
+# Only the two calls the script makes. The export is whatever the test queued.
+case "$1" in
+    where) echo "$FAKE_DB" ;;
+    export)
+        [ "$2" = "-o" ] || exit 64
+        [ "${FAKE_EXPORT_RC:-0}" = 0 ] || { echo 'Error: search issues: invalid connection' >&2; exit "$FAKE_EXPORT_RC"; }
+        cat "$FAKE_EXPORT" >"$3"
+        ;;
+    *) echo "unexpected bd call: $*" >&2; exit 64 ;;
+esac
+EOF
+chmod +x "$TMP/bin/bd"
+export PATH="$TMP/bin:$PATH" FAKE_DB="$TMP/db" FAKE_EXPORT="$TMP/export.jsonl"
+JSONL="$TMP/db/issues.jsonl"
+
+pass=0
+fail=0
+ok() { pass=$((pass + 1)); }
+bad() { fail=$((fail + 1)); printf 'FAIL: %s\n' "$*"; }
+
+rec() { printf '{"_type":"issue","id":"%s"}\n' "$@"; }
+
+# check <description> <want rc> <want file content>
+check() {
+    desc=$1 want_rc=$2 want=$3
+    err=$("$SCRIPT" 2>&1)
+    rc=$?
+    [ "$rc" = "$want_rc" ] && ok || bad "$desc: exit $rc, wanted $want_rc ($err)"
+    got=$(cat "$JSONL" 2>/dev/null)
+    [ "$got" = "$want" ] && ok || bad "$desc: the file holds [$got], wanted [$want]"
+    left=$(find "$TMP/db" -name '.~issues.jsonl.*' | wc -l | tr -d ' ')
+    [ "$left" = 0 ] && ok || bad "$desc: $left temporary file(s) left behind"
+}
+
+# --- it writes -----------------------------------------------------------------
+rm -f "$JSONL"
+rec a b >"$FAKE_EXPORT"
+check "first export with no file yet" 0 "$(rec a b)"
+
+rec a b c >"$FAKE_EXPORT"
+check "new issues are added" 0 "$(rec a b c)"
+perm=$(stat -c '%a' "$JSONL" 2>/dev/null || stat -f '%Lp' "$JSONL")
+[ "$perm" = 644 ] && ok || bad "the file mode is $perm, wanted 644: mktemp's 600 must not reach a tracked file"
+
+: >"$JSONL"
+rec a >"$FAKE_EXPORT"
+check "an empty file is not a record of anything" 0 "$(rec a)"
+
+# --- the guards bd's auto-export had -------------------------------------------
+# The ids can exist only here, brought in by the git convergence when another
+# machine could publish jsonl but not Dolt.
+rec a b c >"$JSONL"
+rec a b >"$FAKE_EXPORT"
+check "an issue only in the jsonl is not overwritten" 3 "$(rec a b c)"
+err=$("$SCRIPT" 2>&1)
+case "$err" in *"e.g. c"*) ok ;; *) bad "a refusal must name the ids: $err" ;; esac
+
+rec a >"$JSONL"
+: >"$FAKE_EXPORT"
+check "an empty export never replaces a populated file" 3 "$(rec a)"
+
+{ rec a; printf '{"_type":"memory","key":"k","value":"v"}\n'; } >"$JSONL"
+rec a b >"$FAKE_EXPORT"
+want=$(cat "$JSONL")
+check "a record that is not an issue is not silently dropped" 3 "$want"
+
+# --- an unknown answer is not an empty one -------------------------------------
+rec a >"$JSONL"
+rec a b >"$FAKE_EXPORT"
+FAKE_EXPORT_RC=1 check "a failed export leaves the file alone" 1 "$(rec a)"
+err=$(FAKE_EXPORT_RC=1 "$SCRIPT" 2>&1)
+case "$err" in *"invalid connection"*) ok ;; *) bad "bd's error must reach the log: $err" ;; esac
+
+rec a >"$JSONL"
+printf '{"_type":"issue","id":"a"}\n{"_type":"iss' >"$FAKE_EXPORT"
+check "a truncated export leaves the file alone" 1 "$(rec a)"
+
+printf 'not json\n' >"$JSONL"
+rec a >"$FAKE_EXPORT"
+check "an unreadable file is not treated as empty" 1 "not json"
+
+# --- the path can be named, which is how it was proved against the real store --
+rec a >"$JSONL"
+rec z >"$TMP/db/other.jsonl"
+rec z y >"$FAKE_EXPORT"
+"$SCRIPT" --jsonl "$TMP/db/other.jsonl" 2>/dev/null
+rc=$?
+[ "$rc" = 0 ] && ok || bad "--jsonl: exit $rc"
+[ "$(cat "$TMP/db/other.jsonl")" = "$(rec z y)" ] && ok || bad "--jsonl did not refresh the named file"
+[ "$(cat "$JSONL")" = "$(rec a)" ] && ok || bad "--jsonl touched the default file"
+
+printf 'bd-export-jsonl: %s passed, %s failed\n' "$pass" "$fail"
+[ "$fail" = 0 ]

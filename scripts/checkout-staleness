@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+# checkout-staleness — warn when a shared repo checkout has fallen far behind origin.
+#
+# Work in this workspace happens in git worktrees, so the shared checkouts
+# (api/, web/, worker/, ...) are rarely pulled and rot in place. Nothing
+# says so: `git status` is clean, the files exist, and anything that reads the
+# tree - a review, an indexer, a daemon that runs from the checkout - gets old
+# code and reports it as current. On 2026-09-05 the shared checkouts were 44 to
+# 719 commits behind origin, and a cross-repo review read them and published
+# two headline claims that origin had already made false.
+#
+# This check runs from the session hooks next to bd-health and names every
+# checkout more than CHECKOUT_STALENESS_MAX commits behind its origin default
+# branch. It reads local refs only (no fetch, no network): worktrees share
+# refs/remotes with their repo, and the worktrees fetch constantly, so
+# origin/<branch> is current even when the checkout is not.
+#
+# Usage: checkout-staleness [--quiet] [--json] [--max N] [--workspace DIR]
+#   default      print one line per repo, stale or fresh
+#   --quiet      print only stale checkouts (for session hooks)
+#   --json       machine-readable findings
+#   --max N      commits behind that count as stale (default 100)
+#   --workspace  directory whose child repos to check (default: the parent
+#                of this repo, i.e. the workspace root)
+#
+# Bare repos, repos without an origin, and repos whose origin default branch
+# cannot be resolved are skipped: none of them is a shared checkout that can
+# mislead anyone.
+set -uo pipefail
+
+QUIET=0
+JSON=0
+MAX=${CHECKOUT_STALENESS_MAX:-100}
+WORKSPACE=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --quiet) QUIET=1 ;;
+        --json) JSON=1 ;;
+        --max) MAX=$2; shift ;;
+        --max=*) MAX=${1#--max=} ;;
+        --workspace) WORKSPACE=$2; shift ;;
+        --workspace=*) WORKSPACE=${1#--workspace=} ;;
+        *) echo "usage: checkout-staleness [--quiet] [--json] [--max N] [--workspace DIR]" >&2; exit 0 ;;
+    esac
+    shift
+done
+
+# The origin default branch of a repo: origin/HEAD when it is set, else the
+# first of main/master/develop that origin has. Empty when nothing resolves.
+default_branch() {
+    local repo=$1 branch
+    branch=$(git -C "$repo" symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null)
+    branch=${branch#origin/}
+    if [ -z "$branch" ]; then
+        local candidate
+        for candidate in main master develop; do
+            if git -C "$repo" show-ref -q --verify "refs/remotes/origin/$candidate"; then
+                branch=$candidate
+                break
+            fi
+        done
+    fi
+    printf '%s' "$branch"
+}
+
+# Commits on origin/<branch> that HEAD does not have. Empty when either ref is
+# missing.
+behind_count() {
+    git -C "$1" rev-list --count "HEAD..origin/$2" 2>/dev/null
+}
+
+# stale or fresh, for a behind-count against the threshold.
+verdict() {
+    if [ "$1" -gt "$2" ]; then echo stale; else echo fresh; fi
+}
+
+# Is this path a shared checkout worth checking: a non-bare main repo with an
+# origin. A .git *file* marks a linked worktree, which is task-scoped and
+# expected to sit wherever its branch left it; only a .git directory is the
+# shared checkout this check exists for.
+checkable() {
+    local repo=$1
+    [ -d "$repo/.git" ] || return 1
+    [ "$(git -C "$repo" rev-parse --is-bare-repository 2>/dev/null)" = "false" ] || return 1
+    git -C "$repo" remote get-url origin >/dev/null 2>&1
+}
+
+# Tests source the script with CHECKOUT_STALENESS_LIB=1 to get the helpers
+# without scanning a workspace.
+if [ "${CHECKOUT_STALENESS_LIB:-0}" = 1 ]; then
+    return 0 2>/dev/null || exit 0
+fi
+
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+if [ -z "$WORKSPACE" ]; then
+    # The workspace is the parent of this repo's MAIN checkout, even when the
+    # script runs from a linked worktree (whose own parent is a worktree pen).
+    common=$(git -C "$SCRIPT_DIR" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)
+    if [ -n "$common" ]; then
+        WORKSPACE=$(cd "$common/../.." && pwd)
+    else
+        WORKSPACE=$(cd "$SCRIPT_DIR/../.." && pwd)
+    fi
+fi
+
+findings=()
+jfind=()
+add() { findings+=("$1"); jfind+=("{\"severity\":\"$2\",\"check\":\"$3\",\"repo\":\"$4\",\"behind\":$5,\"message\":$(printf '%s' "$1" | jq -Rs .)}"); }
+fresh=()
+
+for dir in "$WORKSPACE"/*/; do
+    repo=${dir%/}
+    checkable "$repo" || continue
+    branch=$(default_branch "$repo")
+    [ -n "$branch" ] || continue
+    behind=$(behind_count "$repo" "$branch")
+    [ -n "$behind" ] || continue
+    name=$(basename "$repo")
+    if [ "$(verdict "$behind" "$MAX")" = stale ]; then
+        add "$name is $behind commits behind origin/$branch (shared checkout: branch worktrees off origin/$branch and never trust this tree's contents)" warning checkout-staleness "$name" "$behind"
+    else
+        fresh+=("$name is $behind behind origin/$branch")
+    fi
+done
+
+if [ "$JSON" = 1 ]; then
+    printf '{"count":%d,"max":%d,"findings":[%s]}\n' "${#findings[@]}" "$MAX" "$(IFS=,; echo "${jfind[*]:-}")"
+    exit 0
+fi
+if [ "${#findings[@]}" -gt 0 ]; then
+    echo "checkout-staleness: ${#findings[@]} shared checkout(s) more than $MAX commits behind origin:"
+    for line in "${findings[@]}"; do echo "  - $line"; done
+elif [ "$QUIET" = 0 ]; then
+    echo "checkout-staleness: every shared checkout is within $MAX commits of origin"
+fi
+if [ "$QUIET" = 0 ] && [ "${#fresh[@]}" -gt 0 ]; then
+    for line in "${fresh[@]}"; do echo "  ok   $line"; done
+fi
+exit 0

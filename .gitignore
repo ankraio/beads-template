@@ -4,3 +4,9 @@
 *.db
 .beads-credential-key
 .beads/proxieddb/
+
+# py_compile artefacts (the tests workflow syntax-checks the Python scripts)
+__pycache__/
+
+# written by `bd dolt set`; runtime noise, never team state
+.beads/dolt-config.log

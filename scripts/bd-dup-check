@@ -62,11 +62,15 @@ if [ -n "$BEADS_REPO_DIR" ]; then
     # Test seam: BD_DUP_CHECK_STALE_MARKER overrides the path (point it at
     # /dev/null to keep a real partition out of test output).
     STALE_MARKER="${BD_DUP_CHECK_STALE_MARKER:-$HOME/.claude/logs/beads-tracker-stale-$(basename "$(dirname "$BEADS_REPO_DIR")")}"
+    OFFLINE_MARKER="${BD_DUP_CHECK_OFFLINE_MARKER:-$HOME/.claude/logs/beads-tracker-offline-$(basename "$(dirname "$BEADS_REPO_DIR")")}"
     if [ -f "$STALE_MARKER" ]; then
         echo "bd-dup-check: TRACKER PARTITIONED - $(head -1 "$STALE_MARKER" 2>/dev/null)"
         echo "  This scan (and bd find-duplicates / bd list) cannot see other machines' beads, in either direction."
         echo "  Search GitHub open PRs before claiming or filing anything incident-class, and heal the partition"
         echo "  first (SETUP.md 'Dolt pull conflict: operator merge') before batch-launching fixes."
+    elif [ -f "$OFFLINE_MARKER" ]; then
+        echo "bd-dup-check: TRACKER OFFLINE - duplicate checks are stale until a clean sync."
+        echo "  Search GitHub open PRs before claiming incident work. Restore connectivity and let the session hook retry."
     fi
 fi
 

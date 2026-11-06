@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+# bd-hygiene — the tracker's periodic hygiene pass, from ONE host, once an hour.
+#
+# What it runs:
+#   1. scripts/bd-dup-check      likely-duplicate pairs (bd find-duplicates,
+#                                filtered through dup-check-known-distinct.txt)
+#   2. bd stale                  beads with no activity for BD_HYGIENE_STALE_DAYS
+#   3. age of the oldest in_progress and in_review beads
+#
+# Why it exists: bd find-duplicates is quadratic in open beads. At 1,105 open
+# beads it took 66-72 s, and until 2026-09-01 it ran at EVERY SessionStart on
+# every machine (250 times in one day on one laptop) under a 30 s hook timeout,
+# so the slow runs were cancelled silently and the fast ones cost each agent
+# session 25 s or more before its first token, for a report that was "silent
+# when clean" and therefore never read. Prevention belongs at create/claim time
+# (scripts/beads-precreate-guard.py, sub-second); detection belongs here, once
+# an hour, in one place, with findings routed to someone who decides.
+#
+# Findings go to ~/.claude/logs/beads-hygiene.log.
+#
+# Usage:
+#   bd-hygiene                      run once, print the report
+#   bd-hygiene --quiet              run once, print only when there is a finding
+#   bd-hygiene --install-launchd    schedule hourly via launchd (macOS)
+#   bd-hygiene --uninstall-launchd
+#
+# Env: BD_HYGIENE_STALE_DAYS (default 30), BD_HYGIENE_INREVIEW_DAYS (default 14),
+#      BEADS_HYGIENE_LOG (default ~/.claude/logs/beads-hygiene.log).
+# Exit: 0 clean, 3 findings, 1 environment error. Never mutates the tracker.
+
+set -uo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+REPO=$(cd "$SCRIPT_DIR/.." && pwd)
+WS=$(dirname "$REPO")
+WS_NAME=$(basename "$WS")
+LOG="${BEADS_HYGIENE_LOG:-$HOME/.claude/logs/beads-hygiene.log}"
+STALE_DAYS="${BD_HYGIENE_STALE_DAYS:-30}"
+INREVIEW_DAYS="${BD_HYGIENE_INREVIEW_DAYS:-14}"
+LABEL="io.beads.hygiene.$WS_NAME"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+QUIET=0
+ACTION=run
+
+for arg in "$@"; do
+    case "$arg" in
+        --quiet) QUIET=1 ;;
+        --install-launchd) ACTION=install ;;
+        --uninstall-launchd) ACTION=uninstall ;;
+        -h|--help) sed -n '2,36p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *) echo "bd-hygiene: unknown option $arg" >&2; exit 1 ;;
+    esac
+done
+
+if [ "$ACTION" = install ]; then
+    mkdir -p "$(dirname "$PLIST")" "$(dirname "$LOG")"
+    cat > "$PLIST" <<PL
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>$LABEL</string>
+  <key>ProgramArguments</key><array>
+    <string>/bin/sh</string><string>-c</string>
+    <string>export PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin; export BEADS_DIR='$REPO/.beads'; eval "\$(jq -r '.env // {} | to_entries[] | select(.key|startswith(\"BEADS_DOLT_\")) | \"export \\(.key)=\\(.value|@sh)\"' '$WS/.claude/settings.local.json' 2>/dev/null)"; exec '$SCRIPT_DIR/bd-hygiene' --quiet</string>
+  </array>
+  <key>StartInterval</key><integer>3600</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>$LOG.launchd</string>
+  <key>StandardErrorPath</key><string>$LOG.launchd</string>
+</dict></plist>
+PL
+    launchctl bootout "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || true
+    launchctl bootstrap "gui/$(id -u)" "$PLIST" && echo "installed $LABEL (hourly), log: $LOG"
+    exit $?
+fi
+if [ "$ACTION" = uninstall ]; then
+    launchctl bootout "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || true
+    rm -f "$PLIST" && echo "removed $LABEL"
+    exit 0
+fi
+
+command -v bd >/dev/null 2>&1 || { echo "bd-hygiene: bd not on PATH" >&2; exit 1; }
+command -v jq >/dev/null 2>&1 || { echo "bd-hygiene: needs jq" >&2; exit 1; }
+mkdir -p "$(dirname "$LOG")"
+
+findings=""
+add() { findings="$findings$1"$'\n'; }
+
+# 1. duplicates — bd-dup-check already applies the known-distinct allowlist
+#    and writes its own log; here only its verdict matters.
+dup_out=$("$SCRIPT_DIR/bd-dup-check" --quiet 2>/dev/null)
+[ -n "$dup_out" ] && add "duplicates: $(printf '%s' "$dup_out" | head -1)"
+
+# 2. stale beads (open or in_progress with no activity)
+stale=$(bd stale --days "$STALE_DAYS" --json 2>/dev/null | jq -r 'if type=="array" then length else 0 end' 2>/dev/null)
+[ "${stale:-0}" -gt 0 ] 2>/dev/null && add "stale: $stale bead(s) with no activity for ${STALE_DAYS}d (bd stale --days $STALE_DAYS)"
+
+# 3. oldest in_progress / in_review — the two states that should be short
+now=$(date +%s)
+oldest() {
+    bd list --status="$1" --json 2>/dev/null |
+        jq -r --argjson now "$now" 'map(select(.updated_at != null)) | sort_by(.updated_at) | .[0] // empty |
+            "\(.id)\t\((($now - (.updated_at | sub("\\.[0-9]+";"") | fromdate)) / 86400) | floor)"' 2>/dev/null
+}
+ip=$(oldest in_progress); ir=$(oldest in_review)
+if [ -n "$ip" ]; then
+    id=${ip%%	*}; days=${ip##*	}
+    [ "${days:-0}" -gt "$STALE_DAYS" ] 2>/dev/null && add "in_progress: $id untouched for ${days}d (in_progress means active right now; move it to in_review or open)"
+fi
+if [ -n "$ir" ]; then
+    id=${ir%%	*}; days=${ir##*	}
+    [ "${days:-0}" -gt "$INREVIEW_DAYS" ] 2>/dev/null && add "in_review: $id untouched for ${days}d (its PR may not cite the bead, or it never merged)"
+fi
+
+stamp=$(date '+%Y-%m-%d %H:%M:%S')
+if [ -z "$findings" ]; then
+    printf '[%s] clean\n' "$stamp" >>"$LOG"
+    [ "$QUIET" = 1 ] || echo "bd-hygiene: clean"
+    exit 0
+fi
+
+printf '[%s] findings:\n%s' "$stamp" "$findings" >>"$LOG"
+[ "$QUIET" = 1 ] && [ -z "$findings" ] || printf 'bd-hygiene findings (%s):\n%s' "$WS_NAME" "$findings"
+
+exit 3

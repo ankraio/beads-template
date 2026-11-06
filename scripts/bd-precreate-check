@@ -1,0 +1,281 @@
+#!/usr/bin/env python3
+"""bd-precreate-check - score a PROPOSED bead against the open ones before it is filed.
+
+Why this exists, and why bd-dup-check does not cover it.
+
+bd-dup-check runs `bd find-duplicates`, which scores EXISTING beads against each
+other. It therefore cannot see a bead that has not been created yet, and it runs
+from SessionStart, before the duplicate exists. The only check positioned at the
+moment a duplicate is born was the author's own `bd list` grep, and the workflow
+rule that fires `bd find-duplicates` is gated behind `bd update --claim` - so an
+author who files and moves on without claiming is checked by nothing at all.
+
+That gap was demonstrated on 2026-08-27: a bead was filed for a defect that
+another bead had been tracking since 08:50 the same day, in_progress and assigned.
+The pre-flight grep used the author's own framing ('export', 'scope', 'stale',
+'owned') while the existing bead said 'overwrites', 'divergence guard' and
+'ownership'. Note that 'owned' is not a substring of 'ownership'. Substring
+search only finds a twin when both authors happened to choose the same words,
+which is precisely what two people describing the same bug independently do not
+do.
+
+WHY IDF AND NOT PLAIN TOKEN OVERLAP. Scored on titles alone with a flat metric,
+that real pair lands far below any threshold worth setting: the two titles share
+little more than 'gitops' and 'content'. What actually identifies them as the
+same bug lives in the bodies, and specifically in the RARE tokens - the cluster
+name, the CVE id, the file path, the chart version. Weighting every token
+equally lets a few dozen common words ('the', 'gitops', 'cluster', 'push')
+dominate and drowns those signals. So each token is weighted by inverse document
+frequency over the open corpus: a token appearing in nearly every bead
+contributes almost nothing, while one appearing in two beads is close to
+decisive. The pinning test for this script is that real pair.
+
+Report-only by contract: it prints candidates and exits 1. It never creates,
+edits or closes anything, and the caller decides what to do. The PreToolUse hook
+that wraps it is what turns a finding into a prompt, and that hook always offers
+an explicit way through - a false positive must cost one acknowledgement, never
+a blocked bead.
+
+Usage:
+  bd-precreate-check --title T [--description D] [--threshold F] [--top N] [--json]
+
+Exit codes:
+  0  nothing similar enough to report (or the corpus could not be read - a check
+     that cannot see the data must not manufacture a verdict)
+  1  candidates found; they are printed to stdout
+"""
+
+import argparse
+import json
+import math
+import os
+import re
+import subprocess
+import sys
+
+# Tokens keep internal dots, hyphens, slashes and hashes so that the identifiers
+# that carry the signal survive whole: 'prod-multi-az', '.owned-paths.json',
+# 'cve-2026-65600', 'api#1979', 'values.yaml'. Splitting those on
+# punctuation is what reduces a decisive token to a handful of common words.
+TOKEN_PATTERN = re.compile(r"[a-z0-9][a-z0-9._#/-]*")
+
+# Structural noise that says nothing about WHICH bug this is. Type tags are
+# stripped because the same defect gets filed as [bug] by one author and [task]
+# by another.
+STOPWORDS = frozenset("""
+a an the and or but if then than that this these those of in on at to for from by with without
+is are was were be been being it its as not no we our you your they their he she his her
+bug task chore feature fix fixes fixed bugfix issue ticket bead
+""".split())
+
+# A body can run to hundreds of lines of transcript. Past a few thousand
+# characters the extra text is almost always evidence rather than identity, and
+# it dilutes the rare tokens that matter.
+MAX_BODY_CHARS = 4000
+
+# Two beads about the same defect share a vocabulary, not a lucky word. Measured
+# against the pinned corpus: genuine twins share 13-17 tokens, unrelated controls
+# share 1-4. Six sits in the empty band between them.
+MIN_SHARED_TOKENS = 6
+
+
+def tokenize(text):
+    """Lowercase, extract identifier-ish tokens, drop stopwords and bare numbers."""
+    if not text:
+        return set()
+    tokens = set()
+    for match in TOKEN_PATTERN.findall(text.lower()):
+        token = match.strip("._#/-")
+        if len(token) < 2 or token in STOPWORDS:
+            continue
+        if token.isdigit():
+            continue
+        tokens.add(token)
+    return tokens
+
+
+def load_open_beads():
+    """Read the open beads. Returns [] when bd cannot be read - never a partial verdict.
+
+    BD_PRECREATE_CORPUS points at a JSON file with the same shape as
+    `bd list --json`, so the calibration can be pinned against a fixed corpus.
+    Scores here are relative to the corpus (IDF is computed from it), so a test
+    that read the live tracker would drift every time a bead was filed.
+    """
+    fixture = os.environ.get("BD_PRECREATE_CORPUS")
+    if fixture:
+        try:
+            with open(fixture, "r", encoding="utf-8") as handle:
+                return build_corpus(json.load(handle))
+        except (OSError, json.JSONDecodeError):
+            return []
+    try:
+        completed = subprocess.run(
+            ["bd", "list", "--json"],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if completed.returncode != 0 or not completed.stdout.strip():
+        return []
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError:
+        return []
+    return build_corpus(payload)
+
+
+def build_corpus(payload):
+    if isinstance(payload, dict):
+        payload = payload.get("issues") or payload.get("items") or []
+    if not isinstance(payload, list):
+        return []
+    beads = []
+    for entry in payload:
+        if not isinstance(entry, dict) or not entry.get("id"):
+            continue
+        beads.append({
+            "id": entry.get("id"),
+            "title": entry.get("title") or "",
+            "status": entry.get("status") or "",
+            "assignee": entry.get("assignee") or "",
+            "tokens": tokenize(
+                (entry.get("title") or "") + " " + (entry.get("description") or "")[:MAX_BODY_CHARS]
+            ),
+        })
+    return beads
+
+
+def inverse_document_frequency(beads):
+    """Smoothed IDF over the open corpus. A token in every bead scores ~0."""
+    total = len(beads)
+    frequency = {}
+    for bead in beads:
+        for token in bead["tokens"]:
+            frequency[token] = frequency.get(token, 0) + 1
+    return {
+        token: math.log((total + 1) / (count + 1)) + 1.0
+        for token, count in frequency.items()
+    }
+
+
+def weight(tokens, idf, default):
+    return sum(idf.get(token, default) for token in tokens)
+
+
+def score(query_tokens, bead_tokens, idf, default):
+    """IDF-weighted Dice coefficient. Chosen by measurement, not by taste.
+
+    Three metrics were run against the 2026-08-27 pair (the proposal that became
+    the twin, scored over a live 894-bead corpus) and three unrelated
+    control queries. What separates a real twin from noise is not the same as
+    what ranks it first, and only Dice did both:
+
+      metric       true twin   noisiest control   long 'sweep' epics
+      cosine          16.2%        11.5%              5.1%
+      containment     17.8%         6.8%             14.2%   <- confuses epics
+      Dice            17.9%        10.8%              5.3%   <- separates both
+
+    Containment (dividing by the lighter side) looks appealing for asymmetric
+    lengths and is a trap: a SHORT query trivially achieves containment, so an
+    unrelated one-line proposal outscored the genuine duplicate. It also cannot
+    tell a real twin from a long support-sweep epic, because an epic that
+    mentions forty things overlaps a little with everything.
+
+    Dice normalises by the summed weight of both sides, which keeps the sprawling
+    epics down where they belong while still surfacing the twin. Absolute scores
+    are low in this corpus (a true twin sits near 18%, not 80%), so the threshold
+    is calibrated to the observed gap rather than to a number that reads well.
+    """
+    shared = query_tokens & bead_tokens
+    if not shared:
+        return 0.0
+    total = weight(query_tokens, idf, default) + weight(bead_tokens, idf, default)
+    return 2.0 * weight(shared, idf, default) / total if total else 0.0
+
+
+def rank(title, description, beads, threshold, top, min_shared=MIN_SHARED_TOKENS):
+    """Rank open beads against the proposal. Two gates, because one is not enough.
+
+    The score alone admits a degenerate case that measurement caught: a SHORT
+    proposal sharing a single rare token with an unrelated bead scored 13.7%,
+    above two genuine twins. Dice divides by the summed weight of both sides, so
+    when one side is tiny a lone rare token can carry the ratio.
+
+    Requiring a floor on the NUMBER of shared tokens removes that case outright
+    and widens the margin from about one point to an order of magnitude. Against
+    the pinned corpus the real twins share 17, 15 and 13 tokens; the three
+    control queries share 4, 3 and 1. Nothing sits in between.
+    """
+    query_tokens = tokenize(title + " " + (description or "")[:MAX_BODY_CHARS])
+    if not query_tokens or not beads:
+        return []
+    idf = inverse_document_frequency(beads)
+    # An unseen token is rarer than anything in the corpus, so it gets the
+    # largest weight the corpus can justify rather than a default of zero.
+    default = math.log(len(beads) + 1) + 1.0
+    scored = []
+    for bead in beads:
+        if not bead["tokens"]:
+            continue
+        if len(query_tokens & bead["tokens"]) < min_shared:
+            continue
+        value = score(query_tokens, bead["tokens"], idf, default)
+        if value >= threshold:
+            scored.append((value, bead))
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    return scored[:top]
+
+
+def main():
+    parser = argparse.ArgumentParser(add_help=True)
+    parser.add_argument("--title", required=True)
+    parser.add_argument("--description", default="")
+    # 0.15 is the midpoint of the measured gap: true twins scored 15.2-18.1%,
+    # the worst unrelated control topped out at 12.4%. Raising it past ~0.19
+    # loses the twin this check exists for; dropping it under ~0.13 starts
+    # admitting controls, and a check nobody trusts is a check nobody reads.
+    parser.add_argument("--threshold", type=float, default=0.15)
+    parser.add_argument("--top", type=int, default=5)
+    parser.add_argument("--min-shared", type=int, default=MIN_SHARED_TOKENS, dest="min_shared")
+    parser.add_argument("--json", action="store_true", dest="as_json")
+    arguments = parser.parse_args()
+
+    matches = rank(
+        arguments.title, arguments.description,
+        load_open_beads(), arguments.threshold, arguments.top, arguments.min_shared,
+    )
+
+    if arguments.as_json:
+        json.dump(
+            [
+                {
+                    "id": bead["id"], "title": bead["title"], "status": bead["status"],
+                    "assignee": bead["assignee"], "score": round(value, 4),
+                }
+                for value, bead in matches
+            ],
+            sys.stdout, indent=2,
+        )
+        sys.stdout.write("\n")
+        return 1 if matches else 0
+
+    if not matches:
+        return 0
+
+    print("Possible duplicates of the bead you are about to file:")
+    print()
+    for value, bead in matches:
+        marker = ""
+        if bead["status"] in ("in_progress", "in_review"):
+            owner = bead["assignee"] or "someone"
+            marker = "   <-- %s, %s is on it" % (bead["status"], owner)
+        print("  %3d%%  %-14s %s%s" % (round(value * 100), bead["id"], bead["title"][:96], marker))
+    print()
+    print("Read them with:  bd show %s" % " ".join(bead["id"] for _, bead in matches))
+    print("If one covers your work, update it (bd comment / bd update) instead of filing a twin.")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

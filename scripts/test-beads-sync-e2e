@@ -1,0 +1,420 @@
+#!/bin/sh
+# End-to-end tests for templates/beads-sync.sh's push path, offline.
+#
+# A fake `bd` and a fake `dolt` on PATH, a scratch HOME and a scratch repo:
+# no network, no tracker, no real Dolt store. The unit tests in
+# test-beads-sync pin the classifiers; this drives the glue AROUND them, which
+# is where the defects in acme-eh8hs lived - a relative repo path that made
+# the fallback glob match nothing, a rescued false positive logged as a
+# FAILED block, and a doomed 30s probe run before every direct push.
+#
+# Runs in a few seconds. Each fake records its calls under $FAKE_STATE so a
+# scenario can assert which push ran, not just what was logged.
+
+set -u
+
+HOOK="$(cd "$(dirname "$0")/.." && pwd)/templates/beads-sync.sh"
+T=$(mktemp -d)
+export HOME="$T/home"
+mkdir -p "$HOME" "$T/bin" "$T/ws/beads/.beads/dolt/acme/.dolt"
+export FAKE_STATE="$T/state"
+mkdir -p "$FAKE_STATE"
+: >"$FAKE_STATE/bd-push-calls"
+: >"$FAKE_STATE/dolt-push-calls"
+: >"$FAKE_STATE/bd-push-mode"      # empty = fsck false positive; "ok" = success; "nonff" = rejected
+: >"$FAKE_STATE/dolt-push-mode"    # empty = success; "nonff" = rejected
+
+cat >"$T/bin/bd" <<'EOF'
+#!/bin/sh
+printf '%s\n' "${GIT_SSH_COMMAND:-}" >"$FAKE_STATE/ssh-command"
+case "$1 $2" in
+  "dolt commit") echo "Committed."; exit 0 ;;
+  "dolt pull")
+      if [ -f "$FAKE_STATE/offline" ]; then echo "ssh: connect to host github.com port 22: Network is unreachable"; exit 1; fi
+      echo "Everything up-to-date"; exit 0 ;;
+  "dolt push")
+      if [ -f "$FAKE_STATE/offline" ]; then echo "Could not resolve hostname github.com"; exit 1; fi
+      echo x >>"$FAKE_STATE/bd-push-calls"
+      case "$(cat "$FAKE_STATE/bd-push-mode")" in
+        ok) echo "Pushed."; exit 0 ;;
+        nonff) echo "Error: dolt push failed: ! [rejected] main -> main (non-fast-forward)"; exit 1 ;;
+        *) printf 'Pushing to Dolt remote...\nError: dangling chunk reference: aborting push to prevent propagating corrupt chunks: \n'; exit 1 ;;
+      esac ;;
+  *) exit 0 ;;
+esac
+EOF
+cat >"$T/bin/dolt" <<'EOF'
+#!/bin/sh
+case "$1" in
+  version) cat "$FAKE_STATE/dolt-version" 2>/dev/null || echo "dolt version 2.6.2"; exit 0 ;;
+  config)
+      # dolt config --local --get KEY | dolt config --local --add KEY VALUE
+      case "$3" in
+        --get) cat "$FAKE_STATE/cfg-$4" 2>/dev/null || exit 1 ;;
+        --add) printf '%s\n' "$5" >"$FAKE_STATE/cfg-$4"; echo "$4" >>"$FAKE_STATE/cfg-writes"; : >.dolt/config.json ;;
+      esac
+      exit 0 ;;
+  push)
+      if [ -f "$FAKE_STATE/offline" ]; then echo "Could not resolve host: github.com"; exit 1; fi
+      echo "$PWD" >>"$FAKE_STATE/dolt-push-calls"
+      case "$(cat "$FAKE_STATE/dolt-push-mode")" in
+        nonff) echo " ! [rejected]            main -> main (non-fast-forward)"; exit 1 ;;
+        *) echo "Everything up-to-date"; exit 0 ;;
+      esac ;;
+  *) exit 0 ;;
+esac
+EOF
+chmod +x "$T/bin/bd" "$T/bin/dolt"
+export PATH="$T/bin:$PATH"
+LOG="$HOME/.claude/logs/beads-sync.log"
+MARKER="$HOME/.claude/logs/beads-fsck-false-positive-ws.last"
+fails=0
+ok()   { echo "  ok   $1"; }
+bad()  { echo "  FAIL $1"; fails=$((fails+1)); }
+count() { wc -l <"$1" | tr -d ' '; }
+
+echo "offline run: connectivity is stale, not a new partition"
+touch "$FAKE_STATE/offline"
+sh "$HOOK" "$T/ws/beads" --quick >"$T/offline.out" 2>&1
+STALE="$HOME/.claude/logs/beads-tracker-stale-ws"
+OFFLINE="$HOME/.claude/logs/beads-tracker-offline-ws"
+[ -f "$OFFLINE" ] && ok "offline marker created" || bad "offline marker missing"
+[ ! -f "$STALE" ] && ok "no partition marker for connectivity" || bad "connectivity counted as partition"
+grep -q 'sync OFFLINE' "$LOG" && ok "offline heartbeat" || bad "offline heartbeat missing"
+echo older-partition >"$STALE"
+sh "$HOOK" "$T/ws/beads" --quick >"$T/offline-again.out" 2>&1
+grep -q older-partition "$STALE" && ok "offline cannot clear an older partition" || bad "older partition lost"
+rm -f "$FAKE_STATE/offline"
+sh "$HOOK" "$T/ws/beads" --quick >"$T/online.out" 2>&1
+[ ! -f "$OFFLINE" ] && [ ! -f "$STALE" ] && ok "clean sync clears both markers" || bad "markers survived recovery"
+# Reset counters/log for the original scenarios.
+: >"$LOG"
+: >"$FAKE_STATE/bd-push-calls"
+: >"$FAKE_STATE/dolt-push-calls"
+rm -f "$MARKER"
+
+echo "run 1: RELATIVE path, quick, fsck false positive -> direct push rescues"
+( cd "$T/ws" && sh "$HOOK" beads --quick ) >"$T/out1" 2>&1
+grep -q 'sync OK (quick) in '"$T"'/ws/beads\|sync OK (quick) in /private'"$T"'/ws/beads' "$LOG" && ok "sync OK logged with an ABSOLUTE path" || { bad "sync OK with absolute path"; tail -5 "$LOG"; }
+grep -q 'no chunk named (upstream #4822); published via direct' "$LOG" && ok "rescue logged as one line" || bad "rescue line"
+grep -q 'dolt push FAILED' "$LOG" && bad "no FAILED block for a rescued push" || ok "no FAILED block for a rescued push"
+grep -q 'ServerAliveInterval=30.*ServerAliveCountMax=3' "$FAKE_STATE/ssh-command" && ok "remote clients inherit keepalives" || bad "keepalives missing"
+[ -f "$MARKER" ] && ok "marker created" || bad "marker created"
+[ "$(count "$FAKE_STATE/bd-push-calls")" = 1 ] && ok "bd dolt push probed once" || bad "bd push calls = $(count "$FAKE_STATE/bd-push-calls")"
+[ "$(count "$FAKE_STATE/dolt-push-calls")" = 1 ] && ok "direct dolt push ran once" || bad "dolt push calls"
+grep -q 'NOTE: bd dolt push reported a dangling chunk' "$T/out1" && ok "stdout NOTE on the probe path" || bad "stdout NOTE"
+grep -q 'WARNING' "$T/out1" && { bad "no WARNING on stdout for a rescued push"; cat "$T/out1"; } || ok "no WARNING on stdout"
+
+echo "run 2: marker fresh -> probe skipped, direct push first"
+# Age the marker by an hour first: the skip path must NOT refresh it, or the
+# re-probe clock resets on every sync and the skip becomes permanent.
+touch -t "$(date -v-1H '+%Y%m%d%H%M' 2>/dev/null || date -d '1 hour ago' '+%Y%m%d%H%M')" "$MARKER"
+sh "$HOOK" "$T/ws/beads" --quick >"$T/out2" 2>&1
+[ -n "$(find "$MARKER" -mmin +30 2>/dev/null)" ] && ok "marker NOT refreshed by the skip path" || bad "marker refreshed by the skip path (re-probe would never fire)"
+[ "$(count "$FAKE_STATE/bd-push-calls")" = 1 ] && ok "bd dolt push NOT probed" || bad "bd push probed again"
+[ "$(count "$FAKE_STATE/dolt-push-calls")" = 2 ] && ok "direct dolt push ran" || bad "dolt push calls"
+grep -q 'known false positive since .*probe skipped' "$LOG" && ok "skip logged with marker date" || bad "skip line"
+grep -q 'NOTE\|WARNING' "$T/out2" && { bad "stdout quiet on the skip path"; cat "$T/out2"; } || ok "stdout quiet on the skip path"
+[ "$(grep -c 'sync OK' "$LOG")" = 2 ] && ok "sync OK" || bad "sync OK count"
+
+echo "run 3: re-probe window 0 and bd push succeeds -> marker removed"
+echo ok >"$FAKE_STATE/bd-push-mode"
+BEADS_FSCK_REPROBE_HOURS=0 sh "$HOOK" "$T/ws/beads" --quick >"$T/out3" 2>&1
+[ "$(count "$FAKE_STATE/bd-push-calls")" = 2 ] && ok "bd dolt push probed" || bad "bd push not probed"
+[ ! -f "$MARKER" ] && ok "marker removed after a clean bd push" || bad "marker still present"
+grep -q 'back in front of every push' "$LOG" && ok "reinstatement logged" || bad "reinstatement line"
+[ "$(count "$FAKE_STATE/dolt-push-calls")" = 2 ] && ok "no direct push needed" || bad "direct push ran"
+
+echo "run 4: no marker, fsck false positive, direct push rejected non-ff -> pull + one retry"
+: >"$FAKE_STATE/bd-push-mode"
+echo nonff >"$FAKE_STATE/dolt-push-mode"
+sh "$HOOK" "$T/ws/beads" --quick >"$T/out4" 2>&1
+grep -q 'dolt push fallback FAILED' "$LOG" && ok "direct push failure logged" || bad "fallback FAILED line"
+grep -q 'rejected non-fast-forward - another machine published first' "$T/out4" && ok "non-ff retry engaged" || { bad "non-ff retry"; cat "$T/out4"; }
+[ "$(count "$FAKE_STATE/dolt-push-calls")" = 4 ] && ok "direct push tried twice (initial + retry)" || bad "dolt push calls = $(count "$FAKE_STATE/dolt-push-calls")"
+grep -q 'sync FAILED (quick)' "$LOG" && ok "run marked FAILED" || bad "sync FAILED line"
+grep -q 'WARNING: the direct dolt push failed' "$T/out4" && ok "WARNING on stdout" || bad "WARNING on stdout"
+[ -f "$HOME/.claude/logs/beads-tracker-stale-ws" ] && ok "stale marker written" || bad "stale marker"
+
+echo "run 5: real fsck finding (chunk named) -> sync stops, no direct push"
+cat >"$T/bin/bd" <<'EOF'
+#!/bin/sh
+case "$1 $2" in
+  "dolt push") printf 'Error: dangling chunk reference: aborting push to prevent propagating corrupt chunks: q3frhla5uubflvve2ctfv84pp3vpg6i0\n'; exit 1 ;;
+  "dolt commit") echo Committed.; exit 0 ;;
+  "dolt pull") echo Everything up-to-date; exit 0 ;;
+  *) exit 0 ;;
+esac
+EOF
+: >"$FAKE_STATE/dolt-push-mode"
+before=$(count "$FAKE_STATE/dolt-push-calls")
+sh "$HOOK" "$T/ws/beads" --quick >"$T/out5" 2>&1
+[ "$(count "$FAKE_STATE/dolt-push-calls")" = "$before" ] && ok "no direct push on a real finding" || bad "direct push ran on a real finding"
+grep -q 'dolt push FAILED (rc=1)' "$LOG" && ok "real finding logged as FAILED" || bad "real finding not logged"
+grep -q 'WARNING: beads dolt push failed' "$T/out5" && ok "WARNING on stdout" || bad "WARNING"
+
+# --- git convergence of the shared checkout (full mode, scratch origin) ------
+# acme-n0unr: three hand commits on this machine's main blocked the reset for
+# 25 days, and the refusal said neither which commits nor what to do. These
+# runs drive the whole convergence against a real bare "origin" and a second
+# clone playing the other machines. Isolated from the operator's git config.
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+export GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.com
+export GIT_COMMITTER_NAME=test GIT_COMMITTER_EMAIL=test@example.com
+g() { git -c init.defaultBranch=main -c commit.gpgsign=false "$@"; }
+cat >"$T/bin/bd" <<'EOF'
+#!/bin/sh
+case "$1 $2" in
+  "dolt commit") echo Committed.; exit 0 ;;
+  "dolt pull") echo Everything up-to-date; exit 0 ;;
+  "dolt push") echo Pushed.; exit 0 ;;
+  *) exit 0 ;;
+esac
+EOF
+GW="$T/gws"
+mkdir -p "$GW"
+g init -q --bare "$GW/origin.git"
+g clone -q "$GW/origin.git" "$GW/other" 2>/dev/null
+(
+    cd "$GW/other" && g checkout -q -b main 2>/dev/null
+    mkdir -p .beads && echo "seed" >ledger.txt && echo "notes" >notes.txt
+    echo '{"id":"acme-1"}' >.beads/issues.jsonl
+    echo '{"id":"int-seed"}' >.beads/interactions.jsonl
+    g add -A && g commit -qm seed && g push -q origin main
+)
+g clone -q "$GW/origin.git" "$GW/beads" 2>/dev/null
+REPO=$(cd "$GW/beads" && pwd -P)
+other() { ( cd "$GW/other" && g pull -q --rebase origin main && eval "$1" && g push -q origin main ); }
+at_origin() { [ "$(git -C "$REPO" rev-parse HEAD)" = "$(git -C "$REPO" rev-parse origin/main)" ]; }
+
+echo "run 6: a hand commit on main and origin moved -> not resetting, and the refusal NAMES the commit"
+( cd "$REPO" && echo "acme-x acme-y   # distinct" >>ledger.txt && g commit -qam "dup-check: record x~y" )
+h6=$(git -C "$REPO" rev-parse --short HEAD)
+h6full=$(git -C "$REPO" rev-parse HEAD)
+echo '{"id":"int-local-1"}' >>"$REPO/.beads/interactions.jsonl"
+other 'echo "{\"id\":\"int-up-1\"}" >>.beads/interactions.jsonl && g commit -qam "chore: sync issue export"'
+sh "$HOOK" "$REPO" >"$T/out6" 2>&1
+grep -q "push rejected with 1 non-export commit(s) on main in $REPO; not resetting. Blocking: $h6 dup-check: record x~y" "$LOG" \
+    && ok "log names the blocking commit" || { bad "log names the blocking commit"; grep 'not resetting' "$LOG" | tail -1; }
+grep -q 'SETUP.md "Sync hook will not converge: hand-written commits on main"' "$LOG" && ok "log points at the runbook" || bad "runbook pointer in the log"
+grep -q "WARNING: beads checkout .* is not converging: .*$h6 dup-check: record x~y" "$T/out6" && ok "stdout WARNING names the commit" || { bad "stdout WARNING"; cat "$T/out6"; }
+git -C "$REPO" merge-base --is-ancestor "$h6full" HEAD && ok "the hand commit is untouched" || bad "hand commit lost"
+
+echo "run 7: the operator acknowledges it -> dropped, never replayed; backup branch; interactions carried"
+BEADS_SYNC_DROP_COMMITS="$h6" sh "$HOOK" "$REPO" >"$T/out7" 2>&1
+at_origin && ok "main converged to origin/main" || bad "main did not converge"
+bk=$(git -C "$REPO" for-each-ref --format='%(refname:short)' 'refs/heads/backup/beads-sync-*' | head -1)
+[ -n "$bk" ] && git -C "$REPO" merge-base --is-ancestor "$h6full" "$bk" && ok "previous main kept as $bk" || bad "no backup branch holding the hand commit"
+git -C "$REPO" log --format=%s origin/main | grep -q 'dup-check: record x~y' && bad "the acknowledged commit was pushed to origin" || ok "the acknowledged commit was NOT pushed to origin"
+grep -q "dropping 1 non-export commit(s) already on origin/main or listed in BEADS_SYNC_DROP_COMMITS ($h6 dup-check: record x~y); previous main kept as $bk" "$LOG" \
+    && ok "drop logged with the commit and the backup" || { bad "drop line"; grep 'dropping' "$LOG" | tail -1; }
+grep -q 'int-local-1' "$REPO/.beads/interactions.jsonl" && grep -q 'int-up-1' "$REPO/.beads/interactions.jsonl" \
+    && ok "local interaction record carried across the reset, upstream's kept" || bad "interaction records after reset"
+grep -q 're-appended 1 local-only interaction record(s)' "$LOG" && ok "carry-over logged" || bad "carry-over line"
+
+echo "run 8: next sync publishes the carried records with its export commit"
+sh "$HOOK" "$REPO" >"$T/out8" 2>&1
+at_origin && ok "main == origin/main after the push" || bad "export commit not pushed"
+git -C "$REPO" show origin/main:.beads/interactions.jsonl | grep -q 'int-local-1' && ok "origin has the carried record" || bad "carried record not on origin"
+
+echo "run 9: a hand commit since landed through a PR (same patch) -> converges with no acknowledgement"
+( cd "$REPO" && echo "a note" >>notes.txt && g commit -qam "docs: hand note" )
+h9full=$(git -C "$REPO" rev-parse HEAD)
+g -C "$GW/other" fetch -q "$REPO" "$h9full" 2>/dev/null
+other "g cherry-pick -x $h9full >/dev/null && echo '{\"id\":\"acme-2\"}' >>.beads/issues.jsonl && g commit -qam 'chore: sync issue export'"
+sh "$HOOK" "$REPO" >"$T/out9" 2>&1
+at_origin && ok "main converged to origin/main" || { bad "main did not converge"; cat "$T/out9"; grep 'not resetting' "$LOG" | tail -1; }
+grep -q 'dropping 1 non-export commit(s) already on origin/main' "$LOG" && ok "drop of an upstreamed commit logged" || bad "drop line"
+grep -q 'WARNING' "$T/out9" && { bad "no WARNING for an upstreamed commit"; cat "$T/out9"; } || ok "no WARNING for an upstreamed commit"
+
+echo "run 10: export-only divergence whose rebase conflicts -> reset, local interaction records carried"
+echo '{"id":"int-local-2"}' >>"$REPO/.beads/interactions.jsonl"
+other 'echo "{\"id\":\"int-up-2\"}" >>.beads/interactions.jsonl && g commit -qam "chore: sync issue export"'
+before=$(grep -c 're-appended' "$LOG")
+sh "$HOOK" "$REPO" >"$T/out10" 2>&1
+at_origin && ok "main converged to origin/main" || bad "main did not converge"
+grep -q 'int-local-2' "$REPO/.beads/interactions.jsonl" && grep -q 'int-up-2' "$REPO/.beads/interactions.jsonl" \
+    && ok "the conflicted record survived the reset alongside upstream's" || bad "int-local-2 lost by the reset"
+[ "$(grep -c 're-appended' "$LOG")" -gt "$before" ] && ok "carry-over logged" || bad "carry-over line"
+[ "$(grep -c 'int-local-2' "$REPO/.beads/interactions.jsonl")" = 1 ] && ok "carried once, not duplicated" || bad "int-local-2 duplicated"
+
+# The hook is the one writer of the jsonl since bd's per-write export went off
+# (acme-ywm6d.10). The exporter's own rules are pinned in test-bd-export-jsonl;
+# what these two pin is the hook's half: it calls it before the commit, and a
+# failed export must not cost the convergence below it.
+mkdir -p "$REPO/scripts"
+
+echo "run 11: the hook refreshes the jsonl through bd-export-jsonl and commits the result"
+cat >"$REPO/scripts/bd-export-jsonl" <<'STUB'
+#!/bin/sh
+echo '{"id":"acme-exported"}' >>"$BEADS_DIR/issues.jsonl"
+STUB
+chmod +x "$REPO/scripts/bd-export-jsonl"
+sh "$HOOK" "$REPO" >"$T/out11" 2>&1
+at_origin && ok "main converged to origin/main" || { bad "main did not converge"; cat "$T/out11"; }
+git -C "$REPO" show origin/main:.beads/issues.jsonl | grep -q acme-exported \
+    && ok "the refreshed export reached origin" || { bad "the export was not committed"; cat "$T/out11"; }
+[ "$(git -C "$REPO" log -1 --format=%s origin/main)" = "chore: sync issue export" ] \
+    && ok "committed as an export commit" || bad "wrong commit subject on the export"
+grep -q WARNING "$T/out11" && { bad "no WARNING for a good export"; cat "$T/out11"; } || ok "no WARNING for a good export"
+
+echo "run 12: a failed export is logged out loud, and the git convergence still runs"
+cat >"$REPO/scripts/bd-export-jsonl" <<'STUB'
+#!/bin/sh
+echo 'bd-export-jsonl: bd export failed (rc=1): invalid connection' >&2
+exit 1
+STUB
+other 'echo "{\"id\":\"acme-upstream-12\"}" >>.beads/issues.jsonl && g commit -qam "chore: sync issue export"'
+sh "$HOOK" "$REPO" >"$T/out12" 2>&1
+grep -q 'jsonl export (rc=1)' "$LOG" && grep -q 'invalid connection' "$LOG" \
+    && ok "the failure and bd's reason are in the log" || bad "the failed export was not logged"
+grep -q 'WARNING: beads jsonl export did not run' "$T/out12" && ok "stdout WARNING for a failed export" || { bad "no stdout WARNING"; cat "$T/out12"; }
+at_origin && ok "main still converged to origin/main" || { bad "a failed export stopped the convergence"; cat "$T/out12"; }
+grep -q acme-upstream-12 "$REPO/.beads/issues.jsonl" && ok "upstream's export arrived" || bad "upstream's export is missing"
+rm -rf "$REPO/scripts"
+
+# --- Dolt's history on the git remote (acme-w94uqb) --------------------------
+# What must hold: the settings land once, a server that has not read them is
+# restarted only when no remote work is running, and an old dolt is named. None
+# of it may stop the sync.
+echo "git remote history:"
+HR="$T/hws/beads"
+mkdir -p "$HR/.beads/dolt/acme/.dolt" "$HR/scripts"
+HLOG="$HOME/.claude/logs/beads-sync.log"
+cat >"$HR/scripts/bd-dolt-server" <<'EOF'
+#!/bin/sh
+echo "$1" >>"$FAKE_STATE/server-calls"
+# A real restart leaves a new server and a pid file newer than the config.
+sleep 30 >/dev/null 2>&1 &
+echo "$!" >"$(dirname "$0")/../.beads/dolt-server.pid"
+echo "server restarted, bd answers"
+exit "$(cat "$FAKE_STATE/server-rc" 2>/dev/null || echo 0)"
+EOF
+cat >"$HR/scripts/bd-dolt-remote-children" <<'EOF'
+#!/usr/bin/env python3
+import os
+print(open(os.environ['FAKE_STATE'] + '/remote-note').read().strip())
+EOF
+chmod +x "$HR/scripts/bd-dolt-server" "$HR/scripts/bd-dolt-remote-children"
+hsync() { sh "$HOOK" "$HR" --quick >"$T/hout" 2>&1; }
+hcount() { [ -f "$1" ] && count "$1" || echo 0; }
+live_server() { sleep 60 >/dev/null 2>&1 & echo "$!" >"$HR/.beads/dolt-server.pid"; hsrv=$!; }
+stop_server() { { kill "$hsrv"; wait "$hsrv"; } 2>/dev/null; }
+# Fixed ages: `test -nt` can compare whole seconds, and truncating an empty file
+# does not move its mtime on macOS.
+stale() {
+    touch -t 202601010000 "$HR/.beads/dolt-server.pid"
+    touch -t 202601020000 "$HR/.beads/dolt/acme/.dolt/config.json"
+}
+rm -f "$FAKE_STATE"/cfg-* "$FAKE_STATE/server-calls"
+echo 'server-side remote status: server=1 pushes=0 live_remote_client=no' >"$FAKE_STATE/remote-note"
+: >"$HLOG"
+
+# No server running: written once, nothing to restart.
+hsync
+[ "$(cat "$FAKE_STATE/cfg-git-remote.max-history-commits")" = 0 ] && ok "max-history-commits written as 0" || bad "max-history-commits"
+[ "$(cat "$FAKE_STATE/cfg-git-remote.reset-history-on-prune")" = false ] && ok "reset-history-on-prune written as false" || bad "reset-history-on-prune"
+[ "$(hcount "$FAKE_STATE/cfg-writes")" -ge 2 ] && ok "both settings written" || bad "settings not written"
+[ "$(hcount "$FAKE_STATE/server-calls")" = 0 ] && ok "no server to restart" || bad "restarted a server that was not running"
+grep -q 'sync OK (quick)' "$HLOG" && ok "the sync went on" || { bad "the sync did not finish"; cat "$T/hout"; }
+writes=$(hcount "$FAKE_STATE/cfg-writes")
+hsync
+[ "$(hcount "$FAKE_STATE/cfg-writes")" = "$writes" ] && ok "already in place: not written again" || bad "written on every sync"
+
+# A live server older than the config, nothing remote running: restarted once.
+live_server; stale
+hsync
+[ "$(hcount "$FAKE_STATE/server-calls")" = 1 ] && ok "a stale idle server is restarted" || { bad "stale idle server: $(hcount "$FAKE_STATE/server-calls") restarts"; cat "$T/hout"; }
+grep -q 'restarted the server so it reads the settings (rc=0)' "$HLOG" && ok "the restart is logged" || bad "restart not logged"
+grep -q 'has not read the git remote history settings' "$T/hout" && bad "an idle restart warned as deferred" || ok "an idle restart does not warn"
+stop_server
+hsync
+[ "$(hcount "$FAKE_STATE/server-calls")" = 1 ] && ok "a server newer than the config is left alone" || bad "restarted again: $(hcount "$FAKE_STATE/server-calls")"
+kill "$(cat "$HR/.beads/dolt-server.pid")" 2>/dev/null
+
+# Remote work running, or nobody can tell: left for the next sync.
+rm -f "$FAKE_STATE/server-calls"
+for note in 'server-side remote status: server=1 pushes=1 live_remote_client=no' \
+            'server-side remote status: server=1 pushes=0 live_remote_client=yes' \
+            'server-side remote status: unknown; inspection failed, no further signals sent'; do
+    echo "$note" >"$FAKE_STATE/remote-note"
+    live_server; stale
+    hsync
+    [ "$(hcount "$FAKE_STATE/server-calls")" = 0 ] && ok "not restarted under: ${note#server-side remote status: }" || bad "restarted under: $note"
+    # acme-1r64tl: in the log alone this repeated for 15 hours on a Mac
+    # that could not publish. Each deferral says so, why, and what to run.
+    grep -F "WARNING: the tracker server has not read the git remote history settings" "$T/hout" |
+        grep -F "(${note#server-side remote status: })" | grep -qF "$HR/scripts/bd-dolt-server restart" &&
+        ok "and warns with its reason and the restart command" || { bad "deferral not warned on stdout: $note"; cat "$T/hout"; }
+    stop_server
+done
+grep -q 'left to the next sync' "$HLOG" && ok "the deferral is logged" || bad "deferral not logged"
+grep -q 'sync OK (quick)' "$HLOG" && ok "a deferred restart does not fail the sync" || bad "deferred restart failed the sync"
+
+# A restart that fails is named, and the sync still runs.
+echo 'server-side remote status: server=1 pushes=0 live_remote_client=no' >"$FAKE_STATE/remote-note"
+echo 1 >"$FAKE_STATE/server-rc"
+: >"$HLOG"
+live_server; stale
+hsync
+grep -q 'WARNING: the tracker server could not be restarted (rc=1)' "$T/hout" && ok "a failed restart warns" || bad "failed restart not warned"
+grep -q 'sync OK (quick)' "$HLOG" && ok "a failed restart does not stop the sync" || bad "a failed restart stopped the sync"
+stop_server; kill "$(cat "$HR/.beads/dolt-server.pid")" 2>/dev/null
+rm -f "$FAKE_STATE/server-rc" "$HR/.beads/dolt-server.pid"
+
+# A dolt that cannot keep history is named, every run, until it is upgraded.
+echo 'dolt version 2.2.2' >"$FAKE_STATE/dolt-version"
+: >"$HLOG"
+hsync
+grep -q 'older than 2.5.0' "$T/hout" && ok "an old dolt warns on stdout" || bad "an old dolt did not warn"
+grep -q 'dolt version 2.2.2 cannot keep history' "$HLOG" && ok "and names its version in the log" || bad "old dolt not in the log"
+rm -f "$FAKE_STATE/dolt-version"
+rm -f "$FAKE_STATE"/cfg-*
+hsync
+[ "$(cat "$FAKE_STATE/cfg-git-remote.max-history-commits")" = 0 ] && ok "upgraded: the settings follow" || bad "settings did not follow the upgrade"
+
+echo "bd-dolt-server restart:"
+RS="$T/rws/mine/beads"
+mkdir -p "$RS/scripts" "$RS/.beads/dolt" "$T/rbin"
+cp "$(dirname "$HOOK")/../scripts/bd-dolt-server" "$RS/scripts/bd-dolt-server"
+cat >"$T/rbin/launchctl" <<'EOF'
+#!/bin/sh
+echo "$*" >>"$FAKE_STATE/launchctl-calls"
+case "$1" in
+  print) [ -f "$FAKE_STATE/agent-loaded" ] ;;
+  *) exit 0 ;;
+esac
+EOF
+cat >"$T/rbin/bd" <<'EOF'
+#!/bin/sh
+echo "$* [socket=${BEADS_DOLT_SERVER_SOCKET:-}]" >>"$FAKE_STATE/restart-bd-calls"
+case "$1" in
+  list) n=$(cat "$FAKE_STATE/list-fails" 2>/dev/null || echo 0)
+        [ "$n" -gt 0 ] || exit 0
+        echo $((n - 1)) >"$FAKE_STATE/list-fails"
+        echo "dolt circuit breaker is open" >&2; exit 1 ;;
+  *) exit 0 ;;
+esac
+EOF
+chmod +x "$T/rbin/launchctl" "$T/rbin/bd"
+: >"$FAKE_STATE/launchctl-calls"; : >"$FAKE_STATE/restart-bd-calls"
+touch "$FAKE_STATE/agent-loaded"
+echo 2 >"$FAKE_STATE/list-fails"
+rout=$(PATH="$T/rbin:$PATH" "$RS/scripts/bd-dolt-server" restart 2>&1); rrc=$?
+[ "$rrc" = 0 ] && ok "supervised: exits 0" || bad "supervised restart: rc=$rrc $rout"
+grep -q "kickstart -k gui/$(id -u)/io.beads.dolt.mine" "$FAKE_STATE/launchctl-calls" && ok "supervised: kickstarts this workspace's agent" || bad "no kickstart: $(cat "$FAKE_STATE/launchctl-calls")"
+[ "$(grep -c '^list' "$FAKE_STATE/restart-bd-calls")" = 3 ] && ok "supervised: waits through bd's circuit breaker" || bad "list calls: $(cat "$FAKE_STATE/restart-bd-calls")"
+grep -q 'dolt stop' "$FAKE_STATE/restart-bd-calls" && bad "supervised: must not stop the server through bd" || ok "supervised: leaves bd dolt stop alone"
+grep -q 'socket=.*dolt.sock' "$FAKE_STATE/restart-bd-calls" && ok "supervised: bd uses the socket, so it cannot start a second server" || bad "no socket: $(cat "$FAKE_STATE/restart-bd-calls")"
+: >"$FAKE_STATE/launchctl-calls"; : >"$FAKE_STATE/restart-bd-calls"
+rm -f "$FAKE_STATE/agent-loaded"
+rout=$(PATH="$T/rbin:$PATH" BEADS_DOLT_SERVER_SOCKET= "$RS/scripts/bd-dolt-server" restart 2>&1); rrc=$?
+[ "$rrc" = 0 ] && ok "bd's own server: exits 0" || bad "unsupervised restart: rc=$rrc $rout"
+grep -q 'dolt stop' "$FAKE_STATE/restart-bd-calls" && ok "bd's own server: stopped through bd" || bad "no stop: $(cat "$FAKE_STATE/restart-bd-calls")"
+grep -q kickstart "$FAKE_STATE/launchctl-calls" && bad "bd's own server: no agent to kickstart" || ok "bd's own server: no kickstart"
+
+echo
+[ "${VERBOSE:-0}" = 1 ] && echo "--- log"
+[ "${VERBOSE:-0}" = 1 ] && cat "$LOG"
+rm -rf "$T"
+echo; if [ "$fails" -eq 0 ]; then echo "all tests passed"; exit 0; fi; echo "$fails test(s) failed"; exit 1

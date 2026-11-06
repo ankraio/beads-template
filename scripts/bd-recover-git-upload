@@ -1,0 +1,328 @@
+#!/usr/bin/env python3
+"""Preload intended Dolt Git blobs; normal Dolt sync retains publication authority."""
+import argparse
+import contextlib
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+from urllib.parse import urlsplit
+
+MAX_BATCH = 64 * 1024 * 1024
+MAX_TOTAL = 32 * 1024 * 1024 * 1024
+MAX_OBJECTS = 50000
+OID = re.compile(r'[0-9a-f]{40}')
+SOURCE = re.compile(r'refs/dolt/blobstore/origin/dolt/data/[0-9a-f-]{36}')
+DATA_REF = 'refs/dolt/data'
+
+
+class Refused(Exception):
+    pass
+
+
+class Git:
+    def __init__(self, directory, timeout=180):
+        self.directory = Path(directory)
+        self.timeout = timeout
+        self.deadline = time.monotonic() + 3600
+
+    def run(self, *args, data=None, allow_failure=False):
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise Refused('recovery time budget exhausted; journal retained')
+        env = dict(os.environ, GIT_TERMINAL_PROMPT='0')
+        for key in ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_OBJECT_DIRECTORY',
+                    'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_INDEX_FILE', 'GIT_NAMESPACE'):
+            env.pop(key, None)
+        try:
+            result = subprocess.run(['git', '-C', str(self.directory), *args], input=data,
+                                    capture_output=True, env=env,
+                                    timeout=min(self.timeout, remaining))
+        except subprocess.TimeoutExpired:
+            raise Refused('Git command timed out; inspect the journal and resume') from None
+        if result.returncode and not allow_failure:
+            # Git stderr can contain credential-bearing URLs and private paths.
+            raise Refused(f'Git {args[0]} failed (exit {result.returncode}); no success recorded')
+        return result
+
+    def text(self, *args, **kwargs):
+        return self.run(*args, **kwargs).stdout.decode().strip()
+
+    def refs(self):
+        lines = self.text('ls-remote', '--refs', 'origin', DATA_REF,
+                          'refs/dolt/uploads/beads-recovery-*').splitlines()
+        return {line.split('\t')[1]: line.split('\t')[0] for line in lines}
+
+
+def identity(value):
+    value = value.removeprefix('git+')
+    if value.startswith('git@') and ':' in value:
+        host, path = value[4:].split(':', 1)
+        return host.lower() + '/' + path.removesuffix('.git')
+    parsed = urlsplit(value)
+    if parsed.scheme in ('https', 'ssh'):
+        if parsed.password or parsed.query or parsed.fragment or parsed.username not in (None, 'git'):
+            raise Refused('credential-bearing or ambiguous remote URL is not supported')
+        return (parsed.hostname or '').lower() + (f':{parsed.port}' if parsed.port else '') + parsed.path.removesuffix('.git')
+    if not parsed.scheme and Path(value).is_absolute():
+        return str(Path(value).resolve())  # Also permits fully offline regression tests.
+    raise Refused('unsupported remote URL')
+
+
+def contexts(repo, cache):
+    repo, cache = Path(repo).resolve(), Path(cache).resolve()
+    relative = cache.relative_to(repo / '.beads')
+    parts = relative.parts
+    if len(parts) != 6 or parts[0] not in ('dolt', 'embeddeddolt') or parts[2:4] != ('.dolt', 'git-remote-cache') or parts[-1] != 'repo.git':
+        raise Refused('cache is not a Dolt Git remote cache inside this tracker')
+    tracker, store = Git(repo), Git(cache)
+    endpoints = []
+    for client in (tracker, store):
+        for options in (('--all',), ('--push', '--all')):
+            urls = client.text('remote', 'get-url', *options, 'origin').splitlines()
+            if len(urls) != 1:
+                raise Refused('ambiguous remote endpoints')
+            endpoints.append(identity(urls[0]))
+    actual = endpoints[0]
+    if any(endpoint != actual for endpoint in endpoints):
+        raise Refused('cache remote does not match the tracker origin')
+    return repo, store, hashlib.sha256(actual.encode()).hexdigest()
+
+
+@contextlib.contextmanager
+def sync_lock(repo):
+    lock = Path.home() / '.claude' / 'locks' / f'beads-sync-{repo.parent.name}.lock'
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        lock.mkdir(mode=0o700)
+    except FileExistsError:
+        raise Refused('workspace sync lock is held; wait for its owner, do not remove it') from None
+    try:
+        (lock / 'pid').write_text(str(os.getpid()) + '\n')
+        yield
+    finally:
+        (lock / 'pid').unlink()
+        lock.rmdir()
+
+
+def source_mode(store, source, base):
+    if not OID.fullmatch(source) or not OID.fullmatch(base):
+        raise Refused('invalid commit binding')
+    for oid in (source, base):
+        if store.text('cat-file', '-t', oid) != 'commit':
+            raise Refused('source and destination must identify commits')
+    if not store.run('merge-base', '--is-ancestor', base, source, allow_failure=True).returncode:
+        return 'descendant'
+    if len(store.text('rev-list', '--parents', '-n', '1', source).split()) == 1:
+        return 'root_snapshot'
+    raise Refused('source has divergent ancestry; normal sync must reconcile first')
+
+
+def check_root_base(store, source_ref, base, mode):
+    if mode == 'root_snapshot':
+        paired_ref = source_ref.replace('/blobstore/', '/remotes/', 1)
+        if store.text('rev-parse', '--verify', paired_ref) != base:
+            raise Refused('root snapshot is not bound to the observed Dolt remote base')
+
+
+def object_plan(store, source, base):
+    source_mode(store, source, base)
+    ids = store.text('rev-list', '--objects', '--no-object-names', source, '^' + base).splitlines()
+    if len(ids) > MAX_OBJECTS:
+        raise Refused('too many objects for one bounded recovery')
+    if not ids:
+        return []
+    rows = store.text('cat-file', '--batch-check=%(objectname) %(objecttype) %(objectsize)',
+                      data=('\n'.join(ids) + '\n').encode()).splitlines()
+    blobs = []
+    total = 0
+    metadata = 0
+    for row in rows:
+        oid, kind, size_text = row.split()
+        size = int(size_text)
+        if kind == 'blob':
+            if size > MAX_BATCH:
+                raise Refused('an individual blob exceeds the bounded upload limit')
+            blobs.append({'oid': oid, 'size': size})
+            total += size
+        else:
+            metadata += size
+    if total > MAX_TOTAL or metadata > MAX_BATCH:
+        raise Refused('recovery exceeds the total data or remaining metadata limit')
+    return sorted(blobs, key=lambda item: item['oid'])
+
+
+def write_journal(path, value, *, create=False):
+    path = Path(path)
+    if path.is_symlink() or (create and path.exists()):
+        raise Refused('journal already exists or is a symlink')
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix='.upload-', dir=path.parent)
+    try:
+        with os.fdopen(fd, 'w') as output:
+            json.dump(value, output, indent=2)
+            output.write('\n')
+            output.flush()
+            os.fsync(output.fileno())
+        if create:
+            # Link is an atomic no-overwrite create; a concurrent journal is
+            # never replaced after the earlier existence check.
+            os.link(temporary, path)
+        else:
+            os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def make_plan(repo, cache, source_ref, journal):
+    if not SOURCE.fullmatch(source_ref):
+        raise Refused('source must be the exact Dolt cache ref named by the failed push')
+    repo, store, remote_hash = contexts(repo, cache)
+    with sync_lock(repo):
+        source = store.text('rev-parse', '--verify', source_ref)
+        base = store.refs().get(DATA_REF, '')
+        mode = source_mode(store, source, base)
+        check_root_base(store, source_ref, base, mode)
+        objects = object_plan(store, source, base)
+        recovery = str(uuid.uuid4())
+        for item in objects:
+            item['ref'] = f'refs/dolt/uploads/beads-recovery-{recovery}/{item["oid"]}'
+        plan = dict(version=1, repo=str(repo), cache=str(store.directory), remote_hash=remote_hash,
+                    source_ref=source_ref, source=source, base=base, source_mode=mode, recovery=recovery,
+                    objects=objects, uploaded=False, cleaned=False)
+        write_journal(journal, plan, create=True)
+    print(f'Plan saved: {len(objects)} blobs, {sum(x["size"] for x in objects)} bytes; no remote writes')
+
+
+def read_journal(journal):
+    path = Path(journal)
+    metadata = path.lstat()
+    if metadata.st_uid != os.getuid() or not stat.S_ISREG(metadata.st_mode) or metadata.st_mode & 0o077 or metadata.st_size > 16 * 1024 * 1024:
+        raise Refused('journal must be a private, bounded regular file')
+    plan = json.loads(path.read_text())
+    required_strings = ('repo', 'cache', 'remote_hash', 'source_ref', 'source', 'base', 'recovery')
+    if (not isinstance(plan, dict) or type(plan.get('version')) is not int or plan['version'] != 1
+            or any(not isinstance(plan.get(key), str) for key in required_strings)
+            or not isinstance(plan.get('objects'), list)):
+        raise Refused('invalid recovery journal')
+    if str(uuid.UUID(plan['recovery'])) != plan['recovery'] or not SOURCE.fullmatch(plan['source_ref']):
+        raise Refused('invalid recovery journal')
+    return plan
+
+
+def read_plan(journal):
+    plan = read_journal(journal)
+    repo, store, remote_hash = contexts(plan['repo'], plan['cache'])
+    if remote_hash != plan['remote_hash']:
+        raise Refused('remote changed since planning')
+    mode = source_mode(store, plan['source'], plan['base'])
+    if plan.get('source_mode', 'descendant') != mode:
+        raise Refused('journal source mode does not match the captured commit')
+    expected = object_plan(store, plan['source'], plan['base'])
+    for item in expected:
+        item['ref'] = f'refs/dolt/uploads/beads-recovery-{plan["recovery"]}/{item["oid"]}'
+    if expected != plan['objects']:
+        raise Refused('journal does not match the intended reachable blobs')
+    return plan, repo, store
+
+
+def published_replacement(store, plan, published):
+    # Reconciliation may compact table files before native publication. For a
+    # planned root snapshot, require the SAME cache's current native source
+    # and recorded remote to identify exactly the observed published commit.
+    # Matching the old base is not publication of the recovered state.
+    if plan.get('source_mode') != 'root_snapshot' or published == plan['base']:
+        return False
+    source_ref = plan['source_ref']
+    paired_ref = source_ref.replace('/blobstore/', '/remotes/', 1)
+    return all(store.text('rev-parse', '--verify', ref) == published
+               for ref in (source_ref, paired_ref))
+
+
+def apply_plan(journal, cleanup=False):
+    repo = Path(read_journal(journal)['repo']).resolve()
+    with sync_lock(repo):
+        plan, bound_repo, store = read_plan(journal)
+        if bound_repo != repo:
+            raise Refused('journal changed while acquiring the sync lock')
+        refs = store.refs()
+        for item in plan['objects']:
+            if refs.get(item['ref'], item['oid']) != item['oid']:
+                raise Refused('an owned temporary ref changed; refusing to overwrite or delete it')
+        if cleanup:
+            published = refs.get(DATA_REF, '')
+            if not OID.fullmatch(published):
+                raise Refused('publication is not observable')
+            # Prefer full reachability. A native replacement snapshot needs
+            # its own exact publication proof; unknown newer tips still defer.
+            reachable = set(store.text('rev-list', '--objects', '--no-object-names', published).splitlines())
+            if any(item['oid'] not in reachable for item in plan['objects']):
+                if not published_replacement(store, plan, published):
+                    raise Refused('uploaded blobs lack a bound publication; keep the journal and refs')
+            pending = [item for item in plan['objects'] if item['ref'] in refs]
+        else:
+            check_root_base(store, plan['source_ref'], plan['base'], plan.get('source_mode', 'descendant'))
+            if refs.get(DATA_REF) != plan['base'] or store.text('rev-parse', '--verify', plan['source_ref']) != plan['source']:
+                raise Refused('source or destination changed; re-plan against the current failed push')
+            pending = [item for item in plan['objects'] if item['ref'] not in refs]
+        batch, size = [], 0
+        def transfer(items):
+            if not items:
+                return
+            # Deletion leases compare the expected object atomically on the
+            # server. They apply only to our private refs, never Dolt data.
+            leases = [f'--force-with-lease={x["ref"]}:{x["oid"]}' for x in items] if cleanup else []
+            specifications = [(':' if cleanup else x['oid'] + ':') + x['ref'] for x in items]
+            store.run('push', '--atomic', *leases, 'origin', *specifications)
+            print(f'{"Removed" if cleanup else "Uploaded"} {len(items)} temporary refs', flush=True)
+        for item in pending:
+            if batch and (size + item['size'] > MAX_BATCH or len(batch) >= 64):
+                transfer(batch)
+                batch, size = [], 0
+            batch.append(item)
+            size += item['size']
+        transfer(batch)
+        plan['cleaned' if cleanup else 'uploaded'] = True
+        write_journal(journal, plan)
+    print('Temporary refs cleaned' if cleanup else 'Blobs uploaded; run the canonical sync hook to publish normally')
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest='command', required=True)
+    plan = sub.add_parser('plan')
+    for name in ('repo', 'cache', 'source-ref', 'journal'):
+        plan.add_argument('--' + name, required=True)
+    for name in ('upload', 'cleanup'):
+        action = sub.add_parser(name)
+        action.add_argument('--journal', required=True)
+        action.add_argument('--apply', action='store_true', required=True)
+    args = parser.parse_args()
+    try:
+        if args.command == 'plan':
+            make_plan(args.repo, args.cache, args.source_ref, args.journal)
+        else:
+            apply_plan(args.journal, cleanup=args.command == 'cleanup')
+    except (Refused, ValueError, KeyError, TypeError, OSError) as failure:
+        # No traceback or subprocess stderr: neither is a safe redaction boundary.
+        message = str(failure) if isinstance(failure, Refused) else 'invalid input or inaccessible recovery state'
+        print('Recovery refused: ' + message, file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
