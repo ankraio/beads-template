@@ -377,7 +377,7 @@ check true acme-0xsdd.28 \
 # The branch alone: only the id it starts with, after `type/` segments.
 check true acme-x7q2 "fix the sweep" "fix/acme-x7q2-the-sweep" "why" \
     "a branch-only citation after a type/ prefix is delivered"
-check true acme-x7q2 "fix the sweep" "mattias/fix/acme-x7q2-the-sweep" "why" \
+check true acme-x7q2 "fix the sweep" "someone/fix/acme-x7q2-the-sweep" "why" \
     "a branch-only citation after several path segments is delivered"
 check true acme-ouxcd "record two beads" "acme-ouxcd-2-acme-h34rf" "why" \
     "the id a branch starts with is delivered"
